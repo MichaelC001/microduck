@@ -232,16 +232,15 @@ something that names the part at fault, or says the hardware is fine.
 
 ### M8 — The policy channel: policies from the Hub
 
-Today every policy ships **inside the daemon artifact** — `robotd` loads
-`.../current/policies/alpha_walking.onnx` and friends — so a new gait needs a daemon release,
-and a policy trained on a laptop reaches a duck only through CI or a sideload of the whole
-daemon. The point of this milestone is that a policy trained in `microduck_rl` — the training
-repository, which is private — can be published, installed and tried on its own version line,
-and that someone can try one they did not train and get back.
+Every policy used to ship **inside the daemon artifact**, so a new gait needed a daemon release
+and a policy trained on a laptop reached a duck only through CI or a sideload of the whole daemon.
+The point of this milestone is that a policy trained in `microduck_rl` — the training repository,
+which is private — can be published, installed and tried on its own version line, and that
+someone can try one they did not train and get back.
 
 **Designed**, in [`policy-channel-design.md`](../design/policy-channel-design.md), which owns
 the decisions this section used to leave open. The short version: a slot is filled from one of
-three origins — official (`pollen-robotics/*`, signed, the reset target), community (any other
+three origins — official (`pollen-robotics/*`, the reset target), community (any other
 Hub repo, unsigned, reported but never auto-applied) or local (a path on the board); `policy
 load` writes the config key and `policy reset` removes it, so persistence and undo are the
 mechanism that already exists; and the official set ships as one `policies` component rather
@@ -256,10 +255,11 @@ reload` exists, and `xtask sign` signs any directory of artifacts.
 1. **The local loop, no network.** `robot.loadPolicy` plus the home-pose reload, and `robotctl
    policy list` / `load` / `reset`. Delivers "try a policy without editing the toml" end to end,
    touches no Hub and no publishing decisions. `API_VERSION` 16 → 17.
-2. **Official policies leave the artifact.** Publish the alpha set as the `policies` component,
-   repoint the defaults at its install dir, and drop `policies/` along with the `--include`
-   lines in the two release workflows, `scripts/dev-push.sh` and `xtask`'s
-   `every_policy_in_the_repo_is_packaged`.
+2. **Official policies leave the artifact.** *Done.* `robotd` reads
+   `/opt/robot/policies/current`, which `scripts/seed-policies.sh` fills by downloading the
+   pinned set from `pollen-robotics/microduck-policies` — the arrangement `setup-board.sh`
+   already uses for ONNX Runtime. `policies/` and its three `--include` lists are gone, and
+   bumping `[workspace.metadata.policies]` is now the whole of shipping a gait.
 3. **The Hub library.** `policy.*` on `updaterd` for the fetch and its provenance sidecar,
    `load <repo>`, the official/community split, `check` and `update`, then `search`.
 

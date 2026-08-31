@@ -10,11 +10,12 @@ of §7 — `robotctl policy list`, `load` and `reset`, over `robot.loadPolicy` a
 A policy on the board can be tried and undone without editing a file or restarting anything, and
 `robotd` reads its policies from `/opt/robot/policies/current`, outside the release.
 
-**Not yet true**: `pollen-robotics/microduck-policies` does not exist yet, so every board is
-still on the transitional fallback in §9 — the copy the release carries. Creating that repo and
-tagging `v1` is what switches the fetch on; deleting `policies/` is what finishes §9. There is no
-library, no provenance sidecar, and no `check`, `update` or `search`, so `origin` is only ever
-`official` or `local`. See [`roadmap.md`](../project/roadmap.md) §M8.
+§9 is done: the set lives at `pollen-robotics/microduck-policies` and the release no longer
+carries it.
+
+**Not yet true**: there is no library, no provenance sidecar, and no `check`, `update` or
+`search`, so `origin` is only ever `official` or `local`. See
+[`roadmap.md`](../project/roadmap.md) §M8.
 
 Companion to [`updater-design.md`](updater-design.md), which owns the update engine —
 components, sources, signing, the health gate, rollback — and to
@@ -288,12 +289,16 @@ This is the intended shape rather than a regression: two things with their own v
 not revert together. It is only sharp while the release is still the only source of policies,
 which is another reason not to leave that state sitting for long.
 
-**One transitional branch remains.** The release still carries its copy of the set, and a board
-with *nothing* installed that cannot reach the Hub falls back on it, so a first install without a
-network gets a gait rather than none. That branch — and `policies/`, and the `--include` lines in
-the two release workflows and `scripts/dev-push.sh`, and `xtask`'s
-`every_policy_in_the_repo_is_packaged` — goes as soon as the Hub repo is populated and the fetch
-is proved on a board. It exists so that proving it cannot leave a duck that will not walk.
+**A board that cannot reach the Hub on a first install has no gait**, and that is the accepted
+shape rather than an oversight. `robotd` holds its pose and reports *degraded*, so the update gate
+passes and nothing rolls back; the next update fetches. It is the same bargain `setup-board.sh`
+already makes for ONNX Runtime and `setup-gstreamer.sh` for the plugins — a board needs a network
+once, and this is one more thing that needs it then rather than a reason to carry six megabytes in
+every daemon release forever.
+
+What the seeder must never do is *fail*: a non-zero exit from the post-install hook rolls the
+update back, so a network problem would revert a release that had nothing to do with it. Every
+error path exits zero and says so on stderr.
 
 **One component for the whole set, not one per slot.** The updater design sketched
 `model-walk`, `model-jump` and so on (§5.5), and per-slot components are what its own machinery
@@ -315,14 +320,44 @@ already installs the ONNX runtime and `setup-gstreamer.sh` the plugins — the n
 lands where one exists, and at runtime there is exactly one source for a policy with no
 precedence rule between a release copy and a Hub copy.
 
-## 10. Naming
+## 10. What the official set currently is
+
+Recorded here because it lives nowhere else in this repository now that the files do not, and
+because the mapping is not recoverable from the names on the Hub. Copied from
+`apirrone/microduck_runtime` at `5f3b314` (`roulade.onnx` at `7e4ab6d`, where it first appeared),
+dereferencing the symlinks that repository uses to give stable names to particular training runs:
+
+| in the set | upstream | role |
+| --- | --- | --- |
+| `alpha_walking.onnx` | `BEST_alpha_walking_rough.onnx` | walking / velstand |
+| `alpha_stand.onnx` | `BEST_alpha_stand_body_control.onnx` | standing + body-pose |
+| `alpha_sitstand.onnx` | `BEST_alpha_sitstand.onnx` | sit ↔ stand (posture flag) |
+| `alpha_ground_pick.onnx` | `alpha_ground_pick.onnx` | ground pick (phase command) |
+| `ball_kick_left.onnx` | `ball_kick_left.onnx` | left-leg kick |
+| `ball_kick_right.onnx` | `ball_kick_right.onnx` | right-leg kick |
+| `roller.onnx` | `BEST_roller.onnx` | roller-mode locomotion |
+| `roller_crouch.onnx` | `BEST_roller_crounch.onnx` | roller-mode crouch (ground-pick slot) |
+| `roulade.onnx` | `roulade.onnx` | forward roll (Mjlab-Roulade-MicroDuck) |
+
+(`roller_crouch` also fixes the upstream file name's typo.)
+
+**The names are roles, not training runs**, and that indirection is the reason a retrain is a pin
+bump rather than a config change on every robot: swapping which run is "the walking policy" must
+not mean editing `robotd.toml`.
+
+**Only the 61-D family.** The prototype also ships a 51-D one — `3 gyro + 3 gravity + 42 joints +
+3 command`, the legacy `[vx, vy, vtheta]` — and `robotd` refuses it at load naming both widths.
+That check turned a wrong-policy mistake into a diagnosis rather than a robot moving in ways
+nobody could explain, and it is now also what catches a truncated download (§9).
+
+## 11. Naming
 
 The updater says `model`; `robotd` says `policy`. Standardising on **policy** — the component is
 `policies`, the namespace is `policy.*`, the commands are `robotctl policy …`. `models/` keeps
 its meaning for the things that genuinely are models and not control policies, such as
 `pet_detect.onnx` and the duck detector.
 
-## 11. Decisions recorded
+## 12. Decisions recorded
 
 | | |
 |---|---|
@@ -343,7 +378,7 @@ its meaning for the things that genuinely are models and not control policies, s
 | Seeds are pruned to the current and previous | Unbounded 7 MB-per-release growth; the previous one is the hand-recovery after a rollback (§9) |
 | One `policy check`, routing internally | Two commands for one question is the confusion worth avoiding (§6) |
 
-## 12. Deferred, deliberately
+## 13. Deferred, deliberately
 
 - **Competing versions of one community policy.** A slot holds one file; the library holds many,
   but only the config says which is live. A real `(name, version)` store key is priced in
@@ -356,7 +391,7 @@ its meaning for the things that genuinely are models and not control policies, s
   tag.
 - **Signing community policies**, and any curated-org scheme that would require it.
 
-## 13. Open
+## 14. Open
 
 - **Whether the official set ever becomes an updater component.** Delivery no longer needs one:
   §9 fetches the pinned set from the Hub directly, the way the board's other prerequisites

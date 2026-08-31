@@ -25,12 +25,16 @@
 # Never fatal. A robot with no policy holds its pose and reports *degraded* — a board to fix, not
 # a release to roll back.
 #
-# Usage: seed-policies.sh [RELEASE_DIR] [POLICY_ROOT]
-# Both default to what a robot uses; the arguments exist so this can be tested off a board.
+# A board that cannot reach the Hub on a first install ends up with no policies, and that is the
+# accepted shape rather than an oversight: `robotd` holds its pose and reports *degraded*, the
+# update gate passes, and the next update fetches. It is the same bargain `setup-board.sh` makes
+# for ONNX Runtime — the board prerequisites need a network once.
+#
+# Usage: seed-policies.sh [POLICY_ROOT]
+# Defaults to what a robot uses; the argument exists so this can be tested off a board.
 set -eu
 
-RELEASE_DIR="${1:-$PWD}"
-POLICY_ROOT="${2:-/opt/robot/policies}"
+POLICY_ROOT="${1:-/opt/robot/policies}"
 
 # The pin. An xtask test asserts these literals match `[workspace.metadata.policies]` in
 # Cargo.toml — this script runs from inside a release and cannot read the manifest, which is the
@@ -84,48 +88,18 @@ for name in $POLICY_FILES; do
 done
 
 if [ "$ok" = no ]; then
+    # Nothing partial ever goes live, and nothing already installed is disturbed. A half-published
+    # revision or a link that was down leaves the board exactly as it was — on the previous set if
+    # it has one, with none if it does not — and the pin is retried at the next update.
     rm -rf "$staging"
-
-    # A set is already installed, so keep it. The fetch that just failed was for a *newer* pin —
-    # a half-published revision, or a link that was down — and replacing a working gait with an
-    # older copy to react to that would be a downgrade nobody asked for. The pin is retried at
-    # the next update, and until then the robot walks the way it did this morning.
-    if [ -n "$live" ]; then
-        echo "seed-policies: keeping the set already installed (${live})" >&2
-        exit 0
-    fi
-
-    # TRANSITIONAL, and only for a board with nothing at all. The release still carries a copy of
-    # the set, so a first install that cannot reach the Hub gets a gait instead of no gait. Named
-    # for the release rather than the pin, so the next update tries the Hub again rather than
-    # reading this as the pinned set.
-    #
-    # This whole branch goes when `policies/` leaves the repository, which is the point of the
-    # exercise; it is here so the Hub path can be proved on a real board without a duck that
-    # cannot walk if it is wrong.
-    if [ ! -d "${RELEASE_DIR}/policies" ]; then
-        echo "seed-policies: no policies installed and none to fall back on" >&2
-        exit 0
-    fi
-    version="$(sed -n 's/^version = "\(.*\)"$/\1/p' "${RELEASE_DIR}/version.toml" 2>/dev/null || true)"
-    [ -n "$version" ] || { echo "seed-policies: no version to name a fallback after" >&2; exit 0; }
-    target="releases/seed-release-${version}"
-    [ "$live" != "$target" ] || exit 0
-    echo "seed-policies: falling back on the copy this release carries" >&2
-    staging="${POLICY_ROOT}/${target}"
-    rm -rf "$staging"
-    mkdir -p "$staging" || { echo "seed-policies: cannot create ${staging}" >&2; exit 0; }
-    for policy in "${RELEASE_DIR}"/policies/*.onnx; do
-        [ -f "$policy" ] || continue
-        install -m 644 "$policy" "${staging}/$(basename "$policy")" \
-            || { echo "seed-policies: cannot copy $(basename "$policy")" >&2; exit 0; }
-    done
-else
-    chmod 644 "$staging"/*.onnx 2>/dev/null || true
-    rm -rf "${POLICY_ROOT:?}/${target}"
-    mv "$staging" "${POLICY_ROOT}/${target}" \
-        || { echo "seed-policies: cannot install into ${target}" >&2; exit 0; }
+    echo "seed-policies: leaving the policies already installed alone" >&2
+    exit 0
 fi
+
+chmod 644 "$staging"/*.onnx 2>/dev/null || true
+rm -rf "${POLICY_ROOT:?}/${target}"
+mv "$staging" "${POLICY_ROOT}/${target}" \
+    || { echo "seed-policies: cannot install into ${target}" >&2; exit 0; }
 
 # `current -> releases/<something>`, relative to the directory the link is in, which is the layout
 # the updater already uses and swaps (docs/design/updater-design.md §7.1). Relative and not
