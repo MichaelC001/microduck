@@ -272,12 +272,17 @@ person could make, into a directory `robotd` shape-checks everything out of. The
 also what catches a truncated file, which is why no hashes are pinned here to go stale on every
 retrain.
 
-One rule makes that a bootstrap rather than a second home: **it never touches a set it did not
-install**. A `current` pointing anywhere but a `seed-*` directory means something else put
-policies there, and the release stops overwriting them for good. No flag, no config, and nothing
-to remember at handover — whatever ends up publishing bundles just installs one, and the seeding
-is over. A *newer* seed does replace an older one, because while the release is the only source
-of policies a daemon update is still how a retrained gait reaches a board.
+One rule makes that a bootstrap rather than a second home: **a set that is already installed is
+never replaced, whatever the pin says**. There are two states — something is installed, or
+nothing is — and only the second one fetches. Everything after the first install belongs to
+§9.1.
+
+That rule got stricter after a board proved the looser one wrong. It used to replace an older
+`seed-*` on the reasoning that a daemon update was still how a retrained gait reached a robot.
+`policy update` is now how, and the old rule became a trap: a board moved forward to `v2` by hand
+has `current -> releases/seed-v2`, which matches the pattern the seeder called its own, so the
+next unrelated daemon update would have put `v1` back — reverting the gait somebody chose, as a
+silent side effect of a binary update.
 
 **Policies no longer roll back with the daemon**, and that is worth stating plainly because it
 used to be free. While they lived inside the release, reverting the release reverted them; now
@@ -353,7 +358,14 @@ nicety: the reload runs at the end of every `policy update`, and an install that
 someone's gait experiment would be the worst possible time to discover the two were conflated.
 
 An unreachable Hub is reported, not raised. The robot is walking either way, and a caller shown
-"could not reach the Hub" beside what is installed knows more than one shown an error.
+"could not reach the Hub" beside what is installed knows more than one shown an error. Neither is
+a board with nothing installed: that is not a network fault, and saying it through the same field
+made a healthy Hub look unreachable.
+
+Installs prune to the live set and the one it replaced — seven megabytes each, and somebody
+comparing two gaits will move back and forth. The predecessor is kept on purpose: rollback does
+not run hooks, so reverting the daemon does not revert its policies, and pointing `current` back
+at the kept set is the recovery when a policy is what went wrong.
 
 ## 10. What the official set currently is
 
@@ -413,6 +425,7 @@ its meaning for the things that genuinely are models and not control policies, s
 | The pin is a floor; `policy update` moves past it | Otherwise a gait still needs a daemon release, which is the thing this channel is for (§9.1) |
 | A set records the repo it came from | One writer, one copy, nothing to configure twice or drift (§9.1) |
 | Reload is a third thing, not reset-all | They look identical from outside and conflating them discards every override (§9.1) |
+| The seeder never replaces an installed set | Otherwise a daemon update silently reverts a gait chosen with `policy update` (§9) |
 | Seeds are pruned to the current and previous | Unbounded 7 MB-per-release growth; the previous one is the hand-recovery after a rollback (§9) |
 | One `policy check`, routing internally | Two commands for one question is the confusion worth avoiding (§6) |
 

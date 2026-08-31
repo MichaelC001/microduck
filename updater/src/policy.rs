@@ -187,22 +187,24 @@ pub async fn install(
         source: e,
     })?;
 
+    // `download_to`, not `get_bytes`. The latter is for manifests and API replies and enforces a
+    // one-megabyte ceiling with the message "implausibly large for metadata" — which a policy is
+    // not, and which today's are only just under. A retrain that produced a slightly larger
+    // network would have failed to install with a sentence about metadata.
+    let (progress, mut drain) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move { while drain.recv().await.is_some() {} });
     for name in &files {
         let url = format!(
             "https://huggingface.co/{}/resolve/{version}/{name}",
             source.repo
         );
-        let bytes = http::get_bytes(&client, &url, None)
+        http::download_to(&client, &url, &staging.join(name), None, &progress)
             .await
             .inspect_err(|_| {
                 // Half a set is worse than none: leaving it would make the next attempt look
                 // like a resume of something that was never coherent.
                 let _ = std::fs::remove_dir_all(&staging);
             })?;
-        std::fs::write(staging.join(name), bytes).map_err(|e| Error::Io {
-            path: staging.join(name),
-            source: e,
-        })?;
     }
 
     let recorded = Source {
@@ -223,7 +225,36 @@ pub async fn install(
     })?;
 
     swap_current(root, &name)?;
+    prune(root, &name, previous.as_deref());
     Ok((version, previous))
+}
+
+/// Drop older sets, keeping the live one and the one it replaced.
+///
+/// Every install is a new directory of about seven megabytes, in a place nothing else tidies, so
+/// somebody moving back and forth between revisions would fill an eMMC. The previous one is kept
+/// deliberately: **rollback does not run hooks** (`Engine::post_swap` is on the apply path only),
+/// so reverting the daemon does not revert its policies, and pointing `current` back at the kept
+/// set is the recovery when a policy is what went wrong.
+///
+/// Best effort. A set that cannot be removed is disk space, not a failed install, and undoing a
+/// good install over it would be the wrong trade.
+fn prune(root: &Path, keep: &str, previous: Option<&str>) {
+    let previous = previous.map(|v| format!("{SET_PREFIX}{v}"));
+    let Ok(entries) = std::fs::read_dir(root.join("releases")) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // `seed-` only. Anything else under here belongs to whatever installed it, which is the
+        // rule the seeder opens with and this must not be the exception to.
+        if !name.starts_with(SET_PREFIX) || name == keep || Some(&name) == previous.as_ref() {
+            continue;
+        }
+        if let Err(e) = std::fs::remove_dir_all(entry.path()) {
+            tracing::warn!(set = %name, error = %e, "could not remove an old policy set");
+        }
+    }
 }
 
 /// Point `current` at `releases/<name>`, atomically.
@@ -338,6 +369,51 @@ mod tests {
             vec!["alpha_walking.onnx".to_string(), "roulade.onnx".to_string()],
             "the .source record is not a policy"
         );
+    }
+
+    /// Installs accumulate a directory each, so moving between revisions a few times would fill
+    /// an eMMC with sets nothing else tidies.
+    #[test]
+    fn old_sets_are_pruned_to_the_live_one_and_its_predecessor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for name in ["seed-v1", "seed-v2", "seed-v3", "from-a-tool"] {
+            std::fs::create_dir_all(root.join("releases").join(name)).unwrap();
+        }
+
+        prune(root, "seed-v3", Some("v2"));
+
+        let mut left: Vec<String> = std::fs::read_dir(root.join("releases"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            vec![
+                "from-a-tool".to_string(),
+                "seed-v2".to_string(),
+                "seed-v3".to_string()
+            ],
+            "the live set, the one it replaced, and anything that is not ours"
+        );
+    }
+
+    /// A first install has no predecessor, and must not read that as licence to keep nothing —
+    /// nor to delete a set some other tool put there.
+    #[test]
+    fn pruning_without_a_predecessor_keeps_what_is_not_ours() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for name in ["seed-v1", "from-a-tool"] {
+            std::fs::create_dir_all(root.join("releases").join(name)).unwrap();
+        }
+
+        prune(root, "seed-v1", None);
+
+        assert!(root.join("releases/seed-v1").exists());
+        assert!(root.join("releases/from-a-tool").exists());
     }
 
     /// A board with nothing installed has no repo to ask about, and says so rather than inventing

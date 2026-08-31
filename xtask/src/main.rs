@@ -1332,22 +1332,31 @@ mod tests {
         );
     }
 
-    /// Bumping the pin is how a retrained gait ships, so it has to actually refetch.
+    /// **An installed set is never replaced, whatever the pin says.**
+    ///
+    /// The pin is a floor — what a board with nothing gets — and not a ceiling. This used to
+    /// replace an older set on the reasoning that a daemon update was still how a retrained gait
+    /// reached a board; `robotctl policy update` is now how, and the old rule became a trap. A
+    /// board moved forward to v2 by hand had `current -> releases/seed-v2`, which matches the
+    /// `seed-*` the seeder called its own, so the next unrelated daemon update would have put v1
+    /// back — silently reverting somebody's gait as a side effect of a binary update.
     #[test]
-    fn bumping_the_pin_fetches_the_new_set() {
+    fn a_set_already_installed_is_left_alone_whatever_the_pin_says() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("policies");
         std::fs::create_dir_all(&root).unwrap();
 
-        let v1 = tmp.path().join("hub-v1");
-        fake_hub(&v1, "one");
-        seed(&root, "v1", Some(&v1));
-
         let v2 = tmp.path().join("hub-v2");
-        fake_hub(&v2, "two");
-        let (link, content) = seed(&root, "v2", Some(&v2));
+        fake_hub(&v2, "chosen");
+        seed(&root, "v2", Some(&v2));
+
+        // The release pins v1 and offers it. A board on v2 must stay on v2.
+        let v1 = tmp.path().join("hub-v1");
+        fake_hub(&v1, "pinned");
+        let (link, content) = seed(&root, "v1", Some(&v1));
+
         assert_eq!(link.as_deref(), Some("releases/seed-v2"));
-        assert_eq!(content.as_deref(), Some("two-alpha_walking.onnx"));
+        assert_eq!(content.as_deref(), Some("chosen-alpha_walking.onnx"));
     }
 
     /// A board that cannot reach the Hub on a first install ends up with no policies, and that
@@ -1416,53 +1425,6 @@ mod tests {
             content.as_deref(),
             Some("one-alpha_walking.onnx"),
             "and the board keeps something that works"
-        );
-    }
-
-    /// Seeds accumulate one per pin otherwise, at seven megabytes each, in a directory nothing
-    /// else prunes — growth noticed as a full eMMC months later rather than as its cause.
-    #[test]
-    fn old_sets_are_pruned_to_the_current_and_previous() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("policies");
-        std::fs::create_dir_all(&root).unwrap();
-
-        for n in 1..=4 {
-            let hub = tmp.path().join(format!("hub-{n}"));
-            fake_hub(&hub, &format!("v{n}"));
-            seed(&root, &format!("v{n}"), Some(&hub));
-        }
-
-        let mut kept: Vec<String> = std::fs::read_dir(root.join("releases"))
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .collect();
-        kept.sort();
-        assert_eq!(kept, vec!["seed-v3".to_string(), "seed-v4".to_string()]);
-    }
-
-    /// The previous set is kept, and it is the only recovery for one specific case: **rollback
-    /// does not run hooks** (`post_swap` is on the apply path only), so reverting the daemon does
-    /// not revert its policies. A release rolled back because its policies were bad leaves them
-    /// running, and pointing `current` back at the kept set by hand is what undoes that.
-    #[test]
-    fn the_set_a_pin_replaced_is_still_there_to_go_back_to() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("policies");
-        std::fs::create_dir_all(&root).unwrap();
-
-        let v1 = tmp.path().join("hub-v1");
-        fake_hub(&v1, "good");
-        seed(&root, "v1", Some(&v1));
-
-        let v2 = tmp.path().join("hub-v2");
-        fake_hub(&v2, "bad");
-        seed(&root, "v2", Some(&v2));
-
-        assert_eq!(
-            std::fs::read_to_string(root.join("releases/seed-v1/alpha_walking.onnx")).ok(),
-            Some("good-alpha_walking.onnx".to_string())
         );
     }
 

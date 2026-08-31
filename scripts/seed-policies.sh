@@ -40,9 +40,10 @@ POLICY_ROOT="${1:-/opt/robot/policies}"
 # Cargo.toml — this script runs from inside a release and cannot read the manifest, which is the
 # same reason `setup-gstreamer.sh` carries its plugin version as a literal.
 #
-# A floor, not a ceiling: it decides what a board installs when it has nothing, and a board moves
-# past it with `robotctl policy update`, which needs no daemon release. Bumping this does, since
-# it ships inside one — so bump it when a new set should be what *fresh* boards get.
+# A floor, not a ceiling: it decides what a board installs when it has *nothing*, and nothing
+# else. A board moves past it with `robotctl policy update`, which needs no daemon release;
+# bumping this does, since it ships inside one — so bump it when a new set should be what fresh
+# boards get, not to push one to boards that already have a set.
 POLICY_REPO="${POLICY_REPO:-pollen-robotics/microduck-policies}"
 POLICY_VERSION="${POLICY_VERSION:-v1}"
 POLICY_BASE_URL="${POLICY_BASE_URL:-https://huggingface.co/${POLICY_REPO}/resolve/${POLICY_VERSION}}"
@@ -78,22 +79,29 @@ write_source() {
 target="releases/seed-${POLICY_VERSION}"
 live="$(readlink "${POLICY_ROOT}/current" 2>/dev/null || true)"
 
-case "$live" in
-    "$target")
-        # Already the pinned set, so no network is needed — but back-fill the provenance record
-        # if it is missing. A board seeded before that record existed would otherwise never gain
-        # one, because this is the branch it takes forever after, and `policy check` would report
-        # a robot with a perfectly good policy set as having nothing installed.
-        write_source "${POLICY_ROOT}/${target}" "${POLICY_VERSION}"
-        exit 0 ;;
-    "")
-        ;;                         # nothing installed yet
-    releases/seed-*)
-        ;;                         # an older set of ours, to be replaced
-    *)
-        echo "seed-policies: ${POLICY_ROOT}/current is not ours; leaving it alone" >&2
-        exit 0 ;;
-esac
+# **A set that is already installed is never replaced.** The pin is a floor — what a board with
+# nothing gets — and not a ceiling, which is the distinction that makes `robotctl policy update`
+# possible at all.
+#
+# This used to replace an older `seed-*` on the reasoning that a daemon update was still how a
+# retrained gait reached a board. `policy update` is now how, and the old rule became a trap: a
+# board moved forward to v2 by hand had `current -> releases/seed-v2`, which matches `seed-*`,
+# so the next unrelated daemon update would have read it as an older set of ours and quietly put
+# v1 back. Silently reverting the gait somebody chose, as a side effect of a binary update.
+#
+# So there are two states now: something is installed, or nothing is. Anything installed —
+# whoever installed it — is left alone but has its provenance record back-filled if it is
+# missing, because a board seeded before that record existed takes this branch forever and
+# `policy check` cannot ask about a set that will not say where it came from.
+if [ -n "$live" ]; then
+    case "$live" in
+        releases/*)
+            write_source "${POLICY_ROOT}/${live}" "${live#releases/seed-}" ;;
+        *)
+            echo "seed-policies: ${POLICY_ROOT}/current is not ours; leaving it alone" >&2 ;;
+    esac
+    exit 0
+fi
 
 staging="${POLICY_ROOT}/releases/.staging"
 rm -rf "$staging"
@@ -148,21 +156,3 @@ if ! mv -T "${POLICY_ROOT}/current.new" "${POLICY_ROOT}/current" 2>/dev/null; th
         exit 0
     fi
 fi
-
-# Prune older sets of ours, keeping this one and the one it replaced.
-#
-# Every pin bump is a new directory, and during the transition every dev push is one too — seven
-# megabytes apiece, in a directory nothing else prunes. The previous one is kept on purpose:
-# **rollback does not run hooks** (updater/src/engine.rs — `post_swap` is on the apply path only),
-# so reverting the daemon does not revert its policies, and pointing `current` back at the kept
-# set by hand is the recovery when a policy is what went wrong.
-#
-# `seed-*` only, and only inside `releases/` — anything else under this root belongs to whatever
-# installed it, which is the rule this script opens with.
-for old_seed in "${POLICY_ROOT}"/releases/seed-*; do
-    [ -d "$old_seed" ] || continue
-    name="$(basename "$old_seed")"
-    [ "releases/${name}" != "$target" ] || continue
-    [ "releases/${name}" != "$live" ] || continue
-    rm -rf "$old_seed" || echo "seed-policies: cannot remove ${old_seed}" >&2
-done
