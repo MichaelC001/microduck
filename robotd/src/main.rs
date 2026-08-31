@@ -359,19 +359,36 @@ impl SlotErrors {
 
 /// Where a policy file came from, for `robot.policies`.
 ///
-/// This build knows two origins: the release ships the official set, and anything else is a file
-/// somebody put on the board. **`community` is missing on purpose** — a bundle fetched from a Hub
-/// repo that is not ours arrives with the library, and so does the provenance record that is the
-/// only thing able to tell it from a hand-copied file. Guessing from the path would label a
-/// downloaded policy `local` or a scp'd one `community`, and both are worse than the origin
-/// appearing when it can be known. `docs/design/policy-channel-design.md` §2.
+/// Three origins, and the path is enough to tell them apart because the path is *made* of the
+/// answer: the official set lives in its own directory, and a fetched policy lands under
+/// `<library>/<org>/<name>/<revision>/`, so the org that published it is a path component. A
+/// file anywhere else is one somebody put there by hand.
+///
+/// **Not a security boundary**, and nothing here pretends otherwise. Someone who can edit
+/// `robotd.toml` can point a slot at a directory named to look official, and someone who can do
+/// that can run whatever they like anyway. What stands between a bad policy and a broken robot
+/// is the safety layer and the shape gate, not this label
+/// (`docs/design/policy-channel-design.md` §2). This is here so a person can see what they are
+/// running.
 fn origin_of(path: &std::path::Path) -> &'static str {
     if path.starts_with(params::POLICY_DIR) {
-        "official"
-    } else {
-        "local"
+        return "official";
     }
+    if let Ok(rest) = path.strip_prefix(params::POLICY_LIBRARY)
+        && let Some(org) = rest.components().next()
+    {
+        return if org.as_os_str() == OFFICIAL_ORG {
+            "official"
+        } else {
+            "community"
+        };
+    }
+    "local"
 }
+
+/// The org whose policies are official. One constant, matching `updater::policy::OFFICIAL_ORG`:
+/// a robot that can be *told* which org to trust has a badge that means nothing.
+const OFFICIAL_ORG: &str = "pollen-robotics";
 
 /// The per-slot answer to `robot.policies`: what is loaded, from where, and why not.
 ///
@@ -5229,6 +5246,49 @@ mod tests {
             assert!(!slot.overridden, "{slot:?}");
             assert!(slot.error.is_none(), "{slot:?}");
         }
+    }
+
+    /// The three origins, told apart by the path — because the path is made of the answer.
+    #[test]
+    fn origin_comes_from_where_the_file_lives() {
+        use std::path::Path;
+
+        assert_eq!(
+            origin_of(&Path::new(params::POLICY_DIR).join("alpha_walking.onnx")),
+            "official",
+            "the set the robot fetched from our own repo"
+        );
+        assert_eq!(
+            origin_of(
+                &Path::new(params::POLICY_LIBRARY)
+                    .join("pollen-robotics/microduck-flamingo/main/policy.onnx")
+            ),
+            "official",
+            "and one fetched singly from the same org"
+        );
+        assert_eq!(
+            origin_of(
+                &Path::new(params::POLICY_LIBRARY)
+                    .join("RemiFabre/microduck-flamingo-cycle/main/policy.onnx")
+            ),
+            "community",
+            "a stranger's, which is the whole point of the label"
+        );
+        assert_eq!(
+            origin_of(Path::new("/home/pierre/my_walking.onnx")),
+            "local",
+            "and something somebody scp'd, which has no provenance at all"
+        );
+    }
+
+    /// The library root itself, with no org under it, must not read as official — the org is the
+    /// evidence, and a path with none of it is not a claim to anything.
+    #[test]
+    fn the_bare_library_root_is_not_official() {
+        assert_eq!(
+            origin_of(std::path::Path::new(params::POLICY_LIBRARY)),
+            "local"
+        );
     }
 
     /// An overridden slot must report as such, and a file outside the release is not `official`

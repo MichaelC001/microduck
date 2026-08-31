@@ -187,6 +187,23 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// `docs/design/policy-channel-design.md` §8.
 pub const API_VERSION: u32 = 18;
 
+/// The observation width every policy this robot family runs is built against.
+///
+/// Here rather than only in `duck_control` because it is a **contract with whoever publishes a
+/// policy**, not an implementation detail: it is what a repo's manifest declares, what
+/// `updaterd` refuses a mismatched policy on before downloading it, and what `robotd` refuses it
+/// on at load. `duck_control::obs` is still where the observation is built, and a test there
+/// asserts the two agree.
+pub const POLICY_OBS_LEN: usize = 61;
+
+/// The action count, on the same footing as [`POLICY_OBS_LEN`]: fifteen servos, fourteen of them
+/// driven by a policy.
+pub const POLICY_ACTION_LEN: usize = 14;
+
+/// The robot this daemon drives, as a policy manifest spells it. Refusing a policy published for
+/// something else is cheaper than discovering it in the way the robot moves.
+pub const ROBOT_MODEL: &str = "microduck";
+
 /// The longest an update may legitimately go quiet, in seconds — the pre-install hook's ceiling.
 ///
 /// **Here rather than in `updater`, because it is a contract with every client.** The phase
@@ -469,6 +486,10 @@ pub mod method {
     pub const POLICY_CHECK: &str = "policy.check";
     /// Install a policy set from the Hub and make it live.
     pub const POLICY_INSTALL: &str = "policy.install";
+    /// Fetch one policy from any Hub repo into this robot's library.
+    pub const POLICY_FETCH: &str = "policy.fetch";
+    /// Search the Hub for policies.
+    pub const POLICY_SEARCH: &str = "policy.search";
 
     /// Turn the connection into a stream of [`ROBOT_STATE`] notifications.
     pub const ROBOT_SUBSCRIBE: &str = "robot.subscribe";
@@ -714,6 +735,10 @@ pub enum Call {
     PolicyCheck,
     /// Install a set and make it live; see [`method::POLICY_INSTALL`].
     PolicyInstall(PolicyInstallParams),
+    /// Fetch one policy into the library; see [`method::POLICY_FETCH`].
+    PolicyFetch(PolicyFetchParams),
+    /// Search the Hub; see [`method::POLICY_SEARCH`].
+    PolicySearch(PolicySearchParams),
     RobotSubscribe(SubscribeParams),
     // ── net.* ────────────────────────────────────────────────────────────────
     NetStatus,
@@ -845,6 +870,8 @@ impl Call {
             Call::RobotReloadPolicies => method::ROBOT_RELOAD_POLICIES,
             Call::PolicyCheck => method::POLICY_CHECK,
             Call::PolicyInstall(_) => method::POLICY_INSTALL,
+            Call::PolicyFetch(_) => method::POLICY_FETCH,
+            Call::PolicySearch(_) => method::POLICY_SEARCH,
             Call::RobotSubscribe(_) => method::ROBOT_SUBSCRIBE,
             Call::NetStatus => method::NET_STATUS,
             Call::NetScan => method::NET_SCAN,
@@ -895,6 +922,10 @@ impl Call {
                 // as consequential as bonding a pad. `policy.check` is a read and stays ungated,
                 // like `pad.status` and every other question about what a robot is.
                 | Call::PolicyInstall(_)
+                // Putting a stranger's network on the board is at least as consequential as
+                // replacing the official set. `policy.search` and `policy.fetch`'s read-only
+                // cousins stay ungated — asking what exists changes nothing.
+                | Call::PolicyFetch(_)
         )
     }
 
@@ -944,6 +975,9 @@ impl Call {
             // `robotd` to reload, which is the same order of magnitude as a small update — long,
             // but bounded and not a stream.
             Call::PolicyCheck | Call::PolicyInstall(_) => (Updater, Prompt),
+            // `fetch` downloads one file and `search` is a single query; both are bounded and
+            // neither streams.
+            Call::PolicyFetch(_) | Call::PolicySearch(_) => (Updater, Prompt),
             // Owns its connection until the peer goes away and never reads another request.
             Call::Subscribe => (Updater, Stream),
 
@@ -1059,6 +1093,8 @@ impl Call {
             Call::RobotSetMode(p) => encode(p),
             Call::RobotLoadPolicy(p) => encode(p),
             Call::PolicyInstall(p) => encode(p),
+            Call::PolicyFetch(p) => encode(p),
+            Call::PolicySearch(p) => encode(p),
             Call::RobotSound(p) => encode(p),
             Call::RobotTheremin(p) => encode(p),
             Call::RobotChorale(p) => encode(p),
@@ -1151,6 +1187,8 @@ impl Call {
             method::ROBOT_RELOAD_POLICIES => Call::RobotReloadPolicies,
             method::POLICY_CHECK => Call::PolicyCheck,
             method::POLICY_INSTALL => Call::PolicyInstall(decode(params)?),
+            method::POLICY_FETCH => Call::PolicyFetch(decode(params)?),
+            method::POLICY_SEARCH => Call::PolicySearch(decode(params)?),
             method::ROBOT_SUBSCRIBE => Call::RobotSubscribe(decode(params)?),
             method::NET_STATUS => Call::NetStatus,
             method::NET_SCAN => Call::NetScan,
@@ -1292,6 +1330,14 @@ pub mod test_support {
             Call::PolicyCheck,
             Call::PolicyInstall(PolicyInstallParams {
                 version: Some("v2".into()),
+            }),
+            Call::PolicyFetch(PolicyFetchParams {
+                repo: "RemiFabre/microduck-flamingo-cycle".into(),
+                revision: None,
+                file: None,
+            }),
+            Call::PolicySearch(PolicySearchParams {
+                query: "microduck".into(),
             }),
             Call::RobotLoadPolicy(LoadPolicyParams {
                 slot: Some("walk".into()),
@@ -1962,6 +2008,72 @@ pub struct PolicyInstallResult {
     /// is still running the old ones — a restart away from correct, and worth saying so rather
     /// than reporting a success the robot has not acted on.
     pub reloaded: bool,
+}
+
+/// Which policy to fetch, for [`Call::PolicyFetch`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PolicyFetchParams {
+    /// A Hub repo, `org/name`.
+    pub repo: String,
+    /// A branch, tag or commit. Absent means `main`.
+    pub revision: Option<String>,
+    /// Which file in the repo. Absent means "the only `.onnx` in it", which is what every
+    /// microduck policy repo published so far actually has — they all carry one `policy.onnx`.
+    /// A repo with several is a refusal naming them, not a guess.
+    pub file: Option<String>,
+}
+
+/// What a fetched policy turned out to be, for [`Call::PolicyFetch`].
+///
+/// Most of this comes from the repo's `manifest.json`, which the community convention already
+/// carries and which is **untrusted**: it is a stranger's description of a stranger's file. It is
+/// worth reading anyway, because a policy that says it is 51-D can be refused before the download
+/// rather than after the robot has been asked to run it — and a manifest that lies is caught by
+/// the shape gate at load, which is where the real check has always been.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PolicyFetchResult {
+    /// Where it landed. This is what goes in `[policy] <slot>`.
+    pub path: String,
+    pub repo: String,
+    pub revision: String,
+    /// The commit the revision resolved to, so a moving branch can be noticed later.
+    pub commit: Option<String>,
+    pub file: String,
+    /// `"official"` or `"community"`, by the org the repo belongs to.
+    pub origin: String,
+    /// The manifest's own name for it, if it had one.
+    pub name: Option<String>,
+    /// One line about what it does, from the manifest. Untrusted display text.
+    pub description: Option<String>,
+    /// The manifest's `kind` — `perpetual`, `episodic` and so on. Untrusted.
+    pub kind: Option<String>,
+}
+
+/// What to search the Hub for, for [`Call::PolicySearch`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PolicySearchParams {
+    pub query: String,
+}
+
+/// Answer to [`Call::PolicySearch`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PolicySearchResult {
+    pub models: Vec<PolicySearchHit>,
+}
+
+/// One Hub model matching a search. Everything here is written by whoever published it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PolicySearchHit {
+    /// `org/name`.
+    pub id: String,
+    pub origin: String,
+    pub likes: Option<u64>,
+    pub downloads: Option<u64>,
 }
 
 /// How often a subscriber wants [`method::ROBOT_STATE`].
@@ -4075,7 +4187,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            51,
+            53,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }
@@ -4284,6 +4396,11 @@ mod tests {
                 // asking whether a newer gait exists is inspection, and support has to be able
                 // to ask it on a robot it may not change.
                 method::POLICY_INSTALL,
+                // Putting a stranger's network in a slot is at least as consequential as
+                // replacing the official set. `policy.check` and `policy.search` stay off this
+                // list: asking what exists is inspection, and support has to be able to ask it
+                // on a robot it may not change.
+                method::POLICY_FETCH,
                 method::NET_CONNECT,
                 method::NET_FORGET,
                 method::SYSTEM_SET_NAME,

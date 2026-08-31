@@ -416,6 +416,122 @@ mod tests {
         assert!(root.join("releases/from-a-tool").exists());
     }
 
+    fn here() -> Expectations {
+        Expectations::here(Some(1))
+    }
+
+    fn manifest(json: serde_json::Value) -> PolicyManifest {
+        serde_json::from_value(json).expect("a manifest")
+    }
+
+    /// **The real convention, taken from a policy actually published to the Hub.** These are the
+    /// fields `RemiFabre/microduck-flamingo-cycle` carries, and this asserts we read the ones we
+    /// act on rather than a shape we invented.
+    #[test]
+    fn a_real_community_manifest_parses_and_passes() {
+        let m = manifest(serde_json::json!({
+            "schema_version": 2, "model_api": 1, "name": "flamingo-cycle",
+            "kind": "perpetual", "obs_len": 61, "action_len": 14, "action_scale": 1.0,
+            "entry_pose": "standing", "duration_s": null,
+            "description": "Stand on one foot, either side, on command.",
+            "command": { "head": "unused (zeros)" },
+            "robot": { "model": "microduck", "hw_rev": 1, "servos": "xl330" },
+            "training": { "task_id": "Mjlab-FlamingoCycleHard-Flat-MicroDuck" }
+        }));
+        assert_eq!(m.name.as_deref(), Some("flamingo-cycle"));
+        assert_eq!(m.kind.as_deref(), Some("perpetual"));
+        assert_eq!(m.incompatibility(here()), None);
+    }
+
+    /// The whole point of reading the manifest: a 51-D policy is refused before 800 KB is
+    /// downloaded and before the robot is asked to run it. `robotd` would refuse it at load
+    /// anyway — this is the same answer, arriving where somebody can act on it.
+    #[test]
+    fn a_policy_the_manifest_says_is_the_wrong_shape_is_refused() {
+        let m = manifest(serde_json::json!({ "obs_len": 51, "action_len": 14 }));
+        let why = m.incompatibility(here()).expect("refused");
+        assert!(why.contains("51") && why.contains("61"), "{why}");
+    }
+
+    /// The model-API rule from `updater-design.md` §5.5, finally doing something: a policy needing
+    /// a newer daemon is refused with the remedy in it, and an older one still loads.
+    #[test]
+    fn a_policy_needing_a_newer_daemon_says_so() {
+        let newer = manifest(serde_json::json!({ "model_api": 2 }));
+        let why = newer.incompatibility(here()).expect("refused");
+        assert!(why.contains("update the daemon"), "{why}");
+
+        let older = manifest(serde_json::json!({ "model_api": 1 }));
+        assert_eq!(older.incompatibility(Expectations::here(Some(2))), None);
+    }
+
+    /// A policy published for a different robot is not this robot's to run.
+    #[test]
+    fn a_policy_for_another_robot_is_refused() {
+        let m = manifest(serde_json::json!({ "robot": { "model": "reachy" } }));
+        assert!(m.incompatibility(here()).unwrap().contains("reachy"));
+    }
+
+    /// **Absence is not evidence.** A repo with no manifest, or one that omits the fields we act
+    /// on, must not be refused — most of the Hub follows no convention of ours, and the shape gate
+    /// at load was always going to be the real check.
+    #[test]
+    fn a_manifest_that_claims_nothing_refuses_nothing() {
+        assert_eq!(PolicyManifest::default().incompatibility(here()), None);
+        let sparse = manifest(serde_json::json!({ "name": "something", "unknown_field": 3 }));
+        assert_eq!(sparse.incompatibility(here()), None);
+    }
+
+    /// Origin is the org, and nothing else.
+    #[test]
+    fn origin_is_decided_by_the_org() {
+        assert_eq!(
+            origin_of_repo("pollen-robotics/microduck-policies"),
+            "official"
+        );
+        assert_eq!(
+            origin_of_repo("RemiFabre/microduck-flamingo-cycle"),
+            "community"
+        );
+        // Not a prefix match: an org that merely starts the same way is somebody else.
+        assert_eq!(origin_of_repo("pollen-robotics-fake/x"), "community");
+        assert_eq!(origin_of_repo("nonsense"), "community");
+    }
+
+    /// One `.onnx` is the answer, and it is the answer for every microduck policy published so
+    /// far — they all carry a single `policy.onnx` beside a README and a manifest.
+    #[test]
+    fn the_sole_policy_in_a_repo_is_the_one_to_take() {
+        let files = vec![
+            ".gitattributes".to_string(),
+            "README.md".to_string(),
+            "manifest.json".to_string(),
+            "policy.onnx".to_string(),
+        ];
+        assert_eq!(sole_policy(&files, "org/x").unwrap(), "policy.onnx");
+    }
+
+    /// Several is a refusal naming them, not a guess. Picking wrong here means running the wrong
+    /// network on a real robot, which is not a coin to toss.
+    #[test]
+    fn a_repo_with_several_policies_asks_which() {
+        let files = vec!["walk.onnx".to_string(), "run.onnx".to_string()];
+        let why = sole_policy(&files, "org/x").unwrap_err().to_string();
+        assert!(
+            why.contains("walk.onnx") && why.contains("run.onnx"),
+            "{why}"
+        );
+        assert!(why.contains("<file>"), "and how to say which: {why}");
+
+        let none: Vec<String> = vec!["README.md".to_string()];
+        assert!(
+            sole_policy(&none, "org/x")
+                .unwrap_err()
+                .to_string()
+                .contains("no .onnx")
+        );
+    }
+
     /// A board with nothing installed has no repo to ask about, and says so rather than inventing
     /// one — the repo is a property of the set, not of this daemon.
     ///
@@ -453,4 +569,320 @@ mod tests {
             "but the policies are plainly there"
         );
     }
+}
+
+// ── the community library ────────────────────────────────────────────────────
+//
+// One policy, from any Hub repo, into a slot. Separate from the official set above and
+// deliberately so: a set is nine files that version together and fill every slot, and this is one
+// file somebody wants to try in one of them.
+//
+// Nothing here is signed, per `docs/design/policy-channel-design.md` §2. A policy is not a
+// binary: `robotd` holds the only write handle to the bus behind joint clamps, a fall reflex and
+// an intent deadman, and refuses any graph that is not obs[1,61] -> actions[1,14] while the robot
+// is standing still. That sandbox is the boundary, not a signature.
+
+/// Where fetched policies live. Outside every release directory, per `updater-design.md` §5.7 —
+/// a policy somebody chose must survive an update and a rollback.
+pub const LIBRARY_ROOT: &str = "/var/lib/robot/policies";
+
+/// The org whose policies are "official". One constant: a robot that can be *told* which org to
+/// trust has a badge that means nothing.
+pub const OFFICIAL_ORG: &str = "pollen-robotics";
+
+/// `"official"` or `"community"`, from the repo that published it.
+pub fn origin_of_repo(repo: &str) -> &'static str {
+    match repo.split_once('/') {
+        Some((org, _)) if org == OFFICIAL_ORG => "official",
+        _ => "community",
+    }
+}
+
+/// What a repo's `manifest.json` says about the policy in it.
+///
+/// **Untrusted.** It is a stranger's description of a stranger's file, and every field is taken as
+/// a claim rather than a fact. It is worth reading anyway: a policy that *says* it is 51-D can be
+/// refused before 800 KB is downloaded and before the robot is asked to run it, which is a much
+/// better error than the same refusal arriving at load. A manifest that lies is caught there, by
+/// the check that has always been the real one.
+///
+/// The shape is the convention the published microduck policies already use, and everything is
+/// optional because a repo is under no obligation to carry any of it.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct PolicyManifest {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub kind: Option<String>,
+    pub obs_len: Option<usize>,
+    pub action_len: Option<usize>,
+    pub model_api: Option<u32>,
+    pub robot: Option<ManifestRobot>,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct ManifestRobot {
+    pub model: Option<String>,
+}
+
+/// What this robot expects of a policy.
+///
+/// A value rather than constants read in place, so the manifest check can be tested against
+/// expectations that are not this board's. The defaults come from `duck_ipc_proto`, which is
+/// where the shape contract is published precisely because it is a contract with whoever
+/// publishes a policy — `duck_control` asserts at compile time that its own constants agree.
+#[derive(Debug, Clone, Copy)]
+pub struct Expectations {
+    pub obs_len: usize,
+    pub action_len: usize,
+    pub model_api: u32,
+    pub robot_model: &'static str,
+}
+
+impl Expectations {
+    /// What this daemon believes, with the model API the running `robotd` reports.
+    ///
+    /// `None` — an unreachable robot — takes the contract's own version rather than refusing
+    /// everything: fetching a policy onto a board whose control loop is down is a reasonable
+    /// thing to be doing, and the load will check it properly when the loop comes back.
+    pub fn here(model_api: Option<u32>) -> Self {
+        Self {
+            obs_len: crate::proto::POLICY_OBS_LEN,
+            action_len: crate::proto::POLICY_ACTION_LEN,
+            model_api: model_api.unwrap_or(1),
+            robot_model: crate::proto::ROBOT_MODEL,
+        }
+    }
+}
+
+impl PolicyManifest {
+    /// Refuse a policy the manifest itself says will not work here.
+    ///
+    /// Only refuses on a claim that is *present and wrong*. A manifest with no `obs_len` is not
+    /// evidence of anything, and refusing on absence would reject every repo that does not follow
+    /// a convention nobody has published.
+    pub fn incompatibility(&self, expected: Expectations) -> Option<String> {
+        if let Some(obs) = self.obs_len
+            && obs != expected.obs_len
+        {
+            return Some(format!(
+                "its manifest says observation width {obs}, and this robot builds {}",
+                expected.obs_len
+            ));
+        }
+        if let Some(actions) = self.action_len
+            && actions != expected.action_len
+        {
+            return Some(format!(
+                "its manifest says {actions} actions, and this robot has {}",
+                expected.action_len
+            ));
+        }
+        if let Some(api) = self.model_api
+            && api > expected.model_api
+        {
+            return Some(format!(
+                "it needs model API {api} and this daemon speaks {} — update the daemon first",
+                expected.model_api
+            ));
+        }
+        if let Some(model) = self.robot.as_ref().and_then(|r| r.model.as_deref())
+            && !model.eq_ignore_ascii_case(expected.robot_model)
+        {
+            return Some(format!(
+                "it is for a {model}, and this is a {}",
+                expected.robot_model
+            ));
+        }
+        None
+    }
+}
+
+/// Everything in a repo revision, as the Hub lists it.
+async fn tree(client: &reqwest::Client, repo: &str, revision: &str) -> Result<Vec<String>, Error> {
+    let url = format!("https://huggingface.co/api/models/{repo}/tree/{revision}");
+    let bytes = http::get_bytes(client, &url, None).await?;
+    let listing: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|e| Error::Network(format!("listing {repo}@{revision}: {e}")))?;
+    Ok(listing
+        .as_array()
+        .map(|files| {
+            files
+                .iter()
+                .filter_map(|f| f.get("path")?.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// The commit a revision points at, so a moving branch can be noticed later.
+async fn commit_of(client: &reqwest::Client, repo: &str, revision: &str) -> Option<String> {
+    let url = format!("https://huggingface.co/api/models/{repo}/revision/{revision}");
+    let bytes = http::get_bytes(client, &url, None).await.ok()?;
+    let info: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    info.get("sha")?.as_str().map(str::to_owned)
+}
+
+/// Pick the policy file out of a repo listing.
+///
+/// Exactly one `.onnx` is the answer, and it is the answer for every microduck policy published
+/// so far — they all carry a single `policy.onnx`. Several is a refusal naming them rather than a
+/// guess: choosing wrong here means running the wrong network on a real robot.
+fn sole_policy(files: &[String], repo: &str) -> Result<String, Error> {
+    let mut candidates: Vec<&String> = files.iter().filter(|f| f.ends_with(".onnx")).collect();
+    candidates.sort();
+    match candidates.len() {
+        1 => Ok(candidates[0].clone()),
+        0 => Err(Error::Network(format!("{repo} has no .onnx in it"))),
+        _ => Err(Error::Network(format!(
+            "{repo} has {} policies — name one with `<repo>:<file>`: {}",
+            candidates.len(),
+            candidates
+                .iter()
+                .map(|c| c.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+    }
+}
+
+/// Fetch one policy into the library and say what it turned out to be.
+pub async fn fetch(
+    library: &Path,
+    repo: &str,
+    revision: Option<&str>,
+    file: Option<&str>,
+    expected: Expectations,
+) -> Result<crate::proto::PolicyFetchResult, Error> {
+    // A repo is `org/name`, and nothing else. Checked before it is pasted into a URL and before
+    // any of it becomes a directory name.
+    let Some((org, name)) = repo.split_once('/') else {
+        return Err(Error::Network(format!("{repo} is not an org/name repo")));
+    };
+    for part in [org, name] {
+        if part.is_empty() || part.contains(['.', '/', '\\']) {
+            return Err(Error::Network(format!("{repo} is not an org/name repo")));
+        }
+    }
+    let revision = revision.unwrap_or("main");
+    if revision.contains(['/', '\\']) || revision.starts_with('.') {
+        return Err(Error::Network(format!("{revision} is not a revision")));
+    }
+
+    let client = http::client()?;
+
+    // The manifest first, so a policy that says it cannot work here costs one small request
+    // rather than a download and a refusal from the control loop.
+    let manifest_url = format!("https://huggingface.co/{repo}/resolve/{revision}/manifest.json");
+    let manifest: PolicyManifest = match http::get_bytes(&client, &manifest_url, None).await {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+        // No manifest is not a fault. Plenty of repos will not have one, and the shape gate at
+        // load is the check that was always going to decide this.
+        Err(_) => PolicyManifest::default(),
+    };
+    if let Some(why) = manifest.incompatibility(expected) {
+        return Err(Error::Network(format!(
+            "{repo} will not run on this robot: {why}"
+        )));
+    }
+
+    let file = match file {
+        Some(file) => {
+            if file.contains('/') || file.starts_with('.') || !file.ends_with(".onnx") {
+                return Err(Error::Network(format!("{file} is not a policy file name")));
+            }
+            file.to_owned()
+        }
+        None => sole_policy(&tree(&client, repo, revision).await?, repo)?,
+    };
+
+    let dir = library.join(org).join(name).join(revision);
+    std::fs::create_dir_all(&dir).map_err(|e| Error::Io {
+        path: dir.clone(),
+        source: e,
+    })?;
+
+    // Staged beside the destination, so a download interrupted halfway is never a file a slot
+    // could be pointed at.
+    let staged = dir.join(format!("{file}.part"));
+    let (progress, mut drain) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move { while drain.recv().await.is_some() {} });
+    let url = format!("https://huggingface.co/{repo}/resolve/{revision}/{file}");
+    http::download_to(&client, &url, &staged, None, &progress)
+        .await
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&staged);
+        })?;
+    let path = dir.join(&file);
+    std::fs::rename(&staged, &path).map_err(|e| Error::Io {
+        path: path.clone(),
+        source: e,
+    })?;
+
+    let commit = commit_of(&client, repo, revision).await;
+    let record = format!(
+        "repo={repo}\nversion={revision}\ncommit={}\nfile={file}\nfetched={}\n",
+        commit.as_deref().unwrap_or("unknown"),
+        now_utc(),
+    );
+    let _ = std::fs::write(dir.join(SOURCE_FILE), record);
+
+    Ok(crate::proto::PolicyFetchResult {
+        path: path.display().to_string(),
+        repo: repo.to_owned(),
+        revision: revision.to_owned(),
+        commit,
+        file,
+        origin: origin_of_repo(repo).to_owned(),
+        name: manifest.name,
+        description: manifest.description,
+        kind: manifest.kind,
+    })
+}
+
+/// An RFC-3339 timestamp without pulling in a date library for one line.
+fn now_utc() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("@{secs}")
+}
+
+/// Hub models matching a query.
+///
+/// No tag filter yet: `microduck` in the name is what the published policies have in common, and
+/// a tag is something to add once there is something to tag. Every field is the publisher's.
+pub async fn search(query: &str) -> Result<crate::proto::PolicySearchResult, Error> {
+    let client = http::client()?;
+    let encoded: String = query
+        .chars()
+        .filter(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | ' '))
+        .map(|c| if c == ' ' { '+' } else { c })
+        .collect();
+    let url = format!("https://huggingface.co/api/models?search={encoded}&limit=25");
+    let bytes = http::get_bytes(&client, &url, None).await?;
+    let hits: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|e| Error::Network(format!("searching for {query}: {e}")))?;
+
+    let models = hits
+        .as_array()
+        .map(|models| {
+            models
+                .iter()
+                .filter_map(|m| {
+                    let id = m.get("modelId")?.as_str()?.to_owned();
+                    let origin = origin_of_repo(&id).to_owned();
+                    Some(crate::proto::PolicySearchHit {
+                        id,
+                        origin,
+                        likes: m.get("likes").and_then(|v| v.as_u64()),
+                        downloads: m.get("downloads").and_then(|v| v.as_u64()),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(crate::proto::PolicySearchResult { models })
 }

@@ -38,6 +38,14 @@ pub const RELEASE_DIR: &str = "/opt/robot/daemon/current";
 /// atomically. See `docs/design/policy-channel-design.md` §9.
 pub const POLICY_DIR: &str = "/opt/robot/policies/current";
 
+/// Where policies fetched from the Hub one at a time live — `robotctl policy load <slot> <repo>`.
+///
+/// Outside every release directory, per `updater-design.md` §5.7: a policy somebody chose has to
+/// survive an update and a rollback. The layout mirrors the repo — `<org>/<name>/<revision>/` —
+/// which is what makes the path in `robotd.toml` say where a policy came from without anything
+/// having to look it up. `updater::policy::LIBRARY_ROOT` is the same string on the writing side.
+pub const POLICY_LIBRARY: &str = "/var/lib/robot/policies";
+
 /// Where a provisioned robot keeps it, alongside the updater's own config.
 pub const DEFAULT_PATH: &str = "/etc/robot/robotd.toml";
 

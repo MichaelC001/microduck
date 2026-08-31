@@ -602,6 +602,40 @@ impl Server {
                     Err(e) => Response::err(Some(id), e.to_rpc_error()),
                 }
             }
+            // Read-only and no engine lock: asking the Hub what exists changes nothing here.
+            Call::PolicySearch(params) => match crate::policy::search(&params.query).await {
+                Ok(result) => Response::ok(Some(id), &result),
+                Err(e) => Response::err(Some(id), e.to_rpc_error()),
+            },
+            // `try_lock` like the other mutations. Nothing it writes collides with an update —
+            // the library is outside every release directory — but it asks `robotd` for the
+            // model API, and doing that mid-swap gets an answer about whichever daemon happens
+            // to be running at that instant.
+            Call::PolicyFetch(params) => {
+                let engine = match self.engine.try_lock() {
+                    Ok(engine) => engine,
+                    Err(_) => {
+                        return Response::err(
+                            Some(id),
+                            proto::Error::new(
+                                proto::code::BUSY,
+                                "an update is in progress; retry shortly",
+                            ),
+                        );
+                    }
+                };
+                match engine
+                    .fetch_policy(
+                        &params.repo,
+                        params.revision.as_deref(),
+                        params.file.as_deref(),
+                    )
+                    .await
+                {
+                    Ok(result) => Response::ok(Some(id), &result),
+                    Err(e) => Response::err(Some(id), e.to_rpc_error()),
+                }
+            }
             Call::Rollback(params) => {
                 let component = params.component.0;
                 self.run_mutating(id, out, move |engine, _tx| {

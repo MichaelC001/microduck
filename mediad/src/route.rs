@@ -123,6 +123,10 @@ fn permits(call: &proto::Call) -> bool {
         // to a client that cannot then install it is an odd thing to offer.
         RobotReloadPolicies | PolicyCheck | PolicyInstall(_) => false,
 
+        // And nor fetching a stranger's policy, for the reason above plus §4: there is no
+        // authorisation on this transport, so a LAN peer would inherit it.
+        PolicyFetch(_) | PolicySearch(_) => false,
+
         // ── the streams BLE pointed here ────────────────────────────────────
         //
         // `pad.input` exists to measure the cadence of its own delivery, and `btd` refuses it

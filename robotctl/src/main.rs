@@ -796,8 +796,25 @@ enum PolicyCommand {
     Load {
         /// `walk`, `stand`, `sitstand`, `ground_pick`, `kick_left`, `kick_right` or `roulade`.
         slot: String,
-        /// The `.onnx` to run.
-        path: PathBuf,
+        /// A file on this robot, or a Hub repo to fetch it from.
+        ///
+        /// A path if it exists here; otherwise `org/name`, optionally with `@revision` and
+        /// `:file` — `RemiFabre/microduck-flamingo-cycle`, or `…@v2`, or `…:policy.onnx`. The
+        /// file part is only needed for a repo carrying more than one, which none published so
+        /// far does.
+        source: String,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Look for policies on the Hub.
+    ///
+    /// Everything it prints is written by whoever published the model — treat a description as a
+    /// claim, not a fact. `origin` says which ones are ours.
+    Search {
+        /// What to look for. `microduck` is what the published policies have in common.
+        #[arg(default_value = "microduck")]
+        query: String,
         #[arg(long)]
         json: bool,
     },
@@ -2654,6 +2671,9 @@ fn run_policy(
         PolicyCommand::Update { version, json } => {
             return run_policy_update(updater_socket, version.as_deref(), *json);
         }
+        PolicyCommand::Search { query, json } => {
+            return run_policy_search(updater_socket, query, *json);
+        }
         _ => {}
     }
 
@@ -2671,15 +2691,23 @@ fn run_policy(
             print!("{}", render_policies(&policies));
             return Ok(());
         }
-        PolicyCommand::Load { slot, path, json } => {
+        PolicyCommand::Load { slot, source, json } => {
             let slot = slot_of(slot)?;
-            // Resolved against *this* shell's working directory, because that is what the person
-            // typing it meant. The daemon refuses a relative path outright — its working
-            // directory is not the caller's — so sending one would only produce a confusing
-            // rejection of a path that looked fine on screen.
-            let path = path
-                .canonicalize()
-                .map_err(|e| Failure::new(exit::USAGE, format!("{}: {e}", path.display())))?;
+            let local = PathBuf::from(source);
+            let path = if local.exists() {
+                // Resolved against *this* shell's working directory, because that is what the
+                // person typing it meant. The daemon refuses a relative path outright — its
+                // working directory is not the caller's — so sending one would only produce a
+                // confusing rejection of a path that looked fine on screen.
+                local
+                    .canonicalize()
+                    .map_err(|e| Failure::new(exit::USAGE, format!("{}: {e}", local.display())))?
+            } else {
+                // Not a file here, so a Hub repo. That order because a file that exists is
+                // unambiguous, and because "no such file" is a worse answer to a typo in a repo
+                // name than the daemon's own "that is not an org/name repo".
+                fetch_from_hub(updater_socket, source, slot, *json)?
+            };
             (vec![slot], Some(path), *json)
         }
         PolicyCommand::Reset { slot, json } => {
@@ -2689,11 +2717,13 @@ fn run_policy(
             };
             (slots, None, *json)
         }
-        // Both returned above, before the connection to `robotd` this arm needs. Named rather
-        // than wildcarded so adding a subcommand fails here instead of falling through into a
-        // slot swap it has nothing to do with.
-        PolicyCommand::Check { .. } | PolicyCommand::Update { .. } => {
-            unreachable!("check and update are served by updaterd and returned before this point")
+        // All three returned above, before the connection to `robotd` this arm needs. Named
+        // rather than wildcarded so adding a subcommand fails here instead of falling through
+        // into a slot swap it has nothing to do with.
+        PolicyCommand::Check { .. }
+        | PolicyCommand::Update { .. }
+        | PolicyCommand::Search { .. } => {
+            unreachable!("updaterd serves these, and they returned before this point")
         }
     };
 
@@ -2816,6 +2846,84 @@ fn run_policy(
             ),
         )),
     }
+}
+
+/// Fetch a policy named as `org/name[@revision][:file]`, and say what arrived.
+///
+/// Through `updaterd`, the process with a network stack — this binary deliberately does not link
+/// one (`docs/design/policy-channel-design.md` §8).
+fn fetch_from_hub(
+    updater_socket: &Path,
+    spec: &str,
+    slot: Slot,
+    json: bool,
+) -> Result<PathBuf, Failure> {
+    let (repo, file) = match spec.split_once(':') {
+        Some((repo, file)) => (repo, Some(file.to_owned())),
+        None => (spec, None),
+    };
+    let (repo, revision) = match repo.split_once('@') {
+        Some((repo, revision)) => (repo, Some(revision.to_owned())),
+        None => (repo, None),
+    };
+
+    let mut client = Client::connect_to("updaterd", updater_socket)?;
+    client.hello()?;
+    let result = result_of(
+        client.call(&proto::Call::PolicyFetch(proto::PolicyFetchParams {
+            repo: repo.to_owned(),
+            revision,
+            file,
+        }))?,
+    )?;
+    let fetched: proto::PolicyFetchResult = decode(&result)?;
+
+    if !json {
+        let what = fetched.name.as_deref().unwrap_or(&fetched.file);
+        println!("fetched {what} from {} ({})", fetched.repo, fetched.origin);
+        if let Some(description) = &fetched.description {
+            // The publisher's words, shown as theirs. Nothing here has been checked by anybody.
+            println!("  \"{description}\"");
+        }
+        if fetched.origin == "community" {
+            println!(
+                "  somebody else's policy — watch the robot, and \
+                 `sudo robotctl policy reset {slot}` puts it back"
+            );
+        }
+    }
+    Ok(PathBuf::from(fetched.path))
+}
+
+/// `robotctl policy search` — what is on the Hub.
+fn run_policy_search(updater_socket: &Path, query: &str, json: bool) -> Result<(), Failure> {
+    let mut client = Client::connect_to("updaterd", updater_socket)?;
+    client.hello()?;
+    let result = result_of(client.call(&proto::Call::PolicySearch(
+        proto::PolicySearchParams {
+            query: query.to_owned(),
+        },
+    ))?)?;
+    if json {
+        println!("{}", compact(&result));
+        return Ok(());
+    }
+    let found: proto::PolicySearchResult = decode(&result)?;
+    if found.models.is_empty() {
+        println!("nothing on the Hub matches {query:?}");
+        return Ok(());
+    }
+
+    let width = found.models.iter().map(|m| m.id.len()).max().unwrap_or(20);
+    for hit in &found.models {
+        let likes = hit.likes.unwrap_or(0);
+        println!("{:width$}  {:9}  {likes} likes", hit.id, hit.origin);
+    }
+    println!(
+        "\n`sudo robotctl policy load <slot> <repo>` tries one. Anything not marked official is \
+         somebody else's."
+    );
+    Ok(())
 }
 
 /// `robotctl policy check` — what is installed against what the repo offers.

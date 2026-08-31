@@ -199,6 +199,30 @@ name one — `--version v1` is how to go back. The robot returns to its home pos
 slot and drives again, and **a slot you loaded yourself is left alone**, because it points
 somewhere else entirely.
 
+#### Somebody else's gait
+
+Other people publish policies for this robot. What is out there:
+
+```
+robotctl policy search microduck
+```
+
+Try one — the repo name is enough, and it is fetched and loaded in one step:
+
+```
+sudo robotctl policy load walk RemiFabre/microduck-flamingo-cycle
+```
+
+Add `@v2` for a revision, and `:policy.onnx` for a repo carrying more than one policy (none does
+yet). `robotctl policy list` marks it `community`, and `sudo robotctl policy reset walk` puts your
+own back.
+
+A policy whose manifest says it will not run here — the wrong observation width, a newer daemon,
+a different robot — is refused before it downloads. One with no manifest is accepted and checked
+the usual way, at load. **Nothing a stranger publishes is verified by anybody**: what makes it
+safe to try is the joint clamps, the fall reflex and the shape gate, not the description. Have the
+robot on its stand the first time.
+
 #### The slots
 
 The slots are `walk`, `stand`, `sitstand`, `ground_pick`, `kick_left`, `kick_right` and

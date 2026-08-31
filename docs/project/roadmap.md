@@ -264,8 +264,12 @@ reload` exists, and `xtask sign` signs any directory of artifacts.
    `robotctl policy check` / `update` — a retrained gait now reaches a board with no daemon
    release, which was the milestone's whole point. Each set records the repo it came from, so
    nothing configures it twice.
-4. **The community library.** Fetching a policy from a repo that is not ours, the provenance
-   sidecar that makes `origin` say `community`, and `search`. Not started.
+4. **The community library.** *Done.* `policy load <slot> <org/repo>` fetches one policy from
+   any Hub repo into `/var/lib/robot/policies/<org>/<name>/<rev>/`, `origin` reports `community`
+   for a stranger's, and `policy search` lists what is out there. The repos published so far
+   already carry a `manifest.json` with `obs_len`, `action_len` and `model_api`, so a policy that
+   cannot run here is refused before it is downloaded — which is also where `model_api` stopped
+   being designed-and-unimplemented.
 
 `reset` means "remove the override and re-resolve" in all three, so slice 1 ships a correct
 reset against the in-release copies and slice 2 changes what it resolves *to* without touching

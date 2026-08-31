@@ -5,15 +5,14 @@ Status: draft · Date: 2026-08-31 · Owner: pierre
 Where the ONNX policies come from, how someone tries one they did not train, and what
 "reset" puts back.
 
-**Built so far** (2026-08-31): §3, §4, §5, §9 and §9.1, plus `list`, `load`, `reset`, `check` and
-`update` from §7. A policy on the board can be tried and undone without editing a file or
+**Built so far** (2026-08-31): §3, §4, §5, §9, §9.1 and §9.2 — the whole of §7 except `check`
+covering community entries. A policy on the board can be tried and undone without editing a file or
 restarting anything; the official set is fetched from the Hub rather than carried by the release;
 and a retrained gait reaches a robot without a daemon release.
 
-**Not yet true**: there is no library of *community* policies. A slot can be pointed at a file on
-the board, and the official set can be moved between revisions, but fetching someone else's policy
-from another repo is not wired up — so `origin` is only ever `official` or `local`, and `search`
-does not exist. See [`roadmap.md`](../project/roadmap.md) §M8.
+**Not yet true**: `policy check` covers the official set only — a community policy fetched from a
+moving branch records the commit it came from, but nothing yet compares that against the branch to
+say it has moved. Everything else in this page is built.
 
 Companion to [`updater-design.md`](updater-design.md), which owns the update engine —
 components, sources, signing, the health gate, rollback — and to
@@ -367,6 +366,48 @@ comparing two gaits will move back and forth. The predecessor is kept on purpose
 not run hooks, so reverting the daemon does not revert its policies, and pointing `current` back
 at the kept set is the recovery when a policy is what went wrong.
 
+### 9.2 Somebody else's policy
+
+`robotctl policy load walk RemiFabre/microduck-flamingo-cycle` fetches one policy from any Hub
+repo into `/var/lib/robot/policies/<org>/<name>/<revision>/` and puts it in that slot. Outside
+every release directory, per §5.7 of the updater design: a policy somebody chose survives an
+update and a rollback.
+
+**The path is made of the answer**, which is what lets `origin` be honest without a lookup: the
+org that published a policy is a component of where it lives, so `robot.policies` reports
+`community` for a stranger's and `official` for ours. It is a label and not a boundary — anyone
+who can edit `robotd.toml` can name a directory whatever they like, and anyone who can do that
+can run whatever they like anyway. What stands between a bad policy and a broken robot is §2's
+sandbox.
+
+**A repo carries one `policy.onnx`.** That convention already existed on the Hub before this was
+built — every published microduck policy has exactly one `.onnx` beside a README and a manifest —
+so the fetch takes the sole `.onnx` and refuses a repo with several by naming them. Choosing wrong
+means running the wrong network on a real robot, which is not a coin to toss;
+`<repo>:<file>` says which.
+
+**And it carries a `manifest.json`**, which turned out to be a richer convention than anything
+this design had specified: `obs_len`, `action_len`, `model_api`, `robot.model`, plus a name, a
+kind and a description. Reading it is what lets a policy be refused *before* 800 KB is downloaded
+and before the robot is asked to run it — "its manifest says observation width 51, and this robot
+builds 61" is the same verdict `robotd` would reach at load, arriving where somebody can act on
+it. This is also where `model_api` finally does something: §5.5 of the updater design specified
+it and neither side used it, and now a policy needing a newer daemon is refused with that as the
+remedy.
+
+Three rules keep that from becoming a trap. The manifest is **untrusted** — a stranger's
+description of a stranger's file — so it is a reason to refuse and never a reason to trust; a
+manifest that lies is caught by the shape gate, which is where the real check has always been.
+**Absence is not evidence**: a repo with no manifest, or one omitting the fields we act on, is
+accepted, because most of the Hub follows no convention of ours and refusing on silence would
+reject the majority of it. And the numbers it is checked against are published in
+`duck_ipc_proto` rather than duplicated, with a compile-time assertion in `duck_control` that the
+two agree — a contract with whoever publishes a policy belongs where both sides can see it.
+
+`robotctl policy search microduck` lists what is out there, marking each hit's origin. No tag
+filter: a shared name is what the published policies have in common, and a tag is worth adding
+once there is something to tag.
+
 ## 10. What the official set currently is
 
 Recorded here because it lives nowhere else in this repository now that the files do not, and
@@ -426,6 +467,9 @@ its meaning for the things that genuinely are models and not control policies, s
 | A set records the repo it came from | One writer, one copy, nothing to configure twice or drift (§9.1) |
 | Reload is a third thing, not reset-all | They look identical from outside and conflating them discards every override (§9.1) |
 | The seeder never replaces an installed set | Otherwise a daemon update silently reverts a gait chosen with `policy update` (§9) |
+| Origin is the org in the path | Honest without a lookup, and a label rather than a boundary (§9.2) |
+| The manifest can refuse but never bless | It is a stranger's claim; the shape gate is the check (§9.2) |
+| A repo with two policies is a refusal | Guessing means running the wrong network on a real robot (§9.2) |
 | Seeds are pruned to the current and previous | Unbounded 7 MB-per-release growth; the previous one is the hand-recovery after a rollback (§9) |
 | One `policy check`, routing internally | Two commands for one question is the confusion worth avoiding (§6) |
 

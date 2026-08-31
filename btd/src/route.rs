@@ -261,6 +261,14 @@ fn permits(call: &proto::Call) -> bool {
         // Worth revisiting with the app, alongside `robot.policies` to show the result.
         PolicyCheck | PolicyInstall(_) => false,
 
+        // Browsing the Hub for gaits and installing one from a phone is the most obviously
+        // *appealing* thing in this file, and the one that most wants the app to exist first: it
+        // puts a stranger's network in charge of fifteen servos, and the only judge of whether
+        // that went well is somebody watching the robot. Everything that makes it survivable is
+        // already built — the shape gate, the clamps, the fall reflex — so this is a deferral
+        // about who is looking, not about danger.
+        PolicyFetch(_) | PolicySearch(_) => false,
+
         // Power to the joints. A phone button that drops the robot on the floor is not one to
         // offer, and `robot.init` is its counterpart: standing a robot up moves every joint at once,
         // which wants the person doing it to be looking at the robot rather than at a screen. Both

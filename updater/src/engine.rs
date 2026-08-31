@@ -1299,6 +1299,28 @@ impl Engine {
         })
     }
 
+    /// Fetch one policy from any Hub repo into this robot's library.
+    ///
+    /// The model API comes from the running `robotd` rather than from a constant here, because it
+    /// is the daemon that implements the contract and this process only carries it. An
+    /// unreachable robot is not a refusal — see [`crate::policy::Expectations::here`].
+    pub async fn fetch_policy(
+        &self,
+        repo: &str,
+        revision: Option<&str>,
+        file: Option<&str>,
+    ) -> Result<crate::proto::PolicyFetchResult, Error> {
+        let model_api = self.robot.model_api(ROBOT_QUERY_TIMEOUT).await;
+        crate::policy::fetch(
+            std::path::Path::new(crate::policy::LIBRARY_ROOT),
+            repo,
+            revision,
+            file,
+            crate::policy::Expectations::here(model_api),
+        )
+        .await
+    }
+
     /// Revert to the previously installed release.
     ///
     /// Reachable when `robotd` is dead — that is the case it exists for
