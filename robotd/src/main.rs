@@ -2972,6 +2972,49 @@ fn apply_intent(intents: &Intents, call: &proto::Call) -> bool {
     }
 }
 
+/// Is the robot already in the state a `robot.loadPolicy` is asking for?
+///
+/// `Some(reason)` when the answer is yes and there is nothing to queue. The alternative is a
+/// visible ten-second non-event: the robot goes home, reloads seven networks, and comes back to
+/// exactly what it was running. `robot.setMode` has treated "already in that mode" as an
+/// acceptance since it existed, and for the same reason — the caller asked for a state and that
+/// state is what they have.
+///
+/// **A slot carrying an error is never already-done, whatever its path says.** An override that
+/// failed at boot has been dropped in memory, so the slot reads as not-overridden and running the
+/// default — which looks exactly like a slot that was never touched. Resetting it is how the
+/// error and the config line that caused it get cleared, so that request has to go through.
+fn already_loaded(
+    state: &RobotState,
+    slot: Option<Slot>,
+    path: Option<&std::path::Path>,
+) -> Option<String> {
+    let slots = state.policy_slots.load();
+    let settled = |reported: &proto::PolicySlot| -> bool {
+        if reported.error.is_some() {
+            return false;
+        }
+        match path {
+            Some(path) => reported.path.as_deref() == Some(path.display().to_string().as_str()),
+            None => !reported.overridden,
+        }
+    };
+
+    match slot {
+        Some(slot) => {
+            let reported = slots.iter().find(|s| s.slot == slot.as_str())?;
+            settled(reported).then(|| match path {
+                Some(path) => format!("{slot} is already running {}", path.display()),
+                None => format!("{slot} is already this robot's own policy"),
+            })
+        }
+        None => slots
+            .iter()
+            .all(settled)
+            .then(|| "every slot is already this robot's own policy".to_owned()),
+    }
+}
+
 /// Validate a `robot.loadPolicy` and, if it holds up, queue it for the loop.
 ///
 /// **The file is opened here**, on the IPC runtime rather than the control thread. The swap
@@ -3034,6 +3077,13 @@ fn load_policy_request(
             Some(path)
         }
     };
+
+    // Last, because it is the only check that needs the file to have been resolved and found
+    // valid: "already running this" is a claim about a policy that exists.
+    if let Some(reason) = already_loaded(state, slot, path.as_deref()) {
+        tracing::info!(reason, "policy load: nothing to do");
+        return proto::IntentResult::already(reason);
+    }
 
     intents.request_policy_load(intents::PolicyLoad { slot, path });
     proto::IntentResult::accepted()
@@ -4898,35 +4948,6 @@ mod tests {
         assert!(result.reason.unwrap().contains("omit both"));
     }
 
-    /// Resetting every slot is the "put it back" command, and it must reach the loop even though
-    /// it names neither a slot nor a file — the shape every other refusal above rejects.
-    #[test]
-    fn resetting_every_slot_is_accepted() {
-        let s = RobotState::new(&Params::default(), false, false);
-        let intents = Arc::new(Intents::new());
-
-        let result: proto::IntentResult = dispatch(
-            &s,
-            &intents,
-            proto::Id::Number(1),
-            &proto::Call::RobotLoadPolicy(proto::LoadPolicyParams {
-                slot: None,
-                path: None,
-            }),
-        )
-        .result_as()
-        .unwrap();
-
-        assert!(result.accepted, "{:?}", result.reason);
-        assert_eq!(
-            intents.take_policy_load(),
-            Some(intents::PolicyLoad {
-                slot: None,
-                path: None
-            })
-        );
-    }
-
     /// Writing an override a disabled loop will never read is a config edit that silently does
     /// nothing — the exact failure `robotctl policy load` exists to remove.
     #[test]
@@ -4950,6 +4971,143 @@ mod tests {
 
         assert!(!result.accepted);
         assert!(result.reason.unwrap().contains("disabled"));
+    }
+
+    /// **Resetting a slot nobody overrode is an acceptance with nothing behind it.**
+    ///
+    /// The report from a board: `policy reset` on an untouched robot still sent it home, reloaded
+    /// seven networks and came back to exactly what it was running. The caller asked for a state
+    /// and already had it, which is what `robot.setMode` has always called an acceptance.
+    #[test]
+    fn resetting_an_untouched_slot_queues_nothing() {
+        let s = RobotState::new(&Params::default(), false, false);
+        let intents = Arc::new(Intents::new());
+
+        let result: proto::IntentResult = dispatch(
+            &s,
+            &intents,
+            proto::Id::Number(1),
+            &proto::Call::RobotLoadPolicy(proto::LoadPolicyParams {
+                slot: Some("walk".into()),
+                path: None,
+            }),
+        )
+        .result_as()
+        .unwrap();
+
+        assert!(
+            result.accepted,
+            "asking for the state you have is not an error"
+        );
+        let reason = result
+            .reason
+            .expect("an acceptance that did nothing says so");
+        assert!(reason.contains("already"), "{reason}");
+        assert!(
+            intents.take_policy_load().is_none(),
+            "and the loop is never told to go home"
+        );
+    }
+
+    /// The same for the whole-robot reset, which is the one somebody types when they are not sure
+    /// what they changed — and therefore the one most often already true.
+    #[test]
+    fn resetting_everything_on_an_untouched_robot_queues_nothing() {
+        let s = RobotState::new(&Params::default(), false, false);
+        let intents = Arc::new(Intents::new());
+
+        let result: proto::IntentResult = dispatch(
+            &s,
+            &intents,
+            proto::Id::Number(1),
+            &proto::Call::RobotLoadPolicy(proto::LoadPolicyParams {
+                slot: None,
+                path: None,
+            }),
+        )
+        .result_as()
+        .unwrap();
+
+        assert!(result.accepted);
+        assert!(result.reason.is_some(), "nothing to do, and it says so");
+        assert!(intents.take_policy_load().is_none());
+    }
+
+    /// One overridden slot is enough to make a whole-robot reset real work. The short-circuit is
+    /// an optimisation, and an optimisation that skipped a reset somebody needed would be a bug
+    /// that hides the file they are trying to get rid of.
+    #[test]
+    fn one_override_makes_a_whole_reset_real_work() {
+        let mut params = Params::default();
+        params
+            .policy
+            .set_slot(Slot::KickLeft, Some(PathBuf::from("/srv/mine.onnx")));
+        let s = RobotState::new(&params, false, false);
+        let intents = Arc::new(Intents::new());
+
+        let result: proto::IntentResult = dispatch(
+            &s,
+            &intents,
+            proto::Id::Number(1),
+            &proto::Call::RobotLoadPolicy(proto::LoadPolicyParams {
+                slot: None,
+                path: None,
+            }),
+        )
+        .result_as()
+        .unwrap();
+
+        assert!(result.accepted);
+        assert!(
+            result.reason.is_none(),
+            "there is work to do: {:?}",
+            result.reason
+        );
+        // Also the proof that the naming-neither-slot-nor-file shape reaches the loop at all,
+        // rather than being caught by one of the refusals above it.
+        assert_eq!(
+            intents.take_policy_load(),
+            Some(intents::PolicyLoad {
+                slot: None,
+                path: None
+            })
+        );
+    }
+
+    /// **A slot that fell back is never "already done".**
+    ///
+    /// An override that failed at boot was dropped in memory, so the slot reads as
+    /// not-overridden and running the default — indistinguishable from a slot nobody touched.
+    /// Short-circuiting there would make `policy reset` refuse to clear the one thing it is most
+    /// needed for: the error, and the config line still causing it at every boot.
+    #[test]
+    fn a_slot_that_fell_back_is_never_already_done() {
+        let s = RobotState::new(&Params::default(), false, false);
+        let intents = Arc::new(Intents::new());
+
+        let mut slots = s.policy_slots.load().as_ref().clone();
+        slots[0].error = Some("/srv/gone.onnx: No such file".into());
+        s.policy_slots.store(Arc::new(slots));
+
+        let result: proto::IntentResult = dispatch(
+            &s,
+            &intents,
+            proto::Id::Number(1),
+            &proto::Call::RobotLoadPolicy(proto::LoadPolicyParams {
+                slot: Some("walk".into()),
+                path: None,
+            }),
+        )
+        .result_as()
+        .unwrap();
+
+        assert!(result.accepted);
+        assert!(
+            result.reason.is_none(),
+            "clearing the error is the work: {:?}",
+            result.reason
+        );
+        assert!(intents.take_policy_load().is_some());
     }
 
     /// `robot.policies` answers for every slot, including the empty ones, and says where each

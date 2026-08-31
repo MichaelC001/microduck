@@ -188,6 +188,8 @@ points elsewhere. `reset` removes that line again.
 
 Three things worth knowing:
 
+- **Resetting something already reset does nothing, and says so.** No homing, no reload, and no
+  `sudo` needed when there is also nothing to write.
 - **A policy that is not `obs[1,61] -> actions[1,14]` is refused before anything changes.** The
   file is opened and checked while the robot is still running the old one, and the command
   prints the reason.

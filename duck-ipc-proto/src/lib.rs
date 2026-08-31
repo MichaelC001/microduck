@@ -2649,6 +2649,20 @@ impl IntentResult {
         }
     }
 
+    /// Accepted, and there was nothing to do — the robot is already in the state asked for.
+    ///
+    /// Distinct from [`Self::accepted`] only by carrying a reason, which is the whole signal: an
+    /// acceptance that queued no work still succeeded, but a caller that then waits for something
+    /// to change is waiting for a change that is never coming. `robot.loadPolicy` is the case
+    /// this exists for — resetting a slot that was never overridden would otherwise send the
+    /// robot home, reload every network and come back to exactly what it was running.
+    pub fn already(reason: impl Into<String>) -> Self {
+        Self {
+            accepted: true,
+            reason: Some(reason.into()),
+        }
+    }
+
     pub fn refused(reason: impl Into<String>) -> Self {
         Self {
             accepted: false,

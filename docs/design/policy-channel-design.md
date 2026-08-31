@@ -118,6 +118,17 @@ which has been accepted in shipped behaviour, so it is not being optimised here;
 to matter on the board, loading on a worker thread and swapping in at the home pose is a fix for
 both callers and should be done as one.
 
+**A request that is already true does no work.** Resetting a slot nobody overrode, or loading
+the file a slot is already running, is answered as an acceptance that queued nothing — the same
+answer `robot.setMode` gives for "already in that mode", and for the same reason: the caller
+asked for a state and has it. Without this, `policy reset` on an untouched robot sends it home,
+reloads seven networks and comes back to exactly what it was running, which reads as a fault.
+
+The one slot that is never already-done is one carrying an error. An override that failed at
+boot has been dropped in memory (§5), so it reads as not-overridden and running the default —
+indistinguishable from a slot nobody touched. Resetting it is how the error and the config line
+behind it get cleared, so that request has to go through.
+
 **Failure must not cost you the gait you had.** Today a controller that fails to build leaves
 `policy_error` set, health unhealthy, and the robot holding its pose — right for a mode switch,
 which is a statement about how the robot is configured, and wrong for a trial, which is
@@ -264,6 +275,8 @@ its meaning for the things that genuinely are models and not control policies, s
 | Load and reset are config edits plus a live reload | One source of truth for what the robot runs; reset needs no new concept (§3) |
 | No ephemeral trial mode | A second source of truth, and it makes `reset` redundant with a reboot (§3) |
 | A failed load keeps the running controller | A trial is speculative; it must not cost the gait you had (§4) |
+| A request already satisfied queues no work | Otherwise `reset` on an untouched robot is a ten-second non-event (§4) |
+| …except on a slot carrying an error | A fallen-back slot looks untouched, and clearing it is what reset is for (§4) |
 | A failed community override is degraded, not unhealthy | Otherwise a stale config gates every daemon update (§5) |
 | `pollen-robotics/*` is official, hardcoded | A configurable trust org makes the badge meaningless (§2) |
 | Community policies are not signature-verified | The safety layer and the shape gate are the boundary, not the key (§2) |

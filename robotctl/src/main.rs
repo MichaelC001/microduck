@@ -2516,13 +2516,22 @@ fn ensure_recordable(config: &Path) -> Result<(), Failure> {
     }
 }
 
-/// Write the slot overrides `load` and `reset` imply, through the same editor `configure` uses.
+/// The config edits `load` or `reset` implies — or `None` when the file already says it.
 ///
-/// `path: None` clears, which is what `reset` is: an unset key resolves to the mode's default, so
+/// Planned rather than written, so the caller can act on the difference twice: a request with
+/// nothing to record needs no root at all, and a save that is going to fail should fail before
+/// the robot moves rather than after.
+///
+/// `path: None` clears, which is what `reset` is. An unset key resolves to the mode's default, so
 /// there is no "official path" to write back — and writing one would pin today's release's file
-/// into config forever.
-fn write_policy_keys(config: &Path, slots: &[Slot], path: Option<&Path>) -> Result<(), Failure> {
+/// into config forever, which the next release would then be configured to run after it was gone.
+fn planned_policy_edits(
+    config: &Path,
+    slots: &[Slot],
+    path: Option<&Path>,
+) -> Result<Option<configure::Model>, Failure> {
     let mut model = configure::Model::load(config).map_err(|e| Failure::new(exit::FAILED, e))?;
+    let before = model.rendered();
     let value = match path {
         Some(path) => path.display().to_string(),
         None => "unset".to_owned(),
@@ -2532,7 +2541,9 @@ fn write_policy_keys(config: &Path, slots: &[Slot], path: Option<&Path>) -> Resu
             .edit(policy_entry(*slot)?, &value)
             .map_err(|e| Failure::new(exit::FAILED, format!("{}: {e}", slot.config_key())))?;
     }
-    model.save().map_err(|e| Failure::new(exit::FAILED, e))
+    // Comparing the rendered document rather than the keys: it is the thing `save` would write,
+    // so it cannot disagree about whether writing it would change anything.
+    Ok((model.rendered() != before).then_some(model))
 }
 
 /// Has the loop made the change yet?
@@ -2609,9 +2620,13 @@ fn run_policy(robot_socket: &Path, config: &Path, command: PolicyCommand) -> Res
         }
     };
 
-    // Before the daemon is asked for anything, because the robot must not end up running
-    // something this command could never write down.
-    ensure_recordable(config)?;
+    // Planned before the daemon is asked for anything, so that a change this command could never
+    // write down fails before the robot makes it — and so a request with nothing to write does
+    // not ask for root it has no use for.
+    let mut planned = planned_policy_edits(config, &slots, path.as_deref())?;
+    if planned.is_some() {
+        ensure_recordable(config)?;
+    }
 
     let requested = proto::LoadPolicyParams {
         // One slot names itself; a whole reset names none, which is how the daemon tells "put
@@ -2631,7 +2646,30 @@ fn run_policy(robot_socket: &Path, config: &Path, command: PolicyCommand) -> Res
         ));
     }
 
-    write_policy_keys(config, &slots, path.as_deref())?;
+    let recorded = match planned.as_mut() {
+        Some(model) => {
+            model.save().map_err(|e| Failure::new(exit::FAILED, e))?;
+            true
+        }
+        None => false,
+    };
+
+    // An acceptance carrying a reason is one that queued no work: the robot is already in the
+    // state asked for. Waiting would be waiting for a change that is not coming. Config was still
+    // written if it needed it — a key edited by hand and never restarted into leaves the file
+    // saying something the robot is not doing, and this is the command that reconciles them.
+    if let Some(already) = accepted.reason {
+        if json {
+            let policies = result_of(client.call(&proto::Call::RobotPolicies)?)?;
+            println!("{}", compact(&policies));
+        } else {
+            println!("{already}");
+            if recorded {
+                println!("({} said otherwise, and now agrees)", config.display());
+            }
+        }
+        return Ok(());
+    }
 
     let deadline = Instant::now() + POLICY_SWAP_TIMEOUT;
     let outcome = loop {
@@ -3428,6 +3466,17 @@ mod tests {
         result.unwrap_or_else(|e| panic!("{}", e.message))
     }
 
+    /// Plan and save, the way `run_policy` does. `true` when the file was actually rewritten.
+    fn record(config: &Path, slots: &[Slot], path: Option<&Path>) -> bool {
+        match must(planned_policy_edits(config, slots, path)) {
+            Some(mut model) => {
+                must(model.save().map_err(|e| Failure::new(exit::FAILED, e)));
+                true
+            }
+            None => false,
+        }
+    }
+
     fn slot_state(slot: Slot, path: Option<&str>, overridden: bool) -> proto::PolicySlot {
         proto::PolicySlot {
             slot: slot.as_str().to_owned(),
@@ -3540,17 +3589,17 @@ mod tests {
         )
         .unwrap();
 
-        must(write_policy_keys(
+        assert!(record(
             &config,
             &[Slot::Walk],
-            Some(Path::new("/srv/mine.onnx")),
+            Some(Path::new("/srv/mine.onnx"))
         ));
         let written = std::fs::read_to_string(&config).unwrap();
         assert!(written.contains("walk = \"/srv/mine.onnx\""), "{written}");
         assert!(written.contains("# hand-written"), "{written}");
         assert!(written.contains("# which gait"), "{written}");
 
-        must(write_policy_keys(&config, &[Slot::Walk], None));
+        assert!(record(&config, &[Slot::Walk], None));
         let cleared = std::fs::read_to_string(&config).unwrap();
         assert!(!cleared.contains("/srv/mine.onnx"), "{cleared}");
         assert!(
@@ -3569,7 +3618,7 @@ mod tests {
         let config = dir.path().join("robotd.toml");
         std::fs::write(&config, "[policy]\nwalk = \"/srv/mine.onnx\"\n").unwrap();
 
-        must(write_policy_keys(&config, &Slot::ALL, None));
+        assert!(record(&config, &Slot::ALL, None));
         let cleared = std::fs::read_to_string(&config).unwrap();
         assert!(!cleared.contains("walk ="), "{cleared}");
         assert!(
@@ -3602,6 +3651,47 @@ mod tests {
         must(ensure_recordable(&config));
         assert!(!config.with_extension("toml.new").exists());
         assert_eq!(std::fs::read_to_string(&config).unwrap(), "[policy]\n");
+    }
+
+    /// **Resetting a slot nobody touched writes nothing.** That is what makes it need no root,
+    /// and it is half of why the command stops being a ten-second non-event — the daemon skips
+    /// the reload, and this skips the file.
+    #[test]
+    fn resetting_an_untouched_slot_plans_no_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("robotd.toml");
+        std::fs::write(&config, "[policy]\nmode = \"walk\"\n").unwrap();
+
+        assert!(must(planned_policy_edits(&config, &Slot::ALL, None)).is_none());
+        assert!(must(planned_policy_edits(&config, &[Slot::Walk], None)).is_none());
+    }
+
+    /// And loading the file that is already written is the same non-event. `policy load` run
+    /// twice must not rewrite the config the second time.
+    #[test]
+    fn loading_the_file_already_configured_plans_no_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("robotd.toml");
+        std::fs::write(&config, "[policy]\nwalk = \"/srv/mine.onnx\"\n").unwrap();
+
+        let again = must(planned_policy_edits(
+            &config,
+            &[Slot::Walk],
+            Some(Path::new("/srv/mine.onnx")),
+        ));
+        assert!(again.is_none());
+    }
+
+    /// A reset must still be planned when the *file* disagrees with the robot. The daemon can say
+    /// "nothing to do" about what it is running while a hand-edited config still names an override
+    /// nobody restarted into, and this is the command that reconciles the two.
+    #[test]
+    fn a_stale_config_key_is_still_worth_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("robotd.toml");
+        std::fs::write(&config, "[policy]\nwalk = \"/srv/never-loaded.onnx\"\n").unwrap();
+
+        assert!(must(planned_policy_edits(&config, &[Slot::Walk], None)).is_some());
     }
 
     /// A slot running its default because an override went missing has to say so where somebody
