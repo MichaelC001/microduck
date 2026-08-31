@@ -2564,15 +2564,49 @@ fn swap_settled(
         if let Some(error) = &state.error {
             return Some(Err(error.clone()));
         }
-        let arrived = match path {
-            Some(path) => state.path.as_deref() == Some(&*path.display().to_string()),
-            None => !state.overridden,
-        };
-        if !arrived {
+        if !slot_holds(state, path) {
             return None;
         }
     }
     Some(Ok(()))
+}
+
+/// Is this one slot already what the request asks for?
+///
+/// The per-slot half of [`swap_settled`], and also what decides *which slots a command actually
+/// changed* — the two have to be the same question, or a reset would wait on one set of slots and
+/// report a different one.
+fn slot_holds(state: &proto::PolicySlot, path: Option<&Path>) -> bool {
+    match path {
+        Some(path) => state.path.as_deref() == Some(&*path.display().to_string()),
+        None => !state.overridden,
+    }
+}
+
+/// Which of these slots the request would actually change.
+///
+/// `robotctl policy reset` asks about all seven and typically changes one; reporting all seven as
+/// reset was untrue and read as though six other slots had been altered.
+///
+/// A slot carrying an error counts as changing whatever its path says. It has fallen back, so it
+/// reads as not-overridden and running the default — indistinguishable from a slot nobody touched
+/// — and resetting it is real work, because that is what clears the error.
+fn slots_the_request_changes(
+    policies: &proto::PoliciesResult,
+    slots: &[Slot],
+    path: Option<&Path>,
+) -> Vec<Slot> {
+    slots
+        .iter()
+        .copied()
+        .filter(|slot| {
+            policies
+                .slots
+                .iter()
+                .find(|s| s.slot == slot.as_str())
+                .is_none_or(|state| state.error.is_some() || !slot_holds(state, path))
+        })
+        .collect()
 }
 
 /// `robotctl policy` — which `.onnx` runs in which slot.
@@ -2619,6 +2653,12 @@ fn run_policy(robot_socket: &Path, config: &Path, command: PolicyCommand) -> Res
             (slots, None, *json)
         }
     };
+
+    // What the robot runs now, so the report at the end can name the slots this command actually
+    // changed rather than every slot it asked about.
+    let before: proto::PoliciesResult =
+        decode(&result_of(client.call(&proto::Call::RobotPolicies)?)?)?;
+    let changing = slots_the_request_changes(&before, &slots, path.as_deref());
 
     // Planned before the daemon is asked for anything, so that a change this command could never
     // write down fails before the robot makes it — and so a request with nothing to write does
@@ -2689,17 +2729,28 @@ fn run_policy(robot_socket: &Path, config: &Path, command: PolicyCommand) -> Res
             if json {
                 println!("{}", compact(&policies));
             } else {
-                for slot in &slots {
+                // `changing`, not `slots`: a whole-robot reset asks about all seven and usually
+                // changes one, and naming all seven read as though seven had been altered.
+                for slot in &changing {
                     match path.as_deref() {
                         Some(path) => println!("{slot} is now running {}", path.display()),
                         None => println!("{slot} is back to this robot's own policy"),
                     }
                 }
-                // Config was written before the wait, so this is true whatever happened after.
-                println!(
-                    "(kept in {}; `robotctl policy reset` undoes it)",
-                    config.display()
-                );
+                let untouched = slots.len() - changing.len();
+                if untouched > 0 {
+                    let plural = if untouched == 1 { "slot" } else { "slots" };
+                    println!("(the other {untouched} {plural} needed nothing)");
+                }
+                // Only for a load. Nothing was "kept" by a reset — the override was removed —
+                // and telling somebody who just ran `reset` that `reset` undoes it is circular.
+                if path.is_some() {
+                    let slot = changing.first().map_or(String::new(), |s| format!(" {s}"));
+                    println!(
+                        "(kept in {}; `robotctl policy reset{slot}` undoes it)",
+                        config.display()
+                    );
+                }
             }
             Ok(())
         }
@@ -3692,6 +3743,57 @@ mod tests {
         std::fs::write(&config, "[policy]\nwalk = \"/srv/never-loaded.onnx\"\n").unwrap();
 
         assert!(must(planned_policy_edits(&config, &[Slot::Walk], None)).is_some());
+    }
+
+    /// **A reset must report the slots it changed, not the slots it asked about.**
+    ///
+    /// From a board: one slot was overridden, `policy reset` was run, and all seven reported "is
+    /// back to this robot's own policy". Six of them had not moved. The command was doing the
+    /// right thing and describing something else, which is worse than either.
+    #[test]
+    fn a_reset_reports_only_the_slots_that_move() {
+        let mut slots: Vec<_> = Slot::ALL
+            .into_iter()
+            .map(|slot| slot_state(slot, Some("/opt/robot/policies/current/x.onnx"), false))
+            .collect();
+        slots[0] = slot_state(Slot::Walk, Some("/home/pierre/my_walking.onnx"), true);
+
+        let changing = slots_the_request_changes(&policies_of(slots), &Slot::ALL, None);
+        assert_eq!(changing, vec![Slot::Walk]);
+    }
+
+    /// A slot that fell back counts as changing, whatever its path says. It reads as
+    /// not-overridden and running the default — the same as a slot nobody touched — and resetting
+    /// it is what clears the error, so a report that called it unchanged would be describing the
+    /// one case somebody is most likely running the command for.
+    #[test]
+    fn a_slot_carrying_an_error_counts_as_changing() {
+        let mut slots = vec![slot_state(Slot::Walk, Some("/opt/robot/x.onnx"), false)];
+        slots[0].error = Some("/srv/gone.onnx: No such file".into());
+
+        let changing = slots_the_request_changes(&policies_of(slots), &[Slot::Walk], None);
+        assert_eq!(changing, vec![Slot::Walk]);
+    }
+
+    /// A load names the one slot it is loading, so the whole-set case has no bearing on it.
+    #[test]
+    fn a_load_changes_the_slot_it_names() {
+        let slots = vec![slot_state(Slot::Walk, Some("/opt/robot/alpha.onnx"), false)];
+        let wanted = Path::new("/home/pierre/mine.onnx");
+
+        let changing = slots_the_request_changes(&policies_of(slots), &[Slot::Walk], Some(wanted));
+        assert_eq!(changing, vec![Slot::Walk]);
+    }
+
+    /// And loading what is already loaded changes nothing — the same answer the daemon reaches on
+    /// its own, which is what keeps the two from disagreeing about whether anything happened.
+    #[test]
+    fn loading_what_is_already_running_changes_nothing() {
+        let slots = vec![slot_state(Slot::Walk, Some("/home/pierre/mine.onnx"), true)];
+        let wanted = Path::new("/home/pierre/mine.onnx");
+
+        let changing = slots_the_request_changes(&policies_of(slots), &[Slot::Walk], Some(wanted));
+        assert!(changing.is_empty());
     }
 
     /// A slot running its default because an override went missing has to say so where somebody
