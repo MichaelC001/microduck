@@ -161,7 +161,19 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// results are not `deny_unknown_fields`. An older `updaterd` answers `update.show` with
 /// [`code::METHOD_NOT_FOUND`] naming it, which is the designed skew behaviour rather than a
 /// handshake refusal.
-pub const API_VERSION: u32 = 16;
+///
+/// # v17 — `robot.policies`, `robot.loadPolicy`
+///
+/// Which `.onnx` fills a slot stops being a restart-only decision: a policy can be swapped into
+/// one slot while the robot runs, and dropped again, without editing a file by hand. Additive as
+/// methods, and the state they expose was previously unavailable at all rather than available in
+/// another shape, so nothing an older client reads changes meaning — the policy names in the
+/// `robot.subscribe` acknowledgement could already change mid-session as of v15.
+///
+/// An older `robotd` answers either with [`code::METHOD_NOT_FOUND`] naming the method, which is
+/// the designed skew behaviour and not a handshake refusal. See
+/// `docs/design/policy-channel-design.md` §8.
+pub const API_VERSION: u32 = 17;
 
 /// The longest an update may legitimately go quiet, in seconds — the pre-install hook's ceiling.
 ///
@@ -412,6 +424,19 @@ pub mod method {
     /// comes back in the configured mode.
     pub const ROBOT_SET_MODE: &str = "robot.setMode";
 
+    /// What each policy slot is running, and where that file came from.
+    ///
+    /// Distinct from [`ROBOT_MODE`], which says which *set* of slots is in play. This says what
+    /// is in them — and, when a load failed, what is in them instead of what was asked for.
+    pub const ROBOT_POLICIES: &str = "robot.policies";
+
+    /// Put a different `.onnx` in one slot, or drop an override and go back to the default.
+    ///
+    /// Answered like [`ROBOT_SET_MODE`] and for the same reason: the swap happens at the home
+    /// pose, seconds later, so the reply says the request was accepted and
+    /// [`ROBOT_POLICIES`] says what came of it.
+    pub const ROBOT_LOAD_POLICY: &str = "robot.loadPolicy";
+
     /// Turn the connection into a stream of [`ROBOT_STATE`] notifications.
     pub const ROBOT_SUBSCRIBE: &str = "robot.subscribe";
     /// Server → client. Never carries an `id`.
@@ -644,6 +669,10 @@ pub enum Call {
     RobotMode,
     /// Switch drive mode; see [`method::ROBOT_SET_MODE`].
     RobotSetMode(SetModeParams),
+    /// What each policy slot runs; see [`method::ROBOT_POLICIES`].
+    RobotPolicies,
+    /// Load one slot, or reset it; see [`method::ROBOT_LOAD_POLICY`].
+    RobotLoadPolicy(LoadPolicyParams),
     RobotSubscribe(SubscribeParams),
     // ── net.* ────────────────────────────────────────────────────────────────
     NetStatus,
@@ -770,6 +799,8 @@ impl Call {
             Call::RobotShutdown => method::ROBOT_SHUTDOWN,
             Call::RobotMode => method::ROBOT_MODE,
             Call::RobotSetMode(_) => method::ROBOT_SET_MODE,
+            Call::RobotPolicies => method::ROBOT_POLICIES,
+            Call::RobotLoadPolicy(_) => method::ROBOT_LOAD_POLICY,
             Call::RobotSubscribe(_) => method::ROBOT_SUBSCRIBE,
             Call::NetStatus => method::NET_STATUS,
             Call::NetScan => method::NET_SCAN,
@@ -869,6 +900,7 @@ impl Call {
             | Call::RobotHealth
             | Call::RobotModelApi
             | Call::RobotRemoteSessionActive
+            | Call::RobotPolicies
             | Call::RobotMode => (Robot, Prompt),
             // Intents and one-shot skills. All fast: they store a value the control loop reads on
             // its next tick, and none of them waits for the robot to finish anything.
@@ -886,6 +918,7 @@ impl Call {
             | Call::RobotTheremin(_)
             | Call::RobotChorale(_)
             | Call::RobotSetMode(_)
+            | Call::RobotLoadPolicy(_)
             | Call::RobotShutdown => (Robot, Prompt),
             Call::RobotSubscribe(_) => (Robot, Stream),
             // `btd` asking what to put on the air. The answering connection carries the beacon
@@ -971,6 +1004,7 @@ impl Call {
             Call::RobotPose(p) => encode(p),
             Call::RobotMouth(p) => encode(p),
             Call::RobotSetMode(p) => encode(p),
+            Call::RobotLoadPolicy(p) => encode(p),
             Call::RobotSound(p) => encode(p),
             Call::RobotTheremin(p) => encode(p),
             Call::RobotChorale(p) => encode(p),
@@ -994,6 +1028,7 @@ impl Call {
             | Call::RobotInit
             | Call::RobotRelax
             | Call::RobotShutdown
+            | Call::RobotPolicies
             | Call::RobotMode => Value::Object(serde_json::Map::new()),
             Call::NetStatus
             | Call::NetScan
@@ -1055,6 +1090,8 @@ impl Call {
             method::ROBOT_SHUTDOWN => Call::RobotShutdown,
             method::ROBOT_MODE => Call::RobotMode,
             method::ROBOT_SET_MODE => Call::RobotSetMode(decode(params)?),
+            method::ROBOT_POLICIES => Call::RobotPolicies,
+            method::ROBOT_LOAD_POLICY => Call::RobotLoadPolicy(decode(params)?),
             method::ROBOT_SUBSCRIBE => Call::RobotSubscribe(decode(params)?),
             method::NET_STATUS => Call::NetStatus,
             method::NET_SCAN => Call::NetScan,
@@ -1191,6 +1228,11 @@ pub mod test_support {
             }),
             Call::RobotShutdown,
             Call::RobotMode,
+            Call::RobotPolicies,
+            Call::RobotLoadPolicy(LoadPolicyParams {
+                slot: Some("walk".into()),
+                path: Some("/var/lib/robot/policies/bouncy.onnx".into()),
+            }),
             Call::RobotSubscribe(SubscribeParams { hz: Some(10) }),
             Call::NetStatus,
             Call::NetScan,
@@ -1746,6 +1788,71 @@ pub struct ModeResult {
     /// `"walk"` or `"roller"`. A string rather than an enum so a client older than a new
     /// mode reports it instead of failing to parse the answer.
     pub mode: String,
+}
+
+/// Which slot to change, and to what, for [`Call::RobotLoadPolicy`].
+///
+/// The two `Option`s mirror the config key this ends up writing: `[policy] walk` is an
+/// `Option<PathBuf>` where unset means "resolve this slot's default for the current mode", so
+/// clearing an override and asking for the default are the same operation on the wire as they
+/// are on disk.
+///
+/// | `slot` | `path` | means |
+/// |---|---|---|
+/// | `Some` | `Some` | run this file in this slot |
+/// | `Some` | `None` | drop this slot's override, back to the default |
+/// | `None` | `None` | drop every override — "put it all back" |
+/// | `None` | `Some` | refused; there is no such thing as loading one file into every slot |
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LoadPolicyParams {
+    /// `"walk"`, `"stand"`, `"sitstand"`, `"ground_pick"`, `"kick_left"`, `"kick_right"` or
+    /// `"roulade"`. A string for the reason [`SetModeParams`] carries one: a slot this build
+    /// does not have should be refused with the list of ones it does, not fail to parse.
+    pub slot: Option<String>,
+    /// The `.onnx` to run. Absolute — the daemon resolves nothing relative, because its working
+    /// directory is not the caller's and a path that meant one file to each would be worse than
+    /// a refusal.
+    pub path: Option<String>,
+}
+
+/// Answer to [`Call::RobotPolicies`] — what is actually loaded, not what was configured.
+///
+/// The distinction is the point. A slot whose override failed to load reports the file it fell
+/// back to in `path` and says why in `error`, so "I loaded a policy and the robot did not
+/// change" has an answer that does not require reading the journal.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PoliciesResult {
+    /// `"walk"` or `"roller"` — which mode's slot defaults are in play.
+    pub mode: String,
+    /// Whether policies are loaded at all (`[policy] enabled`). False is a legitimate bench
+    /// configuration, not a fault — the slots below then say what *would* load, and nothing is
+    /// running. Without this a client cannot tell a deliberately quiet robot from a broken one.
+    pub enabled: bool,
+    /// One entry per slot this build has, including the empty ones.
+    pub slots: Vec<PolicySlot>,
+}
+
+/// One policy slot's state, for [`PoliciesResult`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PolicySlot {
+    /// `"walk"`, `"stand"`, …
+    pub slot: String,
+    /// The file running in it. Absent means the slot is empty, which is a capability this
+    /// robot does not have rather than a fault — roller mode has no standing network.
+    pub path: Option<String>,
+    /// `"official"`, `"community"` or `"local"`. Absent when the slot is empty.
+    ///
+    /// A string rather than an enum so a client that predates an origin reports it verbatim
+    /// instead of failing to parse a robot's answer about what it is running.
+    pub origin: Option<String>,
+    /// Whether config overrides this slot, as opposed to it resolving to the mode's default.
+    pub overridden: bool,
+    /// Why this slot is not running what was asked of it. Set when an override failed to load
+    /// and the default was used instead; `path` then names what is actually running.
+    pub error: Option<String>,
 }
 
 /// How often a subscriber wants [`method::ROBOT_STATE`].
@@ -3845,7 +3952,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            46,
+            48,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }

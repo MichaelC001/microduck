@@ -5,6 +5,15 @@ Status: draft · Date: 2026-08-31 · Owner: pierre
 Where the ONNX policies come from, how someone tries one they did not train, and what
 "reset" puts back.
 
+**Built so far** (2026-08-31): everything §3, §4 and §5 describe, plus the local half of §7 —
+`robotctl policy list`, `load` and `reset`, over `robot.loadPolicy` and `robot.policies`. A
+policy on the board can be tried and undone without editing a file or restarting anything.
+
+**Not yet true**: nothing is on the Hub. The `policies` component of §9 does not exist, so every
+slot is still filled from the release directory and `origin` is only ever `official` or `local`;
+there is no library, no provenance sidecar, and no `check`, `update` or `search`. Those are
+slices 2 and 3 in [`roadmap.md`](../project/roadmap.md) §M8.
+
 Companion to [`updater-design.md`](updater-design.md), which owns the update engine —
 components, sources, signing, the health gate, rollback — and to
 [`robotd-design.md`](robotd-design.md) §2.3, which owns how a policy is validated and run.

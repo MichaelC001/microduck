@@ -644,6 +644,8 @@ impl Server {
             | Call::RobotShutdown
             | Call::RobotMode
             | Call::RobotSetMode(_)
+            | Call::RobotPolicies
+            | Call::RobotLoadPolicy(_)
             | Call::RobotSubscribe(_) => Response::err(
                 Some(id),
                 proto::Error::new(

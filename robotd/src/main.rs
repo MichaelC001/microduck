@@ -37,7 +37,7 @@ use clap::{Parser, Subcommand};
 use duck_control::fall::{FallPredictor, FallPredictorConfig};
 use duck_control::io::RobotIo;
 use duck_control::obs::{BodyPose, Command as PolicyCommand};
-use duck_control::policy::{DEFAULT_STANDING_THRESHOLD, Policy, PolicyPaths};
+use duck_control::policy::{DEFAULT_STANDING_THRESHOLD, Policy, PolicyError, PolicyPaths};
 use duck_control::safety::{Safety, SafetyConfig};
 use duck_control::{DEFAULT_POSITION, FakeIo, NUM_JOINTS};
 use duck_ipc_proto as proto;
@@ -46,7 +46,7 @@ use tokio::net::{UnixListener, UnixStream};
 
 use control::{Controller, SkillTuning, Tuning};
 use intents::Intents;
-use params::{Mode, Params};
+use params::{Mode, Params, Slot};
 
 /// What to do when the shutdown sequence completes. Injected so the tests can observe the
 /// call instead of powering off the machine running them.
@@ -332,6 +332,134 @@ impl PolicyNames {
     }
 }
 
+/// Why a slot is not running what was asked of it, for as long as that stays true.
+///
+/// A `Vec` rather than seven fields or a map: it is empty on nearly every robot, at most seven
+/// long, and the linear scan is over a list shorter than the branch predictor's memory.
+#[derive(Debug, Default, Clone)]
+struct SlotErrors(Vec<(Slot, String)>);
+
+impl SlotErrors {
+    fn get(&self, slot: Slot) -> Option<&str> {
+        self.0
+            .iter()
+            .find(|(s, _)| *s == slot)
+            .map(|(_, reason)| reason.as_str())
+    }
+
+    fn set(&mut self, slot: Slot, reason: String) {
+        self.clear(slot);
+        self.0.push((slot, reason));
+    }
+
+    fn clear(&mut self, slot: Slot) {
+        self.0.retain(|(s, _)| *s != slot);
+    }
+}
+
+/// Where a policy file came from, for `robot.policies`.
+///
+/// This build knows two origins: the release ships the official set, and anything else is a file
+/// somebody put on the board. **`community` is missing on purpose** — a bundle fetched from a Hub
+/// repo that is not ours arrives with the library, and so does the provenance record that is the
+/// only thing able to tell it from a hand-copied file. Guessing from the path would label a
+/// downloaded policy `local` or a scp'd one `community`, and both are worse than the origin
+/// appearing when it can be known. `docs/design/policy-channel-design.md` §2.
+fn origin_of(path: &std::path::Path) -> &'static str {
+    if path.starts_with(params::RELEASE_DIR) {
+        "official"
+    } else {
+        "local"
+    }
+}
+
+/// The per-slot answer to `robot.policies`: what is loaded, from where, and why not.
+///
+/// Derived rather than stored, from the three things that between them decide it — what config
+/// says, what that resolved to, and what failed. Storing it instead would be a fourth place for
+/// the same fact, updated from three.
+fn slot_report(
+    policy_params: &params::PolicyParams,
+    cfg: &params::ResolvedPolicy,
+    errors: &SlotErrors,
+) -> Vec<proto::PolicySlot> {
+    Slot::ALL
+        .into_iter()
+        .map(|slot| {
+            let path = cfg.slot(slot);
+            proto::PolicySlot {
+                slot: slot.as_str().to_owned(),
+                path: path.map(|p| p.display().to_string()),
+                origin: path.map(|p| origin_of(p).to_owned()),
+                overridden: policy_params.slot(slot).is_some(),
+                error: errors.get(slot).map(str::to_owned),
+            }
+        })
+        .collect()
+}
+
+/// Drop any *overridden* slot whose file will not load, before the controller is built.
+///
+/// The sharp edge of `robotctl policy load` writing config: a file that loaded when it was tried
+/// can be gone by the next boot — deleted, on a wiped library, on a reflashed board whose config
+/// was restored. Without this the daemon reports unhealthy on every start, and `updaterd`'s
+/// health gate then rolls back daemon releases for a reason no release caused: an update loop
+/// over a missing file no update could have supplied.
+///
+/// So an override that will not load costs its slot and nothing else. The slot falls back to the
+/// mode's default, the reason is recorded, and health reports **degraded** — the state for a
+/// fault that belongs to the board rather than to the release being gated, where reverting the
+/// daemon cannot help and only churns the boot counter.
+///
+/// **Only overrides.** An official path that will not load is a broken bundle and must reach the
+/// health gate as unhealthy, which is exactly what rolls it back.
+///
+/// **And only faults that name a file.** A missing ONNX Runtime fails every path equally; taking
+/// it as evidence against each override in turn would silently strip a board's whole
+/// configuration because a dylib was not installed. `docs/design/policy-channel-design.md` §5.
+fn drop_unloadable_overrides(policy_params: &mut params::PolicyParams, errors: &mut SlotErrors) {
+    drop_unloadable_overrides_with(policy_params, errors, duck_control::policy::validate)
+}
+
+/// [`drop_unloadable_overrides`] with the check injected, so its two rules can be tested on a
+/// machine that has no ONNX Runtime — which is every machine this repository's tests run on, and
+/// is itself one of the cases the rules are about.
+fn drop_unloadable_overrides_with(
+    policy_params: &mut params::PolicyParams,
+    errors: &mut SlotErrors,
+    validate: impl Fn(&std::path::Path) -> Result<(), PolicyError>,
+) {
+    if !policy_params.enabled {
+        return;
+    }
+    for slot in Slot::ALL {
+        if policy_params.slot(slot).is_none() {
+            continue;
+        }
+        let cfg = policy_params.resolved();
+        // A slot set to the literal "none" resolves to nothing, and disabling a capability on
+        // purpose is not a fault to fall back from.
+        let Some(path) = cfg.slot(slot) else {
+            continue;
+        };
+        let Err(e) = validate(path) else {
+            continue;
+        };
+        if e.path().is_none() {
+            tracing::error!(error = %e, "cannot validate policies at all; leaving config alone");
+            return;
+        }
+        tracing::error!(
+            slot = slot.as_str(),
+            path = %path.display(),
+            error = %e,
+            "override will not load; falling back to this slot's default"
+        );
+        errors.set(slot, e.to_string());
+        policy_params.set_slot(slot, None);
+    }
+}
+
 struct RobotState {
     /// Epoch for every timestamp below. `Instant` so the clock cannot go backwards.
     started: Instant,
@@ -398,6 +526,18 @@ struct RobotState {
     /// would be told about a robot that does not exist. Swapped by the control loop, which is
     /// the only thing that loads a policy.
     policies: ArcSwap<PolicyNames>,
+    /// The per-slot report `robot.policies` serves — paths, origins, and any slot whose override
+    /// could not be loaded.
+    ///
+    /// Beside [`Self::policies`] rather than replacing it: that one is read every time a client
+    /// asks which skills exist, on a hot path, and answers with file names alone. This is the
+    /// whole picture and is read when somebody asks a question about policies, which is rare.
+    /// Swapped together and by the same thread, so the two cannot disagree.
+    policy_slots: ArcSwap<Vec<proto::PolicySlot>>,
+    /// `[policy] enabled`. A startup constant — nothing switches it at runtime — and it is here
+    /// because `robot.policies` has to distinguish a robot that is deliberately holding its pose
+    /// from one whose slots merely look empty.
+    policy_enabled: bool,
     /// Whether this robot can make a sound at all: audio enabled, and a bank with wavs in
     /// it. Same job as the `policy_*` fields above — false is "this robot cannot do that",
     /// which is what lets `dispatch` refuse a `robot.sound` with a reason instead of
@@ -461,6 +601,12 @@ impl RobotState {
             chorale_tx: tokio::sync::broadcast::Sender::new(8),
             policy_error: ArcSwapOption::empty(),
             policies: ArcSwap::from_pointee(PolicyNames::of(&params.policy.resolved())),
+            policy_slots: ArcSwap::from_pointee(slot_report(
+                &params.policy,
+                &params.policy.resolved(),
+                &SlotErrors::default(),
+            )),
+            policy_enabled: params.policy.enabled,
             has_voice: params.audio.enabled && has_any_wav(&params.audio.bank),
             theremin_ready: AtomicBool::new(false),
             chorale_accepted: params.chorale.accept,
@@ -540,6 +686,23 @@ impl RobotState {
         // is wrong, instead of leaving a robot that holds a pose and never walks again.
         if let Some(reason) = self.policy_error.load_full() {
             return unhealthy(format!("policy unavailable: {reason}"));
+        }
+
+        // A slot running its default because an override would not load. Degraded rather than
+        // unhealthy, and the distinction is load-bearing: this is a property of the *board* —
+        // somebody's file is missing — so reverting the daemon cannot fix it, and gating on it
+        // would make every subsequent release fail its health check over a stale config line.
+        // The robot walks; it walks with the policy it shipped with, and says so.
+        let fell_back = self.policy_slots.load();
+        let mut fell_back = fell_back
+            .iter()
+            .filter_map(|slot| slot.error.as_ref().map(|e| format!("{}: {e}", slot.slot)))
+            .peekable();
+        if fell_back.peek().is_some() {
+            return degraded(format!(
+                "using the default policy where an override would not load — {}",
+                fell_back.collect::<Vec<_>>().join("; ")
+            ));
         }
 
         let errors = self.consecutive_errors.load(Ordering::Relaxed);
@@ -1048,23 +1211,23 @@ async fn adopt_startup_pose<T: RobotIo>(
 /// back. The alternative — refusing to start — becomes a crashloop under
 /// `Restart=always` and reaches the health gate as `Unreachable`, which blames the wrong
 /// thing in the journal.
-/// Load one mode's policy bundle, or `None` when there is nothing to load.
+/// Load one mode's policy bundle, reporting why not.
 ///
-/// A function rather than a block inline in the loop's preamble, because it runs twice: once at
-/// startup, and again on every `robot.setMode` — which is a mode's whole difference, since the
-/// networks and the tuning are all a mode *is* by the time params are resolved.
+/// `Ok(None)` is "no policy was wanted", which is healthy; `Err` is "one was wanted and could not
+/// be loaded", which is not. Collapsing those two would either make a bench robot look broken or
+/// let a release with an unusable bundle pass the health gate.
 ///
-/// A policy that was *not wanted* is healthy; one that was wanted and could not be loaded is not.
-/// Collapsing those two would either make a bench robot look broken or let a release with an
-/// unusable bundle pass the health gate.
-fn build_controller(
+/// Separate from [`build_controller`] because two callers want opposite things from a failure.
+/// Startup and a mode switch want it recorded as *the* policy error, which is unhealthy and gets
+/// the release rolled back. A `robot.loadPolicy` wants the reason handed back so it can keep the
+/// controller it already had — a robot must not lose its gait because somebody tried a file.
+fn try_controller(
     policy_cfg: &params::ResolvedPolicy,
     limp_fall: bool,
-    state: &RobotState,
-) -> Option<Controller> {
+) -> Result<Option<Controller>, PolicyError> {
     if !policy_cfg.enabled {
         tracing::warn!("policy disabled; holding the startup pose");
-        return None;
+        return Ok(None);
     }
     {
         let tuning = Tuning {
@@ -1112,13 +1275,29 @@ fn build_controller(
                     limp_fall,
                     "policy loaded"
                 );
-                Some(Controller::new(policy, tuning, skills))
+                Ok(Some(Controller::new(policy, tuning, skills)))
             }
-            Err(e) => {
-                tracing::error!(error = %e, "policy unavailable; holding the pose");
-                state.policy_error.store(Some(Arc::new(e.to_string())));
-                None
-            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// [`try_controller`], with a failure recorded as *the* policy error.
+///
+/// The startup and mode-switch path: a policy that was wanted and would not load makes the robot
+/// unhealthy, which is what gets a bad release rolled back rather than leaving a duck that holds
+/// a pose and never walks again.
+fn build_controller(
+    policy_cfg: &params::ResolvedPolicy,
+    limp_fall: bool,
+    state: &RobotState,
+) -> Option<Controller> {
+    match try_controller(policy_cfg, limp_fall) {
+        Ok(controller) => controller,
+        Err(e) => {
+            tracing::error!(error = %e, "policy unavailable; holding the pose");
+            state.policy_error.store(Some(Arc::new(e.to_string())));
+            None
         }
     }
 }
@@ -1131,9 +1310,26 @@ async fn control_loop<T: RobotIo>(
     period: Duration,
     poweroff: PowerOff,
 ) {
+    // Owned rather than borrowed from `params`, because neither the mode nor the slots stay
+    // what the file said: `robot.setMode` replaces the mode, `robot.loadPolicy` replaces one
+    // slot, and the line below drops any override this board cannot actually load.
+    let mut policy_params = params.policy.clone();
+    // Slots running their default because an override would not load. Empty on nearly every
+    // robot; anything in it makes health degraded and shows up in `robot.policies`.
+    let mut slot_errors = SlotErrors::default();
+    drop_unloadable_overrides(&mut policy_params, &mut slot_errors);
     // `mut` because a mode switch replaces it: the resolved policy *is* the mode, once the
     // per-mode defaults have been applied.
-    let mut policy_cfg = params.policy.resolved();
+    let mut policy_cfg = policy_params.resolved();
+    // Republished, because `RobotState::new` built both from the file and the check above may
+    // have dropped an override since. A client that asks before the first tick gets what this
+    // loop is actually going to load, not what the file asked for.
+    state.policies.store(Arc::new(PolicyNames::of(&policy_cfg)));
+    state.policy_slots.store(Arc::new(slot_report(
+        &policy_params,
+        &policy_cfg,
+        &slot_errors,
+    )));
     let mut safety = Safety::new(
         io,
         SafetyConfig {
@@ -1202,9 +1398,9 @@ async fn control_loop<T: RobotIo>(
     // A mode switch in flight: the mode to end up in, once the robot is home. `None` the rest of
     // the time, which is nearly always.
     let mut mode_change: Option<Mode> = None;
-    // The policy params this loop is running, which a mode switch replaces. Owned rather than
-    // borrowed from `params` because the mode is no longer what the file said.
-    let mut policy_params = params.policy.clone();
+    // A policy load in flight, for the same reason and on the same path as `mode_change`: the
+    // robot goes home first, and the swap happens there.
+    let mut policy_change: Option<intents::PolicyLoad> = None;
 
     // Command smoothing, per the prototype: `cmd += α × (target − cmd)` at the tick rate.
     // A stick snap becomes a ramp the gait can follow; the state lives here because it is
@@ -1570,6 +1766,37 @@ async fn control_loop<T: RobotIo>(
             }
         }
 
+        // A policy change: `robot.loadPolicy`. The same path as a mode switch and for the same
+        // reason — swapping a network under a moving gait means the next tick is a different
+        // policy's idea of what the legs were doing — so the robot goes home first and the swap
+        // happens there, torque on throughout.
+        if let Some(load) = intents.take_policy_load() {
+            if mode_change.is_some() || policy_change.is_some() {
+                tracing::warn!("a policy change is already in flight; ignoring this one");
+            } else {
+                tracing::warn!(
+                    slot = load.slot.map_or("all", |slot| slot.as_str()),
+                    path = ?load.path.as_ref().map(|p| p.display().to_string()),
+                    "policy load: going home before swapping"
+                );
+                policy_change = Some(load);
+                // Home first only when the robot is actually up. The ramp exists to stop a
+                // network being swapped under a moving gait, and a robot lying limp on a bench
+                // has no gait to protect — while standing one up because somebody loaded a file
+                // would be a surprise of its own, and on a table a nasty one. So the swap below
+                // waits for the ramp when there is one and happens on this tick when there is
+                // not.
+                if bringup == Bringup::Ready
+                    && let Some(sensors) = sensors.as_ref()
+                {
+                    bringup = Bringup::Homing {
+                        from: sensors.positions,
+                        since: tick_start,
+                    };
+                }
+            }
+        }
+
         // The sit-then-power-off sequence: `robot.shutdown`, or a genuinely empty pack.
         // The battery reading is a ~10 s EMA refreshed once a second, so a load sag cannot
         // reach the floor — a pack that gets there is spent.
@@ -1846,6 +2073,9 @@ async fn control_loop<T: RobotIo>(
                 // `robot.mode` and gets the new one must not then be told the old mode's networks.
                 state.policies.store(Arc::new(PolicyNames::of(&cfg)));
                 state.mode.store(mode_code(target), Ordering::Relaxed);
+                state
+                    .policy_slots
+                    .store(Arc::new(slot_report(&policy_params, &cfg, &slot_errors)));
                 policy_cfg = cfg;
                 tracing::warn!(
                     mode = target.as_str(),
@@ -1853,10 +2083,80 @@ async fn control_loop<T: RobotIo>(
                     "mode switch complete"
                 );
             }
+
             tracing::warn!("at the home pose; the policy has the robot");
             bringup = Bringup::Ready;
             hold = DEFAULT_POSITION;
         }
+        // A pending policy load, applied where it is safe to: at the home pose the ramp above
+        // just reached, or straight away on a robot that was never driving. Never mid-ramp,
+        // which is the one state where the joints are moving somewhere they have not arrived.
+        //
+        // What differs from a mode switch is the failure. A mode switch that will not load
+        // leaves the robot unhealthy, because the release it shipped in is broken. A load is
+        // somebody *trying* a file, and losing the gait you had over it would be a worse answer
+        // than the file being refused — so nothing is swapped unless the new controller built.
+        if !matches!(bringup, Bringup::Homing { .. })
+            && let Some(load) = policy_change.take()
+        {
+            let mut candidate = policy_params.clone();
+            match load.slot {
+                Some(slot) => candidate.set_slot(slot, load.path.clone()),
+                None => {
+                    for slot in Slot::ALL {
+                        candidate.set_slot(slot, None);
+                    }
+                }
+            }
+            let cfg = candidate.resolved();
+            match try_controller(&cfg, params.safety.limp_fall) {
+                Ok(built) => {
+                    controller = built;
+                    policy_params = candidate;
+                    // Whatever this slot could not do before, it is not doing it now: either
+                    // it loaded, or it went back to a default that is known to.
+                    match load.slot {
+                        Some(slot) => slot_errors.clear(slot),
+                        None => slot_errors = SlotErrors::default(),
+                    }
+                    state.policy_error.store(None);
+                    state.policies.store(Arc::new(PolicyNames::of(&cfg)));
+                    state.policy_slots.store(Arc::new(slot_report(
+                        &policy_params,
+                        &cfg,
+                        &slot_errors,
+                    )));
+                    policy_cfg = cfg;
+                    tracing::warn!(
+                        slot = load.slot.map_or("all", |slot| slot.as_str()),
+                        loaded = controller.is_some(),
+                        "policy load complete"
+                    );
+                }
+                Err(e) => {
+                    // `candidate` is dropped, so config, the resolved paths and the running
+                    // networks are all still the ones that were working a tick ago.
+                    tracing::error!(
+                        slot = load.slot.map_or("all", |slot| slot.as_str()),
+                        error = %e,
+                        "policy load failed; keeping the policy that was running"
+                    );
+                    // Recorded against the slot so the failure outlives the log line: it is
+                    // what `robot.policies` shows the caller polling for an outcome, and what
+                    // makes health degraded until the slot is loaded or reset. It does not
+                    // make the robot unhealthy — nothing about the release is wrong.
+                    if let Some(slot) = load.slot {
+                        slot_errors.set(slot, e.to_string());
+                        state.policy_slots.store(Arc::new(slot_report(
+                            &policy_params,
+                            &policy_cfg,
+                            &slot_errors,
+                        )));
+                    }
+                }
+            }
+        }
+
         state
             .homed
             .store(bringup == Bringup::Ready, Ordering::Relaxed);
@@ -2672,6 +2972,73 @@ fn apply_intent(intents: &Intents, call: &proto::Call) -> bool {
     }
 }
 
+/// Validate a `robot.loadPolicy` and, if it holds up, queue it for the loop.
+///
+/// **The file is opened here**, on the IPC runtime rather than the control thread. The swap
+/// itself happens at the home pose seconds later, so without this the answer to
+/// `robotctl policy load walk some-51d-thing.onnx` would be "accepted" followed by a robot that
+/// did not change, and the reason would be a journal line. Validating first turns that into
+/// `observation width is 51, expected 61` before the caller's command returns.
+///
+/// It is not a guarantee — the file can still be replaced between here and the home pose — which
+/// is why the loop keeps the controller it has when the real load fails.
+fn load_policy_request(
+    p: &proto::LoadPolicyParams,
+    state: &RobotState,
+    intents: &Intents,
+) -> proto::IntentResult {
+    // The one combination the wire type allows and nothing means: there is no such thing as
+    // loading one file into every slot.
+    if p.slot.is_none() && p.path.is_some() {
+        return proto::IntentResult::refused(
+            "a path needs a slot; omit both to reset every slot to its default",
+        );
+    }
+
+    let slot = match p.slot.as_deref() {
+        None => None,
+        Some(name) => match Slot::parse(name) {
+            Some(slot) => Some(slot),
+            None => {
+                return proto::IntentResult::refused(format!(
+                    "no policy slot named {name:?}; expected one of {}",
+                    Slot::names()
+                ));
+            }
+        },
+    };
+
+    // Writing an override a disabled loop will never read is a config edit that silently does
+    // nothing, which is the failure `robotctl policy load` exists to remove.
+    if !state.policy_enabled {
+        return proto::IntentResult::refused(
+            "policies are disabled on this robot; set [policy] enabled = true first",
+        );
+    }
+
+    let path = match p.path.as_deref() {
+        None => None,
+        Some(path) => {
+            let path = PathBuf::from(path);
+            // `robotd`'s working directory is not the caller's, so a relative path would name a
+            // different file at each end — a refusal is better than loading the wrong one.
+            if !path.is_absolute() {
+                return proto::IntentResult::refused(format!(
+                    "{} is not an absolute path",
+                    path.display()
+                ));
+            }
+            if let Err(e) = duck_control::policy::validate(&path) {
+                return proto::IntentResult::refused(e.to_string());
+            }
+            Some(path)
+        }
+    };
+
+    intents.request_policy_load(intents::PolicyLoad { slot, path });
+    proto::IntentResult::accepted()
+}
+
 fn dispatch(
     state: &RobotState,
     intents: &Intents,
@@ -2825,6 +3192,24 @@ fn dispatch(
                 }
             };
             proto::Response::ok(Some(id), &result)
+        }
+
+        // What each slot is running, from where, and why it is not running what was asked. Served
+        // from the snapshot the control loop publishes, so it answers during startup too rather
+        // than racing the first load.
+        proto::Call::RobotPolicies => proto::Response::ok(
+            Some(id),
+            &proto::PoliciesResult {
+                mode: mode_of(state.mode.load(Ordering::Relaxed))
+                    .as_str()
+                    .to_owned(),
+                enabled: state.policy_enabled,
+                slots: state.policy_slots.load().as_ref().clone(),
+            },
+        ),
+
+        proto::Call::RobotLoadPolicy(p) => {
+            proto::Response::ok(Some(id), &load_policy_request(p, state, intents))
         }
 
         proto::Call::RobotMode => proto::Response::ok(
@@ -4321,6 +4706,311 @@ mod tests {
             health.degraded,
             "an unpowered board would roll back releases"
         );
+    }
+
+    // ── the policy channel ───────────────────────────────────────────────
+    //
+    // `docs/design/policy-channel-design.md`. These are the rules that keep `policy load` from
+    // being a way to break a robot: what is refused before anything is queued, and what a
+    // failure costs.
+
+    fn shape_error(path: &str) -> PolicyError {
+        PolicyError::Shape {
+            path: PathBuf::from(path),
+            what: "observation width",
+            expected: "61".into(),
+            got: "51".into(),
+        }
+    }
+
+    /// **A board with no ONNX Runtime must keep its overrides.**
+    ///
+    /// The failure this prevents is quiet and total: without the check, a missing dylib fails
+    /// every path in turn, each failure reads as "that slot's file is bad", and a robot silently
+    /// loses its whole policy configuration because a library was not installed. The daemon then
+    /// runs release defaults it was told not to, while the config file still says otherwise.
+    #[test]
+    fn a_fault_that_names_no_file_drops_nothing() {
+        let mut policy = params::PolicyParams::default();
+        policy.set_slot(Slot::Walk, Some(PathBuf::from("/srv/mine.onnx")));
+        policy.set_slot(Slot::Roulade, Some(PathBuf::from("/srv/roll.onnx")));
+        let mut errors = SlotErrors::default();
+
+        drop_unloadable_overrides_with(&mut policy, &mut errors, |_| {
+            Err(PolicyError::RuntimeMissing {
+                searched: "libonnxruntime.so".into(),
+                detail: "cannot open shared object file".into(),
+            })
+        });
+
+        assert_eq!(
+            policy.slot(Slot::Walk).as_deref(),
+            Some(std::path::Path::new("/srv/mine.onnx")),
+            "a missing runtime is not evidence against anybody's file"
+        );
+        assert!(policy.slot(Slot::Roulade).is_some());
+        assert!(errors.get(Slot::Walk).is_none(), "and nothing to report");
+    }
+
+    /// An override that will not load costs its slot, and the slot falls back to the default
+    /// rather than emptying — a robot that loses `walk` cannot walk at all.
+    #[test]
+    fn an_unloadable_override_falls_back_to_the_default() {
+        let mut policy = params::PolicyParams::default();
+        policy.set_slot(Slot::Walk, Some(PathBuf::from("/srv/mine.onnx")));
+        let mut errors = SlotErrors::default();
+
+        drop_unloadable_overrides_with(&mut policy, &mut errors, |path| {
+            Err(shape_error(&path.display().to_string()))
+        });
+
+        assert!(policy.slot(Slot::Walk).is_none(), "the override is dropped");
+        assert!(
+            policy
+                .resolved()
+                .walk
+                .ends_with("policies/alpha_walking.onnx"),
+            "and the slot resolves to the release's own policy"
+        );
+        let reason = errors.get(Slot::Walk).expect("the reason is kept");
+        assert!(reason.contains("51"), "and it names the shape: {reason}");
+    }
+
+    /// **Only overrides are dropped.** An official path that will not load is a broken release,
+    /// and it has to reach the health gate as unhealthy — that is what rolls it back. Quietly
+    /// falling back would leave a duck standing still and a release that passed.
+    #[test]
+    fn an_official_path_is_never_validated_away() {
+        let mut policy = params::PolicyParams::default();
+        policy.set_slot(Slot::Walk, Some(PathBuf::from("/srv/mine.onnx")));
+        let asked = std::cell::RefCell::new(Vec::new());
+        let mut errors = SlotErrors::default();
+
+        drop_unloadable_overrides_with(&mut policy, &mut errors, |path| {
+            asked.borrow_mut().push(path.display().to_string());
+            Ok(())
+        });
+
+        assert_eq!(
+            asked.into_inner(),
+            vec!["/srv/mine.onnx".to_string()],
+            "the six slots resolving to release defaults are not this check's business"
+        );
+    }
+
+    /// **The health-gate rule.** A slot running its default because somebody's override went
+    /// missing is degraded, never unhealthy.
+    ///
+    /// Get this wrong and a stale config line rolls back every daemon release that follows it:
+    /// the robot is unhealthy at boot, the gate reverts, the next release fails the same way, and
+    /// nothing in the update could ever have supplied the file. Degraded passes the gate and
+    /// still says what is wrong.
+    #[test]
+    fn a_slot_that_fell_back_is_degraded_and_not_unhealthy() {
+        let s = RobotState::new(&Params::default(), false, false);
+        s.ticks.store(1, Ordering::Relaxed);
+        s.last_tick_us
+            .store(s.started.elapsed().as_micros() as u64, Ordering::Relaxed);
+
+        let mut slots = s.policy_slots.load().as_ref().clone();
+        slots[0].error = Some("/srv/mine.onnx: observation width is 51, expected 61".into());
+        s.policy_slots.store(Arc::new(slots));
+
+        let health = s.health();
+        assert!(!health.healthy);
+        assert!(health.degraded, "this must not roll a release back");
+        let reason = health.reason.unwrap();
+        assert!(reason.contains("walk"), "it names the slot: {reason}");
+        assert!(reason.contains("51"), "and the reason: {reason}");
+    }
+
+    /// A slot name this build does not have must come back as a refusal listing the ones it does.
+    /// `ground_pick` against `groundPick` is the mistake worth costing one line rather than a
+    /// debugging session.
+    #[test]
+    fn an_unknown_slot_is_refused_with_the_names() {
+        let s = RobotState::new(&Params::default(), false, false);
+        let intents = Arc::new(Intents::new());
+
+        let result: proto::IntentResult = dispatch(
+            &s,
+            &intents,
+            proto::Id::Number(1),
+            &proto::Call::RobotLoadPolicy(proto::LoadPolicyParams {
+                slot: Some("groundPick".into()),
+                path: Some("/srv/x.onnx".into()),
+            }),
+        )
+        .result_as()
+        .unwrap();
+
+        assert!(!result.accepted);
+        let reason = result.reason.unwrap();
+        assert!(reason.contains("ground_pick"), "{reason}");
+        assert!(intents.take_policy_load().is_none(), "nothing was queued");
+    }
+
+    /// `robotd`'s working directory is not the caller's, so a relative path names a different
+    /// file at each end. Refused rather than resolved against whatever the daemon happens to be
+    /// sitting in.
+    #[test]
+    fn a_relative_policy_path_is_refused() {
+        let s = RobotState::new(&Params::default(), false, false);
+        let intents = Arc::new(Intents::new());
+
+        let result: proto::IntentResult = dispatch(
+            &s,
+            &intents,
+            proto::Id::Number(1),
+            &proto::Call::RobotLoadPolicy(proto::LoadPolicyParams {
+                slot: Some("walk".into()),
+                path: Some("mine.onnx".into()),
+            }),
+        )
+        .result_as()
+        .unwrap();
+
+        assert!(!result.accepted);
+        assert!(result.reason.unwrap().contains("absolute"));
+        assert!(intents.take_policy_load().is_none());
+    }
+
+    /// The one combination the wire type can express and nothing means. Refused with the thing
+    /// the caller probably meant, because "omit both" is not guessable from a rejection.
+    #[test]
+    fn a_path_without_a_slot_is_refused() {
+        let s = RobotState::new(&Params::default(), false, false);
+        let intents = Arc::new(Intents::new());
+
+        let result: proto::IntentResult = dispatch(
+            &s,
+            &intents,
+            proto::Id::Number(1),
+            &proto::Call::RobotLoadPolicy(proto::LoadPolicyParams {
+                slot: None,
+                path: Some("/srv/x.onnx".into()),
+            }),
+        )
+        .result_as()
+        .unwrap();
+
+        assert!(!result.accepted);
+        assert!(result.reason.unwrap().contains("omit both"));
+    }
+
+    /// Resetting every slot is the "put it back" command, and it must reach the loop even though
+    /// it names neither a slot nor a file — the shape every other refusal above rejects.
+    #[test]
+    fn resetting_every_slot_is_accepted() {
+        let s = RobotState::new(&Params::default(), false, false);
+        let intents = Arc::new(Intents::new());
+
+        let result: proto::IntentResult = dispatch(
+            &s,
+            &intents,
+            proto::Id::Number(1),
+            &proto::Call::RobotLoadPolicy(proto::LoadPolicyParams {
+                slot: None,
+                path: None,
+            }),
+        )
+        .result_as()
+        .unwrap();
+
+        assert!(result.accepted, "{:?}", result.reason);
+        assert_eq!(
+            intents.take_policy_load(),
+            Some(intents::PolicyLoad {
+                slot: None,
+                path: None
+            })
+        );
+    }
+
+    /// Writing an override a disabled loop will never read is a config edit that silently does
+    /// nothing — the exact failure `robotctl policy load` exists to remove.
+    #[test]
+    fn loading_is_refused_while_policies_are_disabled() {
+        let mut params = Params::default();
+        params.policy.enabled = false;
+        let s = RobotState::new(&params, false, false);
+        let intents = Arc::new(Intents::new());
+
+        let result: proto::IntentResult = dispatch(
+            &s,
+            &intents,
+            proto::Id::Number(1),
+            &proto::Call::RobotLoadPolicy(proto::LoadPolicyParams {
+                slot: Some("walk".into()),
+                path: None,
+            }),
+        )
+        .result_as()
+        .unwrap();
+
+        assert!(!result.accepted);
+        assert!(result.reason.unwrap().contains("disabled"));
+    }
+
+    /// `robot.policies` answers for every slot, including the empty ones, and says where each
+    /// file came from. A client rendering a table needs the empty rows too — "this robot has no
+    /// standing network" is an answer, not a gap.
+    #[test]
+    fn robot_policies_reports_every_slot_with_its_origin() {
+        let s = RobotState::new(&Params::default(), false, false);
+        let intents = Arc::new(Intents::new());
+
+        let result: proto::PoliciesResult = dispatch(
+            &s,
+            &intents,
+            proto::Id::Number(1),
+            &proto::Call::RobotPolicies,
+        )
+        .result_as()
+        .unwrap();
+
+        assert_eq!(result.mode, "walk");
+        assert!(result.enabled);
+        assert_eq!(result.slots.len(), Slot::ALL.len());
+        for slot in &result.slots {
+            assert_eq!(
+                slot.origin.as_deref(),
+                Some("official"),
+                "a default robot runs the release's own set: {slot:?}"
+            );
+            assert!(!slot.overridden, "{slot:?}");
+            assert!(slot.error.is_none(), "{slot:?}");
+        }
+    }
+
+    /// An overridden slot must report as such, and a file outside the release is not `official`
+    /// — the badge is what the whole origin split rests on, so it cannot be decoration.
+    #[test]
+    fn an_override_reports_as_local_and_overridden() {
+        let mut params = Params::default();
+        params
+            .policy
+            .set_slot(Slot::Walk, Some(PathBuf::from("/srv/mine.onnx")));
+        let s = RobotState::new(&params, false, false);
+        let intents = Arc::new(Intents::new());
+
+        let result: proto::PoliciesResult = dispatch(
+            &s,
+            &intents,
+            proto::Id::Number(1),
+            &proto::Call::RobotPolicies,
+        )
+        .result_as()
+        .unwrap();
+
+        let walk = result
+            .slots
+            .iter()
+            .find(|s| s.slot == "walk")
+            .expect("walk is always reported");
+        assert_eq!(walk.origin.as_deref(), Some("local"));
+        assert!(walk.overridden);
+        assert_eq!(walk.path.as_deref(), Some("/srv/mine.onnx"));
     }
 
     /// The other unhealthy states *are* evidence about the release, so they must not be

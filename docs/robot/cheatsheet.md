@@ -156,25 +156,51 @@ journalctl -u mediad -b | grep streaming
 
 #### Your own policy
 
-You do not need to cut a release to try a network. Point `robotd` at your own `.onnx` on the
-board, in `/etc/robot/robotd.toml`:
-
-```toml
-[policy]
-walk = "/home/radxa/my_walking.onnx"
-stand = "/home/radxa/my_stand.onnx"
-```
+You do not need to cut a release, edit a file, or restart anything to try a network. Copy your
+`.onnx` to the board and load it:
 
 ```
-sudo systemctl restart robotd
+sudo robotctl policy load walk /home/radxa/my_walking.onnx
 ```
 
-Your paths survive updates — a release replaces the binaries and the policies it ships, not the
-file that points elsewhere. Delete the lines to go back to the ones the release carries.
+The robot returns to its home pose, loads it, and drives again. What is running:
 
-A policy that could not be loaded reports **unhealthy**, and `robotctl health` and the bottom
-border of `monitor` both name the reason. The shape a policy has to have, and what else is
-checked at load, are in [`../design/robotd-design.md`](../design/robotd-design.md) §2.3.
+```
+robotctl policy list
+```
+
+Put one slot back:
+
+```
+sudo robotctl policy reset walk
+```
+
+Put everything back:
+
+```
+sudo robotctl policy reset
+```
+
+The slots are `walk`, `stand`, `sitstand`, `ground_pick`, `kick_left`, `kick_right` and
+`roulade`. `load` writes the choice into `/etc/robot/robotd.toml`, so it survives a reboot and
+survives updates — a release replaces the binaries and the policies it ships, not the line that
+points elsewhere. `reset` removes that line again.
+
+Three things worth knowing:
+
+- **A policy that is not `obs[1,61] -> actions[1,14]` is refused before anything changes.** The
+  file is opened and checked while the robot is still running the old one, and the command
+  prints the reason.
+- **A load that fails anyway keeps the policy that was running.** Trying a gait cannot cost you
+  the one you had.
+- **A file that has gone missing by the next boot costs its slot, not the robot.** That slot
+  falls back to the policy this release ships, `robotctl health` reports *degraded* and names
+  the file, and `robotctl policy reset <slot>` clears it. An official policy that will not load
+  is still **unhealthy** — that is a broken release, and the updater rolls it back.
+
+The shape a policy has to have and what else is checked at load are in
+[`../design/robotd-design.md`](../design/robotd-design.md) §2.3; where policies come from and
+what `official` means is [`../design/policy-channel-design.md`](../design/policy-channel-design.md).
 
 ### Power to the joints (`robotd`)
 

@@ -36,7 +36,7 @@ const POWER_INIT: u8 = 1;
 const POWER_RELAX: u8 = 2;
 use std::time::{Duration, Instant};
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use duck_control::obs::{BodyPose, Command};
 
 /// A value and when it arrived.
@@ -163,11 +163,34 @@ pub struct Intents {
     /// request wins — two arriving in the same tick means somebody pressed twice, and the second
     /// answer is the one they are waiting for.
     mode_switch: AtomicU8,
+    /// A pending `robot.loadPolicy`, or `None` — which is nearly always.
+    ///
+    /// An `ArcSwapOption` rather than the `AtomicU8` `mode_switch` uses, because the request
+    /// carries a path and a mode code does not. Same last-writer-wins semantics for the same
+    /// reason: two loads in one tick means somebody changed their mind, and the second is the
+    /// answer they are waiting for.
+    ///
+    /// Unlike `mode_switch` this does name a domain type, [`crate::params::Slot`]. The mode code
+    /// exists because `Mode` lives in `main.rs` and this module should not reach into it; `Slot`
+    /// lives in the shared params crate that owns the config keys it names, and encoding one as
+    /// a number here would only move the parse somewhere with less to check it against.
+    policy_load: ArcSwapOption<PolicyLoad>,
     /// Pending one-shot sound tags, a bitmask taken once per tick like the skills.
     sounds: std::sync::atomic::AtomicU32,
     /// The wheee hold, as a stamped level: `padd` re-notifies while the trigger is down,
     /// and the loop reads value + age so a dead client's ride decays instead of looping.
     wheee: ArcSwap<Stamped<bool>>,
+}
+
+/// A pending policy change, as [`Intents::request_policy_load`] took it.
+///
+/// The two `Option`s carry the same four cases the wire type does, minus the one it refuses —
+/// see `duck_ipc_proto::LoadPolicyParams`. `slot: None` is "every slot", which only reaches here
+/// paired with `path: None`, so what it means is *reset everything*.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyLoad {
+    pub slot: Option<crate::params::Slot>,
+    pub path: Option<std::path::PathBuf>,
 }
 
 /// What a client asked for, once.
@@ -227,6 +250,7 @@ impl Intents {
             skills: std::sync::atomic::AtomicU32::new(0),
             shutdown: AtomicBool::new(false),
             mode_switch: AtomicU8::new(MODE_NONE),
+            policy_load: ArcSwapOption::empty(),
             sounds: std::sync::atomic::AtomicU32::new(0),
             wheee: ArcSwap::from_pointee(Stamped {
                 value: false,
@@ -355,6 +379,24 @@ impl Intents {
             MODE_NONE => None,
             code => Some(code),
         }
+    }
+
+    /// Ask for a policy change: one slot to a file, one slot back to its default, or all of
+    /// them back to theirs.
+    ///
+    /// The caller has already validated the file — see `duck_control::policy::validate` — so
+    /// reaching here means the load is expected to succeed. It can still fail at the home pose
+    /// seconds later, which is why the loop keeps the controller it has until the new one is
+    /// built.
+    pub fn request_policy_load(&self, load: PolicyLoad) {
+        self.policy_load.store(Some(Arc::new(load)));
+    }
+
+    /// Take a pending policy change. Taken, so the sequence runs once per request.
+    pub fn take_policy_load(&self) -> Option<PolicyLoad> {
+        self.policy_load
+            .swap(None)
+            .map(|load| PolicyLoad::clone(&load))
     }
 
     /// Ask for the sit-then-power-off sequence.

@@ -102,6 +102,20 @@ fn permits(call: &proto::Call) -> bool {
         // where it belongs.
         RobotSetMode(_) => false,
 
+        // Nor loading a policy, and this one is a deferral rather than a rule — which is the
+        // distinction §5 of the design asks these arms to be honest about. The "peer can watch"
+        // argument that permits `robot.init` and `robot.shutdown` above genuinely does cover
+        // trying a gait over a video link, and a failed load now keeps the running controller
+        // rather than leaving the robot gaitless. What is missing is a client: nothing on this
+        // transport can name a slot or a file yet, and §4 means any LAN peer would inherit it
+        // the moment it could. Lift it when there is something to lift it *for*.
+        RobotLoadPolicy(_) => false,
+
+        // Reading what each slot runs, on the other hand, is the same kind of question as the
+        // update reads below — what software is this robot on — and a remote client watching a
+        // gait misbehave has an obvious use for the answer.
+        RobotPolicies => true,
+
         // ── the streams BLE pointed here ────────────────────────────────────
         //
         // `pad.input` exists to measure the cadence of its own delivery, and `btd` refuses it

@@ -569,6 +569,79 @@ fn is_none_sentinel(path: &std::path::Path) -> bool {
     path.as_os_str().eq_ignore_ascii_case("none")
 }
 
+/// One policy slot, named — the seven `[policy]` path keys as a value rather than a field name.
+///
+/// It exists because three places now need to turn the string `"ground_pick"` into *that
+/// particular key*: `robot.loadPolicy` on the wire, the `toml_edit` write `robotctl policy load`
+/// performs, and the per-slot report `robot.policies` answers with. Spelling the mapping out in
+/// each of them is how one of them ends up writing `policy.groundpick` to a file nobody reads
+/// back until the robot will not walk.
+///
+/// [`Slot::as_str`] is the serde key, not a display name, and
+/// [`tests::every_slot_is_a_registry_key`] is what keeps that true.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Slot {
+    Walk,
+    Stand,
+    SitStand,
+    GroundPick,
+    KickLeft,
+    KickRight,
+    Roulade,
+}
+
+impl Slot {
+    /// Every slot, in the order `[policy]` lists them and the order a report should print them.
+    pub const ALL: [Slot; 7] = [
+        Slot::Walk,
+        Slot::Stand,
+        Slot::SitStand,
+        Slot::GroundPick,
+        Slot::KickLeft,
+        Slot::KickRight,
+        Slot::Roulade,
+    ];
+
+    /// The serde key, exactly as `[policy]` spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Slot::Walk => "walk",
+            Slot::Stand => "stand",
+            Slot::SitStand => "sitstand",
+            Slot::GroundPick => "ground_pick",
+            Slot::KickLeft => "kick_left",
+            Slot::KickRight => "kick_right",
+            Slot::Roulade => "roulade",
+        }
+    }
+
+    /// `section.key`, which is what the registry and `toml_edit` want.
+    pub fn config_key(self) -> String {
+        format!("policy.{}", self.as_str())
+    }
+
+    /// Parse a slot name off the wire. `None` for anything else, so a caller can refuse with
+    /// the list of names it does know rather than failing to deserialize.
+    pub fn parse(name: &str) -> Option<Slot> {
+        Slot::ALL.into_iter().find(|s| s.as_str() == name)
+    }
+
+    /// Every slot name, for the "expected one of" half of a refusal.
+    pub fn names() -> String {
+        Slot::ALL
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+impl std::fmt::Display for Slot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// `[policy]` with every absent field resolved against the mode's defaults.
 ///
 /// This is what the rest of `robotd` consumes — nothing downstream should ever have to ask
@@ -601,7 +674,52 @@ pub struct ResolvedPolicy {
     pub nominal_voltage: f64,
 }
 
+impl ResolvedPolicy {
+    /// The file that will actually be loaded into one slot, after mode defaults are applied.
+    /// `None` means the slot is empty — a capability this robot does not have.
+    pub fn slot(&self, slot: Slot) -> Option<&std::path::Path> {
+        match slot {
+            Slot::Walk => Some(self.walk.as_path()),
+            Slot::Stand => self.stand.as_deref(),
+            Slot::SitStand => self.sitstand.as_deref(),
+            Slot::GroundPick => self.ground_pick.as_deref(),
+            Slot::KickLeft => self.kick_left.as_deref(),
+            Slot::KickRight => self.kick_right.as_deref(),
+            Slot::Roulade => self.roulade.as_deref(),
+        }
+    }
+}
+
 impl PolicyParams {
+    /// What config says about one slot: `None` unset (resolve the mode's default), `Some("none")`
+    /// disabled outright, `Some(path)` an override.
+    pub fn slot(&self, slot: Slot) -> &Option<PathBuf> {
+        match slot {
+            Slot::Walk => &self.walk,
+            Slot::Stand => &self.stand,
+            Slot::SitStand => &self.sitstand,
+            Slot::GroundPick => &self.ground_pick,
+            Slot::KickLeft => &self.kick_left,
+            Slot::KickRight => &self.kick_right,
+            Slot::Roulade => &self.roulade,
+        }
+    }
+
+    /// Set or clear one slot's override. Clearing is what `robotctl policy reset` does, and it
+    /// is why this takes an `Option` rather than having a second method for it.
+    pub fn set_slot(&mut self, slot: Slot, path: Option<PathBuf>) {
+        let field = match slot {
+            Slot::Walk => &mut self.walk,
+            Slot::Stand => &mut self.stand,
+            Slot::SitStand => &mut self.sitstand,
+            Slot::GroundPick => &mut self.ground_pick,
+            Slot::KickLeft => &mut self.kick_left,
+            Slot::KickRight => &mut self.kick_right,
+            Slot::Roulade => &mut self.roulade,
+        };
+        *field = path;
+    }
+
     pub fn resolved(&self) -> ResolvedPolicy {
         let release = |name: &str| PathBuf::from(RELEASE_DIR).join("policies").join(name);
         let path = |field: &Option<PathBuf>, default: Option<&str>| -> Option<PathBuf> {
@@ -1065,6 +1183,90 @@ fn without_unknown_keys(text: &str) -> Option<(Result<Params, toml::de::Error>, 
 
 #[cfg(test)]
 mod tests {
+    /// [`Slot::as_str`] must be the *serde key*, because `robotctl policy load` writes
+    /// `policy.<slot>` into `robotd.toml` with it. A display name that merely reads well —
+    /// `sit_stand`, `groundPick` — would write a key `Params` then ignores as unknown, and the
+    /// symptom is a load that reports success and changes nothing until the next reboot proves
+    /// it never stuck.
+    ///
+    /// The registry is the right thing to check against rather than `PolicyParams`'s fields,
+    /// because it is itself pinned complete against serde's own field list.
+    #[test]
+    fn every_slot_is_a_registry_key() {
+        for slot in super::Slot::ALL {
+            let key = slot.config_key();
+            let entry = crate::registry::REGISTRY
+                .iter()
+                .find(|e| e.key == key)
+                .unwrap_or_else(|| panic!("{key} is not a key of robotd.toml"));
+            assert_eq!(
+                entry.kind,
+                crate::registry::Kind::OptionalPath,
+                "{key} must be a path slot"
+            );
+        }
+    }
+
+    /// Round-tripping every slot through its own name, so a rename cannot half-land: `parse`
+    /// and `as_str` disagreeing would make a slot loadable under a name nothing reports.
+    #[test]
+    fn slot_names_round_trip() {
+        for slot in super::Slot::ALL {
+            assert_eq!(super::Slot::parse(slot.as_str()), Some(slot));
+        }
+        assert_eq!(super::Slot::parse("groundpick"), None);
+        assert_eq!(super::Slot::parse(""), None);
+    }
+
+    /// The accessors have to agree with `resolved()`, which is the function everything
+    /// downstream actually consumes. A `slot()` that read the wrong field would report one
+    /// policy while the loop ran another.
+    #[test]
+    fn slot_accessors_agree_with_the_resolved_paths() {
+        use super::{PolicyParams, Slot};
+        use std::path::PathBuf;
+
+        let mut params = PolicyParams::default();
+        for slot in Slot::ALL {
+            params.set_slot(slot, Some(PathBuf::from(format!("/tmp/{slot}.onnx"))));
+        }
+        let resolved = params.resolved();
+        for slot in Slot::ALL {
+            assert_eq!(
+                params.slot(slot).as_deref(),
+                Some(std::path::Path::new(&format!("/tmp/{slot}.onnx"))),
+                "{slot} reads back what was set"
+            );
+            assert_eq!(
+                resolved.slot(slot),
+                Some(std::path::Path::new(&format!("/tmp/{slot}.onnx"))),
+                "{slot} resolves to its override"
+            );
+        }
+    }
+
+    /// Clearing an override must fall back to the mode's default rather than emptying the slot —
+    /// that is the whole of `policy reset`, and getting it wrong would leave a robot with no gait
+    /// after an undo.
+    #[test]
+    fn clearing_a_slot_falls_back_to_the_mode_default() {
+        use super::{PolicyParams, Slot};
+        use std::path::PathBuf;
+
+        let mut params = PolicyParams::default();
+        params.set_slot(Slot::Walk, Some(PathBuf::from("/tmp/mine.onnx")));
+        assert!(params.resolved().walk.ends_with("mine.onnx"));
+
+        params.set_slot(Slot::Walk, None);
+        assert!(
+            params
+                .resolved()
+                .walk
+                .ends_with("policies/alpha_walking.onnx"),
+            "reset must restore the default, not empty the slot"
+        );
+    }
+
     use super::*;
 
     fn write(dir: &std::path::Path, body: &str) -> std::path::PathBuf {

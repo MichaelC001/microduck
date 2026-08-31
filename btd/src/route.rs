@@ -234,6 +234,21 @@ fn permits(call: &proto::Call) -> bool {
         // made in the room, holding the pad, the same place `robot.shutdown` is refused for.
         RobotSetMode(_) => false,
 
+        // Loading a policy is `robot.setMode` with a wider blast radius: it puts an arbitrary
+        // `.onnx` in charge of fifteen servos, and in slice 3 that file can come from a stranger
+        // on the Hub. Everything that makes it survivable — the shape gate, the clamps, the
+        // fall reflex — is unchanged whoever asked, so the refusal is not about danger; it is
+        // that trying a gait means watching the robot try it, and a phone in the room is not
+        // yet a client that does. Reconsider with the app, which is where
+        // `docs/design/policy-channel-design.md` §13 leaves it.
+        RobotLoadPolicy(_) => false,
+
+        // What each slot is running. Read-only and harmless, and refused on the same ground as
+        // `robot.mode` directly above: routing a read to the radio before a client exists to
+        // display it widens the surface and buys nothing. It goes with `robot.loadPolicy` when
+        // the app wants either.
+        RobotPolicies => false,
+
         // Power to the joints. A phone button that drops the robot on the floor is not one to
         // offer, and `robot.init` is its counterpart: standing a robot up moves every joint at once,
         // which wants the person doing it to be looking at the robot rather than at a screen. Both

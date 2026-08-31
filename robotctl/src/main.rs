@@ -34,9 +34,12 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::{Duration, Instant};
 
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use duck_ipc_proto as proto;
+use robotd_params::Slot;
+use robotd_params::registry::{Entry, REGISTRY};
 
 mod configure;
 mod duck;
@@ -205,6 +208,28 @@ enum Namespace {
     Update {
         #[command(subcommand)]
         command: UpdateCommand,
+    },
+
+    /// Which `.onnx` runs in which slot — try a policy, and put it back.
+    ///
+    /// Slots are `walk`, `stand`, `sitstand`, `ground_pick`, `kick_left`, `kick_right` and
+    /// `roulade`. Each one is a config key; `load` writes it and `reset` removes it, so a change
+    /// survives a reboot and undoing it is one command rather than an edit.
+    ///
+    /// The swap is live: the robot returns to its home pose, loads, and drives again, without a
+    /// restart and without going limp. A file that is not `obs[1,61] -> actions[1,14]` is refused
+    /// before anything changes, and a load that fails anyway leaves the policy that was running
+    /// in place — trying a gait must not be able to cost you the one you had.
+    ///
+    /// `docs/design/policy-channel-design.md`.
+    #[command(subcommand_required = true, arg_required_else_help = true)]
+    Policy {
+        #[command(subcommand)]
+        command: PolicyCommand,
+
+        /// The config a change is written to. The default is where a provisioned robot keeps it.
+        #[arg(long, default_value = robotd_params::DEFAULT_PATH)]
+        file: PathBuf,
     },
 
     /// Watch what the robot is doing, live.
@@ -748,6 +773,42 @@ enum PadCommand {
     /// this robot no longer has and the bond is refused.
     Forget {
         mac: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// `robotctl policy …`
+#[derive(Subcommand, Debug)]
+enum PolicyCommand {
+    /// What each slot is running, and where that file came from.
+    List {
+        /// Emit JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Run a different policy in one slot, from now on.
+    ///
+    /// The robot goes home, loads it, and drives again. The path is resolved against the
+    /// directory you are in, and the file has to still be there at the next boot — a slot whose
+    /// file has gone falls back to this robot's own policy and says so in `robotctl health`.
+    Load {
+        /// `walk`, `stand`, `sitstand`, `ground_pick`, `kick_left`, `kick_right` or `roulade`.
+        slot: String,
+        /// The `.onnx` to run.
+        path: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Put a slot back to the policy this robot shipped with. Omit the slot for all of them.
+    ///
+    /// The undo, and the way out of a robot that walks badly: `robotctl policy reset` with no
+    /// arguments returns every slot at once, which is the state a robot left the factory in.
+    Reset {
+        /// Which slot. Omit to reset all seven.
+        slot: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -2394,6 +2455,290 @@ impl Drop for BtdPaused {
 /// `pair` is the only command here that takes a while — discovery is held open while someone holds
 /// the pad's sync button — and it stays a single blocking call rather than a progress stream: there
 /// is exactly one thing to report, and it arrives at the end.
+/// How long to wait for the loop to actually make the swap.
+///
+/// The daemon accepts a load and answers immediately; the swap happens at the home pose, after
+/// the joints have ramped there. Generous, because the alternative is a command that reports a
+/// timeout on a robot that was merely taking its time standing up.
+const POLICY_SWAP_TIMEOUT: Duration = Duration::from_secs(20);
+const POLICY_POLL: Duration = Duration::from_millis(250);
+
+/// Turn a slot name from the command line into a [`Slot`], refusing with the list of real ones.
+fn slot_of(name: &str) -> Result<Slot, Failure> {
+    Slot::parse(name).ok_or_else(|| {
+        Failure::new(
+            exit::USAGE,
+            format!(
+                "no policy slot named {name:?}; expected one of {}",
+                Slot::names()
+            ),
+        )
+    })
+}
+
+/// The registry entry for a slot's config key.
+///
+/// It cannot be missing — `robotd_params` has a test asserting every slot is a key — but going
+/// through the registry rather than formatting a key string is what makes that test load-bearing
+/// here too.
+fn policy_entry(slot: Slot) -> Result<&'static Entry, Failure> {
+    let key = slot.config_key();
+    REGISTRY
+        .iter()
+        .find(|e| e.key == key)
+        .ok_or_else(|| Failure::new(exit::FAILED, format!("{key} is not a key robotd knows")))
+}
+
+/// Fail before the robot changes anything, when config could not be recorded anyway.
+///
+/// The daemon call needs only the socket's group; writing `/etc/robot/robotd.toml` needs root.
+/// Without this check a non-root `policy load` would swap the running policy and *then* fail to
+/// record it, leaving a robot running something its own config does not name — which comes back
+/// at the next reboot as a surprise instead of as the error it was.
+///
+/// The probe is the write `save` actually performs: create the staged file beside the target,
+/// which is what both the rename and the create need permission for.
+fn ensure_recordable(config: &Path) -> Result<(), Failure> {
+    let staged = config.with_extension("toml.new");
+    match std::fs::File::create(&staged) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&staged);
+            Ok(())
+        }
+        Err(e) => Err(Failure::new(
+            exit::DENIED,
+            format!(
+                "cannot write {}: {e}\ntry sudo — a policy change has to be recorded, \
+                 not just made",
+                config.display()
+            ),
+        )),
+    }
+}
+
+/// Write the slot overrides `load` and `reset` imply, through the same editor `configure` uses.
+///
+/// `path: None` clears, which is what `reset` is: an unset key resolves to the mode's default, so
+/// there is no "official path" to write back — and writing one would pin today's release's file
+/// into config forever.
+fn write_policy_keys(config: &Path, slots: &[Slot], path: Option<&Path>) -> Result<(), Failure> {
+    let mut model = configure::Model::load(config).map_err(|e| Failure::new(exit::FAILED, e))?;
+    let value = match path {
+        Some(path) => path.display().to_string(),
+        None => "unset".to_owned(),
+    };
+    for slot in slots {
+        model
+            .edit(policy_entry(*slot)?, &value)
+            .map_err(|e| Failure::new(exit::FAILED, format!("{}: {e}", slot.config_key())))?;
+    }
+    model.save().map_err(|e| Failure::new(exit::FAILED, e))
+}
+
+/// Has the loop made the change yet?
+///
+/// `None` while it is still coming, `Some(Err)` when the load failed at the home pose and the
+/// robot kept the policy it had. The daemon validated the file before accepting, so this second
+/// outcome is rare — the file changed underneath, or the runtime went away — but it is the one a
+/// caller must not be left guessing about.
+fn swap_settled(
+    policies: &proto::PoliciesResult,
+    slots: &[Slot],
+    path: Option<&Path>,
+) -> Option<Result<(), String>> {
+    for slot in slots {
+        let Some(state) = policies.slots.iter().find(|s| s.slot == slot.as_str()) else {
+            return Some(Err(format!("{slot} is not a slot this robot reports")));
+        };
+        if let Some(error) = &state.error {
+            return Some(Err(error.clone()));
+        }
+        let arrived = match path {
+            Some(path) => state.path.as_deref() == Some(&*path.display().to_string()),
+            None => !state.overridden,
+        };
+        if !arrived {
+            return None;
+        }
+    }
+    Some(Ok(()))
+}
+
+/// `robotctl policy` — which `.onnx` runs in which slot.
+///
+/// Two halves, and both have to happen for the command to mean what it says. The daemon is asked
+/// first, because it is the half that can say no: it opens the file and checks
+/// `obs[1,61] -> actions[1,14]` before accepting, so a policy that cannot run is refused here
+/// rather than written into config and discovered at the next boot. Config is written second, so
+/// the choice survives a reboot — which is the whole reason this is not a flag on `robotd`.
+///
+/// Then it waits. The swap happens at the home pose seconds later, and a command that returned
+/// the moment the request was accepted would report success for a load that had not happened yet.
+fn run_policy(robot_socket: &Path, config: &Path, command: PolicyCommand) -> Result<(), Failure> {
+    let mut client = Client::connect_to("robotd", robot_socket)?;
+    client.hello()?;
+
+    let (slots, path, json) = match &command {
+        PolicyCommand::List { json } => {
+            let result = result_of(client.call(&proto::Call::RobotPolicies)?)?;
+            if *json {
+                println!("{}", compact(&result));
+                return Ok(());
+            }
+            let policies: proto::PoliciesResult = decode(&result)?;
+            print!("{}", render_policies(&policies));
+            return Ok(());
+        }
+        PolicyCommand::Load { slot, path, json } => {
+            let slot = slot_of(slot)?;
+            // Resolved against *this* shell's working directory, because that is what the person
+            // typing it meant. The daemon refuses a relative path outright — its working
+            // directory is not the caller's — so sending one would only produce a confusing
+            // rejection of a path that looked fine on screen.
+            let path = path
+                .canonicalize()
+                .map_err(|e| Failure::new(exit::USAGE, format!("{}: {e}", path.display())))?;
+            (vec![slot], Some(path), *json)
+        }
+        PolicyCommand::Reset { slot, json } => {
+            let slots = match slot {
+                Some(name) => vec![slot_of(name)?],
+                None => Slot::ALL.to_vec(),
+            };
+            (slots, None, *json)
+        }
+    };
+
+    // Before the daemon is asked for anything, because the robot must not end up running
+    // something this command could never write down.
+    ensure_recordable(config)?;
+
+    let requested = proto::LoadPolicyParams {
+        // One slot names itself; a whole reset names none, which is how the daemon tells "put
+        // this slot back" from "put everything back".
+        slot: (slots.len() == 1).then(|| slots[0].as_str().to_owned()),
+        path: path.as_ref().map(|p| p.display().to_string()),
+    };
+    let accepted: proto::IntentResult = decode(&result_of(
+        client.call(&proto::Call::RobotLoadPolicy(requested))?,
+    )?)?;
+    if !accepted.accepted {
+        return Err(Failure::new(
+            exit::REFUSED,
+            accepted
+                .reason
+                .unwrap_or_else(|| "the robot refused, without saying why".to_owned()),
+        ));
+    }
+
+    write_policy_keys(config, &slots, path.as_deref())?;
+
+    let deadline = Instant::now() + POLICY_SWAP_TIMEOUT;
+    let outcome = loop {
+        let policies: proto::PoliciesResult =
+            decode(&result_of(client.call(&proto::Call::RobotPolicies)?)?)?;
+        if let Some(outcome) = swap_settled(&policies, &slots, path.as_deref()) {
+            break Some((outcome, policies));
+        }
+        if Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(POLICY_POLL);
+    };
+
+    match outcome {
+        Some((Ok(()), policies)) => {
+            if json {
+                println!("{}", compact(&policies));
+            } else {
+                for slot in &slots {
+                    match path.as_deref() {
+                        Some(path) => println!("{slot} is now running {}", path.display()),
+                        None => println!("{slot} is back to this robot's own policy"),
+                    }
+                }
+                // Config was written before the wait, so this is true whatever happened after.
+                println!(
+                    "(kept in {}; `robotctl policy reset` undoes it)",
+                    config.display()
+                );
+            }
+            Ok(())
+        }
+        // The daemon took the file and then could not load it. Config still names it, which is
+        // deliberate: the robot says so at every boot until somebody resets the slot, rather than
+        // quietly editing a file the operator wrote.
+        Some((Err(reason), _)) => Err(Failure::new(
+            exit::FAILED,
+            format!(
+                "the robot kept the policy it was running: {reason}\n\
+                 config still names the file — `robotctl policy reset` to undo"
+            ),
+        )),
+        None => Err(Failure::new(
+            exit::FAILED,
+            format!(
+                "the robot accepted the change but had not made it after {}s — \
+                 `robotctl policy list` will say whether it has since",
+                POLICY_SWAP_TIMEOUT.as_secs()
+            ),
+        )),
+    }
+}
+
+/// One line per slot: what is in it, where that came from, and whether it is this robot's own.
+fn render_policies(policies: &proto::PoliciesResult) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    let _ = writeln!(out, "mode: {}", policies.mode);
+    if !policies.enabled {
+        let _ = writeln!(
+            out,
+            "policies are OFF ([policy] enabled = false) — the loop runs and holds its pose.\n\
+             What follows is what would load."
+        );
+    }
+
+    let width = policies
+        .slots
+        .iter()
+        .map(|s| s.slot.len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    let _ = writeln!(out, "\n{:width$}  {:8}  POLICY", "SLOT", "ORIGIN");
+    for slot in &policies.slots {
+        let origin = slot.origin.as_deref().unwrap_or("-");
+        // An empty slot is a capability this robot does not have, not a fault. Roller mode has
+        // no standing network, and saying so beats a blank the reader has to interpret.
+        let what = slot.path.as_deref().unwrap_or("(none)");
+        let _ = writeln!(out, "{:width$}  {origin:8}  {what}", slot.slot);
+    }
+
+    let mut notes = policies
+        .slots
+        .iter()
+        .filter(|s| s.error.is_some())
+        .peekable();
+    if notes.peek().is_some() {
+        let _ = writeln!(out);
+        for slot in notes {
+            let _ = writeln!(
+                out,
+                "{}: running the default — {}",
+                slot.slot,
+                slot.error.as_deref().unwrap_or("")
+            );
+        }
+        let _ = writeln!(
+            out,
+            "`robotctl policy reset <slot>` clears the override that will not load."
+        );
+    }
+    out
+}
+
 fn run_pad(socket: &Path, command: PadCommand) -> Result<(), Failure> {
     let mut client = Client::connect_to("configd", socket)?;
     client.hello()?;
@@ -2828,6 +3173,9 @@ fn run(cli: Cli) -> Result<(), Failure> {
         Namespace::Pad { command } => {
             return run_pad(&cli.config_socket, command);
         }
+        Namespace::Policy { command, file } => {
+            return run_policy(&cli.robot_socket, &file, command);
+        }
         Namespace::Robot { command } => {
             return run_robot(&cli.robot_socket, command);
         }
@@ -3067,6 +3415,219 @@ fn compact(value: &impl serde::Serialize) -> String {
 }
 #[cfg(test)]
 mod tests {
+
+    // ── robotctl policy ──────────────────────────────────────────────────
+    //
+    // `docs/design/policy-channel-design.md` §3 and §7. The half of the feature that lives on
+    // this side is: turn a slot name into the right config key, write or clear it without
+    // disturbing the file, and know when the robot has actually made the change.
+
+    /// `Failure` carries a message meant for a terminal, not a `Debug` impl — so a test that
+    /// fails on one should print that message rather than force a derive onto a production type.
+    fn must<T>(result: Result<T, Failure>) -> T {
+        result.unwrap_or_else(|e| panic!("{}", e.message))
+    }
+
+    fn slot_state(slot: Slot, path: Option<&str>, overridden: bool) -> proto::PolicySlot {
+        proto::PolicySlot {
+            slot: slot.as_str().to_owned(),
+            path: path.map(str::to_owned),
+            origin: path.map(|_| "local".to_owned()),
+            overridden,
+            error: None,
+        }
+    }
+
+    fn policies_of(slots: Vec<proto::PolicySlot>) -> proto::PoliciesResult {
+        proto::PoliciesResult {
+            mode: "walk".into(),
+            enabled: true,
+            slots,
+        }
+    }
+
+    /// A misspelled slot must name the real ones. `ground_pick` against `groundPick` is a
+    /// one-line fix if the message says so and a puzzle if it does not.
+    #[test]
+    fn an_unknown_slot_name_lists_the_real_ones() {
+        let failure = slot_of("groundPick").expect_err("not a slot");
+        assert_eq!(failure.code, exit::USAGE);
+        assert!(
+            failure.message.contains("ground_pick"),
+            "{}",
+            failure.message
+        );
+    }
+
+    /// Every slot has to resolve to a key `robotd` will actually read. The daemon has the same
+    /// assertion against its registry; this is the half that writes the file, and a key it
+    /// invented would be written, parsed as unknown, and silently ignored.
+    #[test]
+    fn every_slot_has_a_config_key_here_too() {
+        for slot in Slot::ALL {
+            let entry = must(policy_entry(slot));
+            assert_eq!(entry.key, slot.config_key());
+        }
+    }
+
+    /// The wait is not over until the slot reports the file that was asked for. Returning early
+    /// would print "now running X" while the robot was still ramping home.
+    #[test]
+    fn a_swap_is_pending_until_the_path_arrives() {
+        let wanted = Path::new("/srv/mine.onnx");
+        let before = policies_of(vec![slot_state(Slot::Walk, Some("/opt/old.onnx"), false)]);
+        assert!(swap_settled(&before, &[Slot::Walk], Some(wanted)).is_none());
+
+        let after = policies_of(vec![slot_state(Slot::Walk, Some("/srv/mine.onnx"), true)]);
+        assert_eq!(
+            swap_settled(&after, &[Slot::Walk], Some(wanted)),
+            Some(Ok(()))
+        );
+    }
+
+    /// A load that failed at the home pose must end the wait, not run it out. The robot kept the
+    /// policy it had, and the caller needs to hear why rather than a timeout.
+    #[test]
+    fn a_reported_error_ends_the_wait() {
+        let mut slots = vec![slot_state(Slot::Walk, Some("/opt/old.onnx"), true)];
+        slots[0].error = Some("observation width is 51, expected 61".into());
+        let policies = policies_of(slots);
+
+        let outcome = swap_settled(&policies, &[Slot::Walk], Some(Path::new("/srv/mine.onnx")));
+        assert!(matches!(outcome, Some(Err(reason)) if reason.contains("51")));
+    }
+
+    /// Reset waits on `overridden` clearing rather than on a path, because there is no path to
+    /// wait for — the slot resolves to whatever this release ships, which the client does not know.
+    #[test]
+    fn a_reset_is_settled_when_the_override_is_gone() {
+        let still = policies_of(vec![slot_state(Slot::Walk, Some("/srv/mine.onnx"), true)]);
+        assert!(swap_settled(&still, &[Slot::Walk], None).is_none());
+
+        let gone = policies_of(vec![slot_state(Slot::Walk, Some("/opt/alpha.onnx"), false)]);
+        assert_eq!(swap_settled(&gone, &[Slot::Walk], None), Some(Ok(())));
+    }
+
+    /// Resetting everything is not done while any slot is still overridden — one settled slot
+    /// out of seven is not the state `robotctl policy reset` promises.
+    #[test]
+    fn resetting_everything_waits_for_every_slot() {
+        let mut slots: Vec<_> = Slot::ALL
+            .into_iter()
+            .map(|slot| slot_state(slot, Some("/opt/alpha.onnx"), false))
+            .collect();
+        slots[3].overridden = true;
+        let partway = policies_of(slots.clone());
+        assert!(swap_settled(&partway, &Slot::ALL, None).is_none());
+
+        slots[3].overridden = false;
+        assert_eq!(
+            swap_settled(&policies_of(slots), &Slot::ALL, None),
+            Some(Ok(()))
+        );
+    }
+
+    /// **The config half, end to end.** Load writes the key, reset removes it, and the comments
+    /// around them survive both — the file belongs to the operator, and a tool that reformatted
+    /// it on every gait experiment would not be one anybody used twice.
+    #[test]
+    fn load_writes_the_key_and_reset_removes_it_without_touching_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("robotd.toml");
+        std::fs::write(
+            &config,
+            "# hand-written, and it stays that way\n[policy]\n# which gait\nmode = \"walk\"\n",
+        )
+        .unwrap();
+
+        must(write_policy_keys(
+            &config,
+            &[Slot::Walk],
+            Some(Path::new("/srv/mine.onnx")),
+        ));
+        let written = std::fs::read_to_string(&config).unwrap();
+        assert!(written.contains("walk = \"/srv/mine.onnx\""), "{written}");
+        assert!(written.contains("# hand-written"), "{written}");
+        assert!(written.contains("# which gait"), "{written}");
+
+        must(write_policy_keys(&config, &[Slot::Walk], None));
+        let cleared = std::fs::read_to_string(&config).unwrap();
+        assert!(!cleared.contains("/srv/mine.onnx"), "{cleared}");
+        assert!(
+            cleared.contains("mode = \"walk\""),
+            "reset touches one key: {cleared}"
+        );
+        assert!(cleared.contains("# hand-written"), "{cleared}");
+    }
+
+    /// Reset must clear an override rather than write today's default in its place. Pinning the
+    /// release's own path into config would survive the release, and the next update would find
+    /// a robot configured to run a file that no longer exists.
+    #[test]
+    fn reset_clears_the_key_rather_than_writing_the_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("robotd.toml");
+        std::fs::write(&config, "[policy]\nwalk = \"/srv/mine.onnx\"\n").unwrap();
+
+        must(write_policy_keys(&config, &Slot::ALL, None));
+        let cleared = std::fs::read_to_string(&config).unwrap();
+        assert!(!cleared.contains("walk ="), "{cleared}");
+        assert!(
+            !cleared.contains("alpha_walking"),
+            "no default is pinned: {cleared}"
+        );
+    }
+
+    /// A change that cannot be recorded must fail before the robot makes it. Otherwise a
+    /// non-root `policy load` swaps the running policy and then reports an error, leaving a robot
+    /// running something its own config does not name until the next reboot quietly undoes it.
+    #[test]
+    fn an_unwritable_config_is_refused_before_anything_moves() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("nowhere").join("robotd.toml");
+
+        let failure = ensure_recordable(&config).expect_err("the directory does not exist");
+        assert_eq!(failure.code, exit::DENIED);
+        assert!(failure.message.contains("sudo"), "{}", failure.message);
+    }
+
+    /// And the probe must leave nothing behind on the happy path — a stray `robotd.toml.new`
+    /// beside a robot's config is the kind of litter somebody later mistakes for a backup.
+    #[test]
+    fn the_writability_probe_cleans_up_after_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("robotd.toml");
+        std::fs::write(&config, "[policy]\n").unwrap();
+
+        must(ensure_recordable(&config));
+        assert!(!config.with_extension("toml.new").exists());
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), "[policy]\n");
+    }
+
+    /// A slot running its default because an override went missing has to say so where somebody
+    /// will read it, with the way out on the next line.
+    #[test]
+    fn the_listing_explains_a_slot_that_fell_back() {
+        let mut slots = vec![slot_state(Slot::Walk, Some("/opt/alpha.onnx"), false)];
+        slots[0].error = Some("/srv/gone.onnx: No such file".into());
+        let rendered = render_policies(&policies_of(slots));
+
+        assert!(rendered.contains("running the default"), "{rendered}");
+        assert!(rendered.contains("/srv/gone.onnx"), "{rendered}");
+        assert!(rendered.contains("policy reset"), "{rendered}");
+    }
+
+    /// A disabled loop is a legitimate bench configuration, and the listing must not look like a
+    /// robot that merely has policies in its slots.
+    #[test]
+    fn the_listing_says_when_policies_are_off() {
+        let mut policies =
+            policies_of(vec![slot_state(Slot::Walk, Some("/opt/alpha.onnx"), false)]);
+        policies.enabled = false;
+        let rendered = render_policies(&policies);
+        assert!(rendered.contains("OFF"), "{rendered}");
+    }
+
     use super::*;
     use clap::CommandFactory;
 
