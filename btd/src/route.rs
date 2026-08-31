@@ -249,6 +249,18 @@ fn permits(call: &proto::Call) -> bool {
         // the app wants either.
         RobotPolicies => false,
 
+        // Re-reading the slots is `robot.loadPolicy` without the arguments, and carries the same
+        // refusal: it changes what drives fifteen servos, and doing that is something to watch
+        // the robot through rather than tap.
+        RobotReloadPolicies => false,
+
+        // Updating the policy set from the Hub. The closest thing here to `update.apply`, which
+        // *is* routed — and the difference is what an app can do about the outcome. A daemon
+        // update that goes wrong reports unhealthy and reverts itself; a gait that goes wrong
+        // walks badly, which nothing detects and only a person watching the robot can judge.
+        // Worth revisiting with the app, alongside `robot.policies` to show the result.
+        PolicyCheck | PolicyInstall(_) => false,
+
         // Power to the joints. A phone button that drops the robot on the floor is not one to
         // offer, and `robot.init` is its counterpart: standing a robot up moves every joint at once,
         // which wants the person doing it to be looking at the robot rather than at a screen. Both

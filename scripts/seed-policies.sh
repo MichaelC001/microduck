@@ -40,8 +40,9 @@ POLICY_ROOT="${1:-/opt/robot/policies}"
 # Cargo.toml — this script runs from inside a release and cannot read the manifest, which is the
 # same reason `setup-gstreamer.sh` carries its plugin version as a literal.
 #
-# A retrain bumps POLICY_VERSION, and that is the whole of "ship a new gait": no daemon release,
-# no restart, and a board picks it up at its next update.
+# A floor, not a ceiling: it decides what a board installs when it has nothing, and a board moves
+# past it with `robotctl policy update`, which needs no daemon release. Bumping this does, since
+# it ships inside one — so bump it when a new set should be what *fresh* boards get.
 POLICY_REPO="${POLICY_REPO:-pollen-robotics/microduck-policies}"
 POLICY_VERSION="${POLICY_VERSION:-v1}"
 POLICY_BASE_URL="${POLICY_BASE_URL:-https://huggingface.co/${POLICY_REPO}/resolve/${POLICY_VERSION}}"
@@ -97,6 +98,19 @@ if [ "$ok" = no ]; then
 fi
 
 chmod 644 "$staging"/*.onnx 2>/dev/null || true
+
+# Where this set came from, beside the set itself.
+#
+# It is what lets `robotctl policy check` ask the Hub whether there is anything newer without
+# anybody configuring the repo a second time. One writer, one copy, no drift — and a set that a
+# different tool installs later carries its own, so the question "what is this and where is it
+# from" has the same answer however it arrived.
+{
+    echo "repo=${POLICY_REPO}"
+    echo "version=${POLICY_VERSION}"
+    echo "fetched=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+} > "${staging}/.source" || echo "seed-policies: cannot record where this set came from" >&2
+
 rm -rf "${POLICY_ROOT:?}/${target}"
 mv "$staging" "${POLICY_ROOT}/${target}" \
     || { echo "seed-policies: cannot install into ${target}" >&2; exit 0; }

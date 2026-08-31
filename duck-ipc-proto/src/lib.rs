@@ -162,6 +162,18 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// [`code::METHOD_NOT_FOUND`] naming it, which is the designed skew behaviour rather than a
 /// handshake refusal.
 ///
+/// # v18 — `policy.*` and `robot.reloadPolicies`
+///
+/// The official policy set stops needing a daemon release to change. `policy.check` asks the Hub
+/// what revisions exist against the one installed, `policy.install` fetches one, and
+/// `robot.reloadPolicies` is how the thing that swapped the set tells `robotd` to re-read it —
+/// necessary because installing a set swaps a symlink *underneath* unchanged paths, so
+/// `robot.loadPolicy` would correctly conclude there was nothing to do.
+///
+/// Additive as methods. `policy.*` is the first namespace `updaterd` serves that is not
+/// `update.*`, and it is there rather than in `robotd` because it needs a network stack, and not
+/// in `robotctl` because that must not link one. See `docs/design/policy-channel-design.md` §8.
+///
 /// # v17 — `robot.policies`, `robot.loadPolicy`
 ///
 /// Which `.onnx` fills a slot stops being a restart-only decision: a policy can be swapped into
@@ -173,7 +185,7 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// An older `robotd` answers either with [`code::METHOD_NOT_FOUND`] naming the method, which is
 /// the designed skew behaviour and not a handshake refusal. See
 /// `docs/design/policy-channel-design.md` §8.
-pub const API_VERSION: u32 = 17;
+pub const API_VERSION: u32 = 18;
 
 /// The longest an update may legitimately go quiet, in seconds — the pre-install hook's ceiling.
 ///
@@ -437,6 +449,27 @@ pub mod method {
     /// [`ROBOT_POLICIES`] says what came of it.
     pub const ROBOT_LOAD_POLICY: &str = "robot.loadPolicy";
 
+    /// Re-read every policy slot from disk, whatever the paths say.
+    ///
+    /// Distinct from [`ROBOT_LOAD_POLICY`] because the paths do not change: installing a newer
+    /// official set swaps a symlink underneath them, so every slot still resolves to the same
+    /// string and a load would correctly conclude there is nothing to do. This is how the thing
+    /// that swapped the symlink says otherwise.
+    pub const ROBOT_RELOAD_POLICIES: &str = "robot.reloadPolicies";
+
+    // ── policy.* ─────────────────────────────────────────────────────────────
+    //
+    // Served by `updaterd`, not `robotd`, and the split is the same one everywhere else here:
+    // `robotd` says what it is *running*, `updaterd` is the thing with a network stack and is
+    // therefore what asks the Hub what exists. `robotctl` must not link an HTTP client — it is on
+    // the recovery path and its dependency list is deliberately short — so the fetch cannot live
+    // in the CLI either. `docs/design/policy-channel-design.md` §8.
+
+    /// Is there a newer policy set than the one installed?
+    pub const POLICY_CHECK: &str = "policy.check";
+    /// Install a policy set from the Hub and make it live.
+    pub const POLICY_INSTALL: &str = "policy.install";
+
     /// Turn the connection into a stream of [`ROBOT_STATE`] notifications.
     pub const ROBOT_SUBSCRIBE: &str = "robot.subscribe";
     /// Server → client. Never carries an `id`.
@@ -673,6 +706,14 @@ pub enum Call {
     RobotPolicies,
     /// Load one slot, or reset it; see [`method::ROBOT_LOAD_POLICY`].
     RobotLoadPolicy(LoadPolicyParams),
+    /// Re-read every slot from disk; see [`method::ROBOT_RELOAD_POLICIES`].
+    RobotReloadPolicies,
+
+    // ── policy.* ─────────────────────────────────────────────────────────────
+    /// What is installed and what the Hub offers; see [`method::POLICY_CHECK`].
+    PolicyCheck,
+    /// Install a set and make it live; see [`method::POLICY_INSTALL`].
+    PolicyInstall(PolicyInstallParams),
     RobotSubscribe(SubscribeParams),
     // ── net.* ────────────────────────────────────────────────────────────────
     NetStatus,
@@ -801,6 +842,9 @@ impl Call {
             Call::RobotSetMode(_) => method::ROBOT_SET_MODE,
             Call::RobotPolicies => method::ROBOT_POLICIES,
             Call::RobotLoadPolicy(_) => method::ROBOT_LOAD_POLICY,
+            Call::RobotReloadPolicies => method::ROBOT_RELOAD_POLICIES,
+            Call::PolicyCheck => method::POLICY_CHECK,
+            Call::PolicyInstall(_) => method::POLICY_INSTALL,
             Call::RobotSubscribe(_) => method::ROBOT_SUBSCRIBE,
             Call::NetStatus => method::NET_STATUS,
             Call::NetScan => method::NET_SCAN,
@@ -847,6 +891,10 @@ impl Call {
                 // `pad.status` is a read and stays ungated.
                 | Call::PadPair(_)
                 | Call::PadForget(_)
+                // Replacing the policy set changes what drives fifteen servos, which is at least
+                // as consequential as bonding a pad. `policy.check` is a read and stays ungated,
+                // like `pad.status` and every other question about what a robot is.
+                | Call::PolicyInstall(_)
         )
     }
 
@@ -892,6 +940,10 @@ impl Call {
             // enforces at write time, so the answer cannot grow without limit however long
             // a hook talked for.
             Call::Show(_) => (Updater, Prompt),
+            // `check` is one HTTP round trip. `install` downloads a policy set and then asks
+            // `robotd` to reload, which is the same order of magnitude as a small update — long,
+            // but bounded and not a stream.
+            Call::PolicyCheck | Call::PolicyInstall(_) => (Updater, Prompt),
             // Owns its connection until the peer goes away and never reads another request.
             Call::Subscribe => (Updater, Stream),
 
@@ -919,6 +971,7 @@ impl Call {
             | Call::RobotChorale(_)
             | Call::RobotSetMode(_)
             | Call::RobotLoadPolicy(_)
+            | Call::RobotReloadPolicies
             | Call::RobotShutdown => (Robot, Prompt),
             Call::RobotSubscribe(_) => (Robot, Stream),
             // `btd` asking what to put on the air. The answering connection carries the beacon
@@ -1005,6 +1058,7 @@ impl Call {
             Call::RobotMouth(p) => encode(p),
             Call::RobotSetMode(p) => encode(p),
             Call::RobotLoadPolicy(p) => encode(p),
+            Call::PolicyInstall(p) => encode(p),
             Call::RobotSound(p) => encode(p),
             Call::RobotTheremin(p) => encode(p),
             Call::RobotChorale(p) => encode(p),
@@ -1029,6 +1083,8 @@ impl Call {
             | Call::RobotRelax
             | Call::RobotShutdown
             | Call::RobotPolicies
+            | Call::RobotReloadPolicies
+            | Call::PolicyCheck
             | Call::RobotMode => Value::Object(serde_json::Map::new()),
             Call::NetStatus
             | Call::NetScan
@@ -1092,6 +1148,9 @@ impl Call {
             method::ROBOT_SET_MODE => Call::RobotSetMode(decode(params)?),
             method::ROBOT_POLICIES => Call::RobotPolicies,
             method::ROBOT_LOAD_POLICY => Call::RobotLoadPolicy(decode(params)?),
+            method::ROBOT_RELOAD_POLICIES => Call::RobotReloadPolicies,
+            method::POLICY_CHECK => Call::PolicyCheck,
+            method::POLICY_INSTALL => Call::PolicyInstall(decode(params)?),
             method::ROBOT_SUBSCRIBE => Call::RobotSubscribe(decode(params)?),
             method::NET_STATUS => Call::NetStatus,
             method::NET_SCAN => Call::NetScan,
@@ -1229,6 +1288,11 @@ pub mod test_support {
             Call::RobotShutdown,
             Call::RobotMode,
             Call::RobotPolicies,
+            Call::RobotReloadPolicies,
+            Call::PolicyCheck,
+            Call::PolicyInstall(PolicyInstallParams {
+                version: Some("v2".into()),
+            }),
             Call::RobotLoadPolicy(LoadPolicyParams {
                 slot: Some("walk".into()),
                 path: Some("/var/lib/robot/policies/bouncy.onnx".into()),
@@ -1853,6 +1917,51 @@ pub struct PolicySlot {
     /// Why this slot is not running what was asked of it. Set when an override failed to load
     /// and the default was used instead; `path` then names what is actually running.
     pub error: Option<String>,
+}
+
+/// Which set to install, for [`Call::PolicyInstall`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PolicyInstallParams {
+    /// A revision in the policy repo — a tag like `v2`, or a branch. Absent means whatever
+    /// [`Call::PolicyCheck`] calls the newest, which is the ordinary case and saves a client
+    /// having to make two calls to do the obvious thing.
+    pub version: Option<String>,
+}
+
+/// Answer to [`Call::PolicyCheck`].
+///
+/// Deliberately says what is installed *and* what exists, rather than a bare "update available".
+/// A robot two versions behind, a robot ahead of its release's pin, and a robot whose Hub is
+/// unreachable are three different situations, and a boolean makes them all look alike.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PolicyCheckResult {
+    /// The Hub repo the installed set came from, per its own provenance record.
+    pub repo: Option<String>,
+    /// The revision installed, e.g. `v1`.
+    pub installed: Option<String>,
+    /// The newest revision the repo offers, if the Hub could be reached.
+    pub available: Option<String>,
+    /// Every revision the repo offers, newest first. What makes going *back* possible.
+    pub versions: Vec<String>,
+    /// Why `available` is absent. An unreachable Hub is a fact to report, not an error to fail
+    /// on — the robot is walking either way.
+    pub unreachable: Option<String>,
+}
+
+/// Answer to [`Call::PolicyInstall`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PolicyInstallResult {
+    /// What is now live.
+    pub installed: String,
+    /// What was live before, when it was something else. Absent on a first install.
+    pub previous: Option<String>,
+    /// Whether `robotd` picked the new set up. False means the files are in place and the robot
+    /// is still running the old ones — a restart away from correct, and worth saying so rather
+    /// than reporting a success the robot has not acted on.
+    pub reloaded: bool,
 }
 
 /// How often a subscriber wants [`method::ROBOT_STATE`].
@@ -3966,7 +4075,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            48,
+            51,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }
@@ -4170,6 +4279,11 @@ mod tests {
                 method::PIN,
                 // Powering the machine off is as consequential as rebooting it.
                 method::ROBOT_SHUTDOWN,
+                // Replacing the policy set is at least as consequential as bonding a pad: it
+                // decides what drives fifteen servos. `policy.check` must stay off this list —
+                // asking whether a newer gait exists is inspection, and support has to be able
+                // to ask it on a robot it may not change.
+                method::POLICY_INSTALL,
                 method::NET_CONNECT,
                 method::NET_FORGET,
                 method::SYSTEM_SET_NAME,

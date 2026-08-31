@@ -573,6 +573,35 @@ impl Server {
                 })
                 .await
             }
+            // No engine lock: it reads a directory and makes one HTTP request, touches no engine
+            // state, and a question about whether a newer gait exists should stay answerable
+            // while an unrelated update runs.
+            Call::PolicyCheck => {
+                Response::ok(Some(id), &crate::policy::check(
+                    std::path::Path::new(crate::policy::POLICY_ROOT),
+                ).await)
+            }
+            // `try_lock` and the same `BUSY` every other mutation answers with. Swapping the
+            // policy set while a release is being installed would have two things rewriting what
+            // the robot runs at once, and the second one to finish would win by accident.
+            Call::PolicyInstall(params) => {
+                let engine = match self.engine.try_lock() {
+                    Ok(engine) => engine,
+                    Err(_) => {
+                        return Response::err(
+                            Some(id),
+                            proto::Error::new(
+                                proto::code::BUSY,
+                                "an update is in progress; retry shortly",
+                            ),
+                        );
+                    }
+                };
+                match engine.install_policies(params.version.as_deref()).await {
+                    Ok(result) => Response::ok(Some(id), &result),
+                    Err(e) => Response::err(Some(id), e.to_rpc_error()),
+                }
+            }
             Call::Rollback(params) => {
                 let component = params.component.0;
                 self.run_mutating(id, out, move |engine, _tx| {
@@ -646,6 +675,7 @@ impl Server {
             | Call::RobotSetMode(_)
             | Call::RobotPolicies
             | Call::RobotLoadPolicy(_)
+            | Call::RobotReloadPolicies
             | Call::RobotSubscribe(_) => Response::err(
                 Some(id),
                 proto::Error::new(

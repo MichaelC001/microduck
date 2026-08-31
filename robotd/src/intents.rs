@@ -163,7 +163,7 @@ pub struct Intents {
     /// request wins — two arriving in the same tick means somebody pressed twice, and the second
     /// answer is the one they are waiting for.
     mode_switch: AtomicU8,
-    /// A pending `robot.loadPolicy`, or `None` — which is nearly always.
+    /// A pending policy change, or `None` — which is nearly always.
     ///
     /// An `ArcSwapOption` rather than the `AtomicU8` `mode_switch` uses, because the request
     /// carries a path and a mode code does not. Same last-writer-wins semantics for the same
@@ -174,7 +174,7 @@ pub struct Intents {
     /// exists because `Mode` lives in `main.rs` and this module should not reach into it; `Slot`
     /// lives in the shared params crate that owns the config keys it names, and encoding one as
     /// a number here would only move the parse somewhere with less to check it against.
-    policy_load: ArcSwapOption<PolicyLoad>,
+    policy_change: ArcSwapOption<PolicyChange>,
     /// Pending one-shot sound tags, a bitmask taken once per tick like the skills.
     sounds: std::sync::atomic::AtomicU32,
     /// The wheee hold, as a stamped level: `padd` re-notifies while the trigger is down,
@@ -182,15 +182,27 @@ pub struct Intents {
     wheee: ArcSwap<Stamped<bool>>,
 }
 
-/// A pending policy change, as [`Intents::request_policy_load`] took it.
+/// A pending policy change, as [`Intents::request_policy_change`] took it.
 ///
-/// The two `Option`s carry the same four cases the wire type does, minus the one it refuses —
-/// see `duck_ipc_proto::LoadPolicyParams`. `slot: None` is "every slot", which only reaches here
-/// paired with `path: None`, so what it means is *reset everything*.
+/// An enum and not the wire type's pair of `Option`s, because there are three things to say and
+/// two `Option`s can only say four — one of which is meaningless and one of which was, briefly,
+/// wrong. [`Self::Reload`] and [`Self::ResetAll`] both name no slot and no path, and conflating
+/// them wiped every override on a board whenever a newer policy set was installed.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PolicyLoad {
-    pub slot: Option<crate::params::Slot>,
-    pub path: Option<std::path::PathBuf>,
+pub enum PolicyChange {
+    /// Put one slot on a file, or — with `path: None` — back to its default.
+    Slot {
+        slot: crate::params::Slot,
+        path: Option<std::path::PathBuf>,
+    },
+    /// Every slot back to its default. `robotctl policy reset`.
+    ResetAll,
+    /// Re-resolve and rebuild, changing no configuration at all.
+    ///
+    /// For when the *files* moved and the paths did not: installing a policy set swaps
+    /// `current` underneath every slot, so the config is already right and only the loaded
+    /// sessions are stale.
+    Reload,
 }
 
 /// What a client asked for, once.
@@ -250,7 +262,7 @@ impl Intents {
             skills: std::sync::atomic::AtomicU32::new(0),
             shutdown: AtomicBool::new(false),
             mode_switch: AtomicU8::new(MODE_NONE),
-            policy_load: ArcSwapOption::empty(),
+            policy_change: ArcSwapOption::empty(),
             sounds: std::sync::atomic::AtomicU32::new(0),
             wheee: ArcSwap::from_pointee(Stamped {
                 value: false,
@@ -388,15 +400,15 @@ impl Intents {
     /// reaching here means the load is expected to succeed. It can still fail at the home pose
     /// seconds later, which is why the loop keeps the controller it has until the new one is
     /// built.
-    pub fn request_policy_load(&self, load: PolicyLoad) {
-        self.policy_load.store(Some(Arc::new(load)));
+    pub fn request_policy_change(&self, change: PolicyChange) {
+        self.policy_change.store(Some(Arc::new(change)));
     }
 
     /// Take a pending policy change. Taken, so the sequence runs once per request.
-    pub fn take_policy_load(&self) -> Option<PolicyLoad> {
-        self.policy_load
+    pub fn take_policy_change(&self) -> Option<PolicyChange> {
+        self.policy_change
             .swap(None)
-            .map(|load| PolicyLoad::clone(&load))
+            .map(|change| PolicyChange::clone(&change))
     }
 
     /// Ask for the sit-then-power-off sequence.

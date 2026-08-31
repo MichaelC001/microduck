@@ -5,17 +5,15 @@ Status: draft · Date: 2026-08-31 · Owner: pierre
 Where the ONNX policies come from, how someone tries one they did not train, and what
 "reset" puts back.
 
-**Built so far** (2026-08-31): everything §3, §4, §5 and §9's runtime half, plus the local part
-of §7 — `robotctl policy list`, `load` and `reset`, over `robot.loadPolicy` and `robot.policies`.
-A policy on the board can be tried and undone without editing a file or restarting anything, and
-`robotd` reads its policies from `/opt/robot/policies/current`, outside the release.
+**Built so far** (2026-08-31): §3, §4, §5, §9 and §9.1, plus `list`, `load`, `reset`, `check` and
+`update` from §7. A policy on the board can be tried and undone without editing a file or
+restarting anything; the official set is fetched from the Hub rather than carried by the release;
+and a retrained gait reaches a robot without a daemon release.
 
-§9 is done: the set lives at `pollen-robotics/microduck-policies` and the release no longer
-carries it.
-
-**Not yet true**: there is no library, no provenance sidecar, and no `check`, `update` or
-`search`, so `origin` is only ever `official` or `local`. See
-[`roadmap.md`](../project/roadmap.md) §M8.
+**Not yet true**: there is no library of *community* policies. A slot can be pointed at a file on
+the board, and the official set can be moved between revisions, but fetching someone else's policy
+from another repo is not wired up — so `origin` is only ever `official` or `local`, and `search`
+does not exist. See [`roadmap.md`](../project/roadmap.md) §M8.
 
 Companion to [`updater-design.md`](updater-design.md), which owns the update engine —
 components, sources, signing, the health gate, rollback — and to
@@ -252,9 +250,14 @@ Fetching rather than copying is the point: it is the arrangement `setup-board.sh
 for ONNX Runtime and `setup-gstreamer.sh` for the plugins, which are the other two things a board
 needs and a release has no business carrying. The pin lives in `[workspace.metadata.policies]`
 and as literals in the script, with a test asserting they agree — `setup-gstreamer.sh`'s trap,
-because a script that runs from inside a release cannot read the manifest. **Bumping the pin is
-the whole of shipping a new gait**: no daemon release, no restart, and a board takes it at its
-next update.
+because a script that runs from inside a release cannot read the manifest.
+
+**The pin is a floor, not a ceiling**, and that distinction is load-bearing. It ships inside the
+daemon release, so bumping it *does* need a daemon release — an earlier draft of this section
+claimed otherwise and was simply wrong. What the pin decides is what a *freshly provisioned* board
+installs. Moving past it is `robotctl policy update` (§9.1), which is the thing that makes a
+retrained gait reach a robot without a daemon release, and therefore the thing that makes this
+whole channel worth having.
 
 Three things it does not do. It does not re-download a set it already has, so an update whose pin
 is unchanged touches no network — which matters because the post-install hook runs under a
@@ -320,6 +323,38 @@ already installs the ONNX runtime and `setup-gstreamer.sh` the plugins — the n
 lands where one exists, and at runtime there is exactly one source for a policy with no
 precedence rule between a release copy and a Hub copy.
 
+### 9.1 Moving past the pin
+
+`robotctl policy check` asks the Hub what revisions the set's repo offers, against the one on the
+board. `robotctl policy update` installs one — the newest by default, or `--version v1` to go
+back — and tells `robotd` to re-read its slots.
+
+Both are served by `updaterd` (§8), and three details are the whole of why this is not simply a
+second copy of the seeder:
+
+**The repo comes from the set, not from configuration.** Each installed set carries a `.source`
+record naming the repo and revision it came from, written by whatever installed it. So there is no
+second place to configure the repo and nothing to drift; a set installed by some future tool
+answers the same question the same way.
+
+**Newest means the repo's own newest, not a semver sort.** A policy repo is not obliged to use
+semver, and ordering `bouncy-2` against `v10` would be a guess presented as a fact. The Hub lists
+refs oldest-first, so newest is that reversed, and `check` prints the whole list rather than only
+its own verdict — going *back* is as much the point as going forward.
+
+**`robot.reloadPolicies` exists because the paths do not change.** Installing a set swaps
+`current` underneath every slot, so each one still resolves to the same string and
+`robot.loadPolicy` would correctly conclude there is nothing to do. It is right about the paths
+and wrong about the bytes, which is exactly the case that needs a separate method — and one that
+is never short-circuited, since "already loaded" is the answer it exists to disbelieve.
+
+A reload changes no configuration, so **a slot you loaded yourself survives it**. That is not a
+nicety: the reload runs at the end of every `policy update`, and an install that quietly discarded
+someone's gait experiment would be the worst possible time to discover the two were conflated.
+
+An unreachable Hub is reported, not raised. The robot is walking either way, and a caller shown
+"could not reach the Hub" beside what is installed knows more than one shown an error.
+
 ## 10. What the official set currently is
 
 Recorded here because it lives nowhere else in this repository now that the files do not, and
@@ -375,6 +410,9 @@ its meaning for the things that genuinely are models and not control policies, s
 | Seeding never overwrites a set it did not install | The handover needs no flag: the first real install ends it (§9) |
 | The set is downloaded, not shipped | Same as ONNX Runtime and the plugins; bumping the pin ships a gait (§9) |
 | A failed fetch keeps the set already installed | A half-published revision must not downgrade a working gait (§9) |
+| The pin is a floor; `policy update` moves past it | Otherwise a gait still needs a daemon release, which is the thing this channel is for (§9.1) |
+| A set records the repo it came from | One writer, one copy, nothing to configure twice or drift (§9.1) |
+| Reload is a third thing, not reset-all | They look identical from outside and conflating them discards every override (§9.1) |
 | Seeds are pruned to the current and previous | Unbounded 7 MB-per-release growth; the previous one is the hand-recovery after a rollback (§9) |
 | One `policy check`, routing internally | Two commands for one question is the confusion worth avoiding (§6) |
 

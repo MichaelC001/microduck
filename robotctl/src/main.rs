@@ -802,6 +802,28 @@ enum PolicyCommand {
         json: bool,
     },
 
+    /// Is there a newer official policy set than the one installed?
+    ///
+    /// Asks the Hub what revisions the set's own repo offers, against the one on the board.
+    /// Changes nothing, and an unreachable Hub is reported rather than treated as a failure.
+    Check {
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Install an official policy set from the Hub and run it.
+    ///
+    /// The newest revision unless `--version` names one, which is also how to go back to an
+    /// older one. The robot returns to its home pose, re-reads every slot, and drives again;
+    /// slots you have loaded yourself are left alone, because they point somewhere else.
+    Update {
+        /// A revision in the policy repo — a tag like `v2`. Omit for the newest.
+        #[arg(long)]
+        version: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Put a slot back to the policy this robot shipped with. Omit the slot for all of them.
     ///
     /// The undo, and the way out of a robot that walks badly: `robotctl policy reset` with no
@@ -2619,7 +2641,22 @@ fn slots_the_request_changes(
 ///
 /// Then it waits. The swap happens at the home pose seconds later, and a command that returned
 /// the moment the request was accepted would report success for a load that had not happened yet.
-fn run_policy(robot_socket: &Path, config: &Path, command: PolicyCommand) -> Result<(), Failure> {
+fn run_policy(
+    robot_socket: &Path,
+    updater_socket: &Path,
+    config: &Path,
+    command: PolicyCommand,
+) -> Result<(), Failure> {
+    // `check` and `update` are `updaterd`'s: they need a network stack, which this binary
+    // deliberately does not link and `robotd` deliberately does not have.
+    match &command {
+        PolicyCommand::Check { json } => return run_policy_check(updater_socket, *json),
+        PolicyCommand::Update { version, json } => {
+            return run_policy_update(updater_socket, version.as_deref(), *json);
+        }
+        _ => {}
+    }
+
     let mut client = Client::connect_to("robotd", robot_socket)?;
     client.hello()?;
 
@@ -2651,6 +2688,12 @@ fn run_policy(robot_socket: &Path, config: &Path, command: PolicyCommand) -> Res
                 None => Slot::ALL.to_vec(),
             };
             (slots, None, *json)
+        }
+        // Both returned above, before the connection to `robotd` this arm needs. Named rather
+        // than wildcarded so adding a subcommand fails here instead of falling through into a
+        // slot swap it has nothing to do with.
+        PolicyCommand::Check { .. } | PolicyCommand::Update { .. } => {
+            unreachable!("check and update are served by updaterd and returned before this point")
         }
     };
 
@@ -2773,6 +2816,79 @@ fn run_policy(robot_socket: &Path, config: &Path, command: PolicyCommand) -> Res
             ),
         )),
     }
+}
+
+/// `robotctl policy check` — what is installed against what the repo offers.
+fn run_policy_check(updater_socket: &Path, json: bool) -> Result<(), Failure> {
+    let mut client = Client::connect_to("updaterd", updater_socket)?;
+    client.hello()?;
+    let result = result_of(client.call(&proto::Call::PolicyCheck)?)?;
+    if json {
+        println!("{}", compact(&result));
+        return Ok(());
+    }
+    let check: proto::PolicyCheckResult = decode(&result)?;
+
+    match (&check.repo, &check.installed) {
+        (Some(repo), Some(installed)) => println!("installed  {installed}  (from {repo})"),
+        _ => println!("installed  nothing"),
+    }
+    if let Some(why) = &check.unreachable {
+        println!("the Hub    could not be reached — {why}");
+        return Ok(());
+    }
+    match (&check.available, &check.installed) {
+        (Some(available), Some(installed)) if available == installed => {
+            println!("newest     {available}  — up to date");
+        }
+        (Some(available), _) => {
+            println!("newest     {available}");
+            println!("\n`sudo robotctl policy update` installs it.");
+        }
+        (None, _) => println!("newest     the repo has no tagged revisions"),
+    }
+    if check.versions.len() > 1 {
+        println!("\nalso available: {}", check.versions[1..].join(", "));
+    }
+    Ok(())
+}
+
+/// `robotctl policy update` — fetch a set and run it.
+fn run_policy_update(
+    updater_socket: &Path,
+    version: Option<&str>,
+    json: bool,
+) -> Result<(), Failure> {
+    let mut client = Client::connect_to("updaterd", updater_socket)?;
+    client.hello()?;
+    let result = result_of(client.call(&proto::Call::PolicyInstall(
+        proto::PolicyInstallParams {
+            version: version.map(str::to_owned),
+        },
+    ))?)?;
+    if json {
+        println!("{}", compact(&result));
+        return Ok(());
+    }
+    let installed: proto::PolicyInstallResult = decode(&result)?;
+
+    match &installed.previous {
+        None => println!("{} was already installed", installed.installed),
+        Some(previous) => {
+            println!("installed {} (was {previous})", installed.installed);
+            // Worth its own line rather than silence: the files are right and the robot is not
+            // running them, which looks from the outside exactly like an update that did nothing.
+            if installed.reloaded {
+                println!("the robot is running it now");
+            } else {
+                println!(
+                    "the robot did not pick it up — it is still running the old set. \n\
+                     `sudo systemctl restart robotd`, or check `robotctl health`."
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// One line per slot: what is in it, where that came from, and whether it is this robot's own.
@@ -3263,7 +3379,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
             return run_pad(&cli.config_socket, command);
         }
         Namespace::Policy { command, file } => {
-            return run_policy(&cli.robot_socket, &file, command);
+            return run_policy(&cli.robot_socket, &cli.socket, &file, command);
         }
         Namespace::Robot { command } => {
             return run_robot(&cli.robot_socket, command);

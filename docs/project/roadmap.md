@@ -260,8 +260,12 @@ reload` exists, and `xtask sign` signs any directory of artifacts.
    pinned set from `pollen-robotics/microduck-policies` — the arrangement `setup-board.sh`
    already uses for ONNX Runtime. `policies/` and its three `--include` lists are gone, and
    bumping `[workspace.metadata.policies]` is now the whole of shipping a gait.
-3. **The Hub library.** `policy.*` on `updaterd` for the fetch and its provenance sidecar,
-   `load <repo>`, the official/community split, `check` and `update`, then `search`.
+3. **Moving past the pin.** *Done.* `policy.*` on `updaterd`, `robot.reloadPolicies`, and
+   `robotctl policy check` / `update` — a retrained gait now reaches a board with no daemon
+   release, which was the milestone's whole point. Each set records the repo it came from, so
+   nothing configures it twice.
+4. **The community library.** Fetching a policy from a repo that is not ours, the provenance
+   sidecar that makes `origin` say `community`, and `search`. Not started.
 
 `reset` means "remove the override and re-resolve" in all three, so slice 1 ships a correct
 reset against the in-release copies and slice 2 changes what it resolves *to* without touching

@@ -1252,10 +1252,18 @@ mod tests {
         assert_eq!(link.as_deref(), Some("releases/seed-v1"));
         assert_eq!(content.as_deref(), Some("hub-alpha_walking.onnx"));
 
-        let installed = std::fs::read_dir(root.join("releases/seed-v1"))
+        let mut installed: Vec<String> = std::fs::read_dir(root.join("releases/seed-v1"))
             .unwrap()
-            .count();
-        assert_eq!(installed, policies_robotd_expects().len(), "the whole set");
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".onnx"))
+            .collect();
+        installed.sort();
+        assert_eq!(installed, policies_robotd_expects(), "the whole set");
+        assert!(
+            root.join("releases/seed-v1/.source").exists(),
+            "and a record of where it came from, which is what `policy check` reads"
+        );
     }
 
     /// **The pinned set already installed means no network at all.** This runs inside every

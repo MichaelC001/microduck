@@ -49,8 +49,9 @@ runtime = "v2.3.2"
 # inside a release and cannot read this file, so it carries the literals and a test asserts the
 # two agree.
 #
-# `version` is a tag in the Hub repo. Bumping it *is* shipping a new gait: no daemon release, no
-# restart, and a board picks it up at its next update.
+# `version` is a tag in the Hub repo, and it is a *floor*: it decides what a freshly provisioned
+# board installs, not what every board runs. Moving past it is `robotctl policy update`, which
+# needs no daemon release — bumping this does, since it ships inside one.
 [workspace.metadata.policies]
 repo    = "pollen-robotics/microduck-policies"
 version = "v1"

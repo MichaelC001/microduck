@@ -181,6 +181,26 @@ Put everything back:
 sudo robotctl policy reset
 ```
 
+#### A newer official gait
+
+The set the robot walks with lives on the Hub and updates on its own line — no daemon release:
+
+```
+robotctl policy check
+```
+
+```
+sudo robotctl policy update
+```
+
+`check` prints what is installed, what is newest, and what else the repo offers; it changes
+nothing and says so plainly when the Hub cannot be reached. `update` takes the newest unless you
+name one — `--version v1` is how to go back. The robot returns to its home pose, re-reads every
+slot and drives again, and **a slot you loaded yourself is left alone**, because it points
+somewhere else entirely.
+
+#### The slots
+
 The slots are `walk`, `stand`, `sitstand`, `ground_pick`, `kick_left`, `kick_right` and
 `roulade`. `load` writes the choice into `/etc/robot/robotd.toml`, so it survives a reboot and
 survives updates — a release replaces the binaries and the policies it ships, not the line that

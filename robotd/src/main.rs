@@ -1400,7 +1400,7 @@ async fn control_loop<T: RobotIo>(
     let mut mode_change: Option<Mode> = None;
     // A policy load in flight, for the same reason and on the same path as `mode_change`: the
     // robot goes home first, and the swap happens there.
-    let mut policy_change: Option<intents::PolicyLoad> = None;
+    let mut policy_change: Option<intents::PolicyChange> = None;
 
     // Command smoothing, per the prototype: `cmd += α × (target − cmd)` at the tick rate.
     // A stick snap becomes a ramp the gait can follow; the state lives here because it is
@@ -1770,16 +1770,15 @@ async fn control_loop<T: RobotIo>(
         // reason — swapping a network under a moving gait means the next tick is a different
         // policy's idea of what the legs were doing — so the robot goes home first and the swap
         // happens there, torque on throughout.
-        if let Some(load) = intents.take_policy_load() {
+        if let Some(change) = intents.take_policy_change() {
             if mode_change.is_some() || policy_change.is_some() {
                 tracing::warn!("a policy change is already in flight; ignoring this one");
             } else {
                 tracing::warn!(
-                    slot = load.slot.map_or("all", |slot| slot.as_str()),
-                    path = ?load.path.as_ref().map(|p| p.display().to_string()),
-                    "policy load: going home before swapping"
+                    change = describe_change(&change),
+                    "policy change: going home before swapping"
                 );
-                policy_change = Some(load);
+                policy_change = Some(change);
                 // Home first only when the robot is actually up. The ramp exists to stop a
                 // network being swapped under a moving gait, and a robot lying limp on a bench
                 // has no gait to protect — while standing one up because somebody loaded a file
@@ -2097,16 +2096,20 @@ async fn control_loop<T: RobotIo>(
         // somebody *trying* a file, and losing the gait you had over it would be a worse answer
         // than the file being refused — so nothing is swapped unless the new controller built.
         if !matches!(bringup, Bringup::Homing { .. })
-            && let Some(load) = policy_change.take()
+            && let Some(change) = policy_change.take()
         {
             let mut candidate = policy_params.clone();
-            match load.slot {
-                Some(slot) => candidate.set_slot(slot, load.path.clone()),
-                None => {
+            match &change {
+                intents::PolicyChange::Slot { slot, path } => {
+                    candidate.set_slot(*slot, path.clone())
+                }
+                intents::PolicyChange::ResetAll => {
                     for slot in Slot::ALL {
                         candidate.set_slot(slot, None);
                     }
                 }
+                // Config is already right; only the loaded sessions are stale.
+                intents::PolicyChange::Reload => {}
             }
             let cfg = candidate.resolved();
             match try_controller(&cfg, params.safety.limp_fall) {
@@ -2115,9 +2118,12 @@ async fn control_loop<T: RobotIo>(
                     policy_params = candidate;
                     // Whatever this slot could not do before, it is not doing it now: either
                     // it loaded, or it went back to a default that is known to.
-                    match load.slot {
-                        Some(slot) => slot_errors.clear(slot),
-                        None => slot_errors = SlotErrors::default(),
+                    match &change {
+                        intents::PolicyChange::Slot { slot, .. } => slot_errors.clear(*slot),
+                        // A reload re-reads every file, so every slot's verdict is fresh again.
+                        intents::PolicyChange::ResetAll | intents::PolicyChange::Reload => {
+                            slot_errors = SlotErrors::default()
+                        }
                     }
                     state.policy_error.store(None);
                     state.policies.store(Arc::new(PolicyNames::of(&cfg)));
@@ -2128,24 +2134,24 @@ async fn control_loop<T: RobotIo>(
                     )));
                     policy_cfg = cfg;
                     tracing::warn!(
-                        slot = load.slot.map_or("all", |slot| slot.as_str()),
+                        change = describe_change(&change),
                         loaded = controller.is_some(),
-                        "policy load complete"
+                        "policy change complete"
                     );
                 }
                 Err(e) => {
                     // `candidate` is dropped, so config, the resolved paths and the running
                     // networks are all still the ones that were working a tick ago.
                     tracing::error!(
-                        slot = load.slot.map_or("all", |slot| slot.as_str()),
+                        change = describe_change(&change),
                         error = %e,
-                        "policy load failed; keeping the policy that was running"
+                        "policy change failed; keeping the policy that was running"
                     );
                     // Recorded against the slot so the failure outlives the log line: it is
                     // what `robot.policies` shows the caller polling for an outcome, and what
                     // makes health degraded until the slot is loaded or reset. It does not
                     // make the robot unhealthy — nothing about the release is wrong.
-                    if let Some(slot) = load.slot {
+                    if let intents::PolicyChange::Slot { slot, .. } = change {
                         slot_errors.set(slot, e.to_string());
                         state.policy_slots.store(Arc::new(slot_report(
                             &policy_params,
@@ -2972,6 +2978,19 @@ fn apply_intent(intents: &Intents, call: &proto::Call) -> bool {
     }
 }
 
+/// One phrase for the journal: which of the three things a pending change is.
+fn describe_change(change: &intents::PolicyChange) -> String {
+    match change {
+        intents::PolicyChange::Slot {
+            slot,
+            path: Some(path),
+        } => format!("{slot} <- {}", path.display()),
+        intents::PolicyChange::Slot { slot, path: None } => format!("{slot} reset"),
+        intents::PolicyChange::ResetAll => "all slots reset".to_owned(),
+        intents::PolicyChange::Reload => "reload".to_owned(),
+    }
+}
+
 /// Is the robot already in the state a `robot.loadPolicy` is asking for?
 ///
 /// `Some(reason)` when the answer is yes and there is nothing to queue. The alternative is a
@@ -3085,7 +3104,10 @@ fn load_policy_request(
         return proto::IntentResult::already(reason);
     }
 
-    intents.request_policy_load(intents::PolicyLoad { slot, path });
+    intents.request_policy_change(match slot {
+        Some(slot) => intents::PolicyChange::Slot { slot, path },
+        None => intents::PolicyChange::ResetAll,
+    });
     proto::IntentResult::accepted()
 }
 
@@ -3260,6 +3282,28 @@ fn dispatch(
 
         proto::Call::RobotLoadPolicy(p) => {
             proto::Response::ok(Some(id), &load_policy_request(p, state, intents))
+        }
+
+        // Re-read every slot, whatever the paths say.
+        //
+        // The one case `robot.loadPolicy` cannot serve, and not for want of trying: installing a
+        // newer official set swaps `/opt/robot/policies/current` underneath the slots, so every
+        // path still resolves to the same string and `already_loaded` correctly concludes there
+        // is nothing to do. It is right about the paths and wrong about the bytes. This is how
+        // whatever moved the symlink says so.
+        //
+        // No short-circuit for the same reason: "already loaded" is the answer this exists to
+        // disbelieve.
+        proto::Call::RobotReloadPolicies => {
+            let result = if !state.policy_enabled {
+                proto::IntentResult::refused(
+                    "policies are disabled on this robot; set [policy] enabled = true first",
+                )
+            } else {
+                intents.request_policy_change(intents::PolicyChange::Reload);
+                proto::IntentResult::accepted()
+            };
+            proto::Response::ok(Some(id), &result)
         }
 
         proto::Call::RobotMode => proto::Response::ok(
@@ -4895,7 +4939,7 @@ mod tests {
         assert!(!result.accepted);
         let reason = result.reason.unwrap();
         assert!(reason.contains("ground_pick"), "{reason}");
-        assert!(intents.take_policy_load().is_none(), "nothing was queued");
+        assert!(intents.take_policy_change().is_none(), "nothing was queued");
     }
 
     /// `robotd`'s working directory is not the caller's, so a relative path names a different
@@ -4920,7 +4964,7 @@ mod tests {
 
         assert!(!result.accepted);
         assert!(result.reason.unwrap().contains("absolute"));
-        assert!(intents.take_policy_load().is_none());
+        assert!(intents.take_policy_change().is_none());
     }
 
     /// The one combination the wire type can express and nothing means. Refused with the thing
@@ -5002,7 +5046,7 @@ mod tests {
             .expect("an acceptance that did nothing says so");
         assert!(reason.contains("already"), "{reason}");
         assert!(
-            intents.take_policy_load().is_none(),
+            intents.take_policy_change().is_none(),
             "and the loop is never told to go home"
         );
     }
@@ -5028,7 +5072,7 @@ mod tests {
 
         assert!(result.accepted);
         assert!(result.reason.is_some(), "nothing to do, and it says so");
-        assert!(intents.take_policy_load().is_none());
+        assert!(intents.take_policy_change().is_none());
     }
 
     /// One overridden slot is enough to make a whole-robot reset real work. The short-circuit is
@@ -5064,11 +5108,8 @@ mod tests {
         // Also the proof that the naming-neither-slot-nor-file shape reaches the loop at all,
         // rather than being caught by one of the refusals above it.
         assert_eq!(
-            intents.take_policy_load(),
-            Some(intents::PolicyLoad {
-                slot: None,
-                path: None
-            })
+            intents.take_policy_change(),
+            Some(intents::PolicyChange::ResetAll)
         );
     }
 
@@ -5105,7 +5146,58 @@ mod tests {
             "clearing the error is the work: {:?}",
             result.reason
         );
-        assert!(intents.take_policy_load().is_some());
+        assert!(intents.take_policy_change().is_some());
+    }
+
+    /// **A reload must not touch anybody's overrides.**
+    ///
+    /// `Reload` and `ResetAll` both name no slot and no path, and while the intent was a pair of
+    /// `Option`s they were the same value — so installing a newer policy set, which ends in a
+    /// reload, would have silently thrown away every `robotctl policy load` on the board. Three
+    /// things to say needs three things to say them with.
+    #[test]
+    fn a_reload_is_not_a_reset() {
+        let s = RobotState::new(&Params::default(), false, false);
+        let intents = Arc::new(Intents::new());
+
+        let result: proto::IntentResult = dispatch(
+            &s,
+            &intents,
+            proto::Id::Number(1),
+            &proto::Call::RobotReloadPolicies,
+        )
+        .result_as()
+        .unwrap();
+
+        assert!(result.accepted, "{:?}", result.reason);
+        assert_eq!(
+            intents.take_policy_change(),
+            Some(intents::PolicyChange::Reload),
+            "a reload must be distinguishable from resetting every slot"
+        );
+    }
+
+    /// And a reload is never short-circuited, because "already loaded" is exactly the answer it
+    /// exists to disbelieve: installing a set swaps a symlink underneath unchanged paths, so
+    /// every slot still resolves to the same string while the bytes behind it are new.
+    #[test]
+    fn a_reload_is_queued_even_when_nothing_looks_changed() {
+        let s = RobotState::new(&Params::default(), false, false);
+        let intents = Arc::new(Intents::new());
+
+        // A robot with no overrides at all — the state `policy reset` would call already done.
+        let result: proto::IntentResult = dispatch(
+            &s,
+            &intents,
+            proto::Id::Number(1),
+            &proto::Call::RobotReloadPolicies,
+        )
+        .result_as()
+        .unwrap();
+
+        assert!(result.accepted);
+        assert!(result.reason.is_none(), "{:?}", result.reason);
+        assert!(intents.take_policy_change().is_some());
     }
 
     /// `robot.policies` answers for every slot, including the empty ones, and says where each

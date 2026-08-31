@@ -116,6 +116,13 @@ fn permits(call: &proto::Call) -> bool {
         // gait misbehave has an obvious use for the answer.
         RobotPolicies => true,
 
+        // Both mutations stay out, for the reason `robot.loadPolicy` above does: §4 means any LAN
+        // peer inherits whatever is opened here, and nothing on this transport can name a policy
+        // set yet. `policy.check` is read-only and would be harmless, but it is half of a pair
+        // whose other half is not, and routing the half that answers "yes there is a newer gait"
+        // to a client that cannot then install it is an odd thing to offer.
+        RobotReloadPolicies | PolicyCheck | PolicyInstall(_) => false,
+
         // ── the streams BLE pointed here ────────────────────────────────────
         //
         // `pad.input` exists to measure the cadence of its own delivery, and `btd` refuses it

@@ -1269,6 +1269,36 @@ impl Engine {
 
     // ── explicit transitions ─────────────────────────────────────────────────
 
+    /// Install a policy set from the Hub and tell `robotd` to pick it up.
+    ///
+    /// Not an update in the component sense — no manifest, no signature, no health gate, no
+    /// rollback — and [`crate::policy`] says why. It is here because it needs this process's two
+    /// privileges, a network stack and root, and because `robotd` must be told afterwards: the
+    /// swap moves a symlink underneath unchanged paths, so nothing about the slots looks
+    /// different from the loop's side until something says otherwise.
+    ///
+    /// A robot that does not pick it up is reported rather than treated as a failure. The files
+    /// are installed and correct; the running loop is one restart behind, which is a true thing
+    /// to say and not a reason to undo a download.
+    pub async fn install_policies(
+        &self,
+        version: Option<&str>,
+    ) -> Result<crate::proto::PolicyInstallResult, Error> {
+        let root = std::path::Path::new(crate::policy::POLICY_ROOT);
+        let (installed, previous) = crate::policy::install(root, version).await?;
+        let reloaded = match &previous {
+            // Nothing moved, so there is nothing for the robot to re-read and asking would only
+            // make it go home and rebuild for no reason.
+            None => true,
+            Some(_) => self.robot.reload_policies(ROBOT_QUERY_TIMEOUT).await,
+        };
+        Ok(crate::proto::PolicyInstallResult {
+            installed,
+            previous,
+            reloaded,
+        })
+    }
+
     /// Revert to the previously installed release.
     ///
     /// Reachable when `robotd` is dead — that is the case it exists for
