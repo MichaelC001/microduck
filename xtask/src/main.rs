@@ -1121,19 +1121,53 @@ mod tests {
         }
     }
 
-    /// Run `scripts/seed-policies.sh` against a throwaway tree.
+    /// The policy set, as `robotd-params` resolves it across both drive modes.
     ///
-    /// Returns what `current` points at afterwards, and what the walking policy contains through
-    /// it — the two things a robot actually depends on.
-    fn seed(release: &std::path::Path, root: &std::path::Path) -> (Option<String>, Option<String>) {
-        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    /// The one list everything else must agree with: these are the files a slot can default to,
+    /// so they are exactly the files that have to exist on a board.
+    fn policies_robotd_expects() -> Vec<String> {
+        let mut names = Vec::new();
+        for mode in [robotd_params::Mode::Walk, robotd_params::Mode::Roller] {
+            let params = robotd_params::PolicyParams {
+                mode,
+                ..Default::default()
+            };
+            let resolved = params.resolved();
+            for slot in robotd_params::Slot::ALL {
+                if let Some(path) = resolved.slot(slot) {
+                    names.push(path.file_name().unwrap().to_string_lossy().into_owned());
+                }
+            }
+        }
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// Run `scripts/seed-policies.sh` against a throwaway tree, with the Hub faked by a directory.
+    ///
+    /// `base_url` of `None` is an unreachable Hub, which is the case the fallback is for.
+    /// Returns what `current` points at, and what the walking policy contains through it.
+    fn seed(
+        release: &std::path::Path,
+        root: &std::path::Path,
+        version: &str,
+        base_url: Option<&std::path::Path>,
+    ) -> (Option<String>, Option<String>) {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
-            .expect("xtask/ has a parent")
-            .join("scripts/seed-policies.sh");
+            .expect("xtask/ has a parent");
+        let url = match base_url {
+            Some(dir) => format!("file://{}", dir.display()),
+            None => "file:///nonexistent-hub".to_owned(),
+        };
         let status = std::process::Command::new("sh")
-            .arg(&script)
+            .arg(repo_root.join("scripts/seed-policies.sh"))
             .arg(release)
             .arg(root)
+            .env("POLICY_VERSION", version)
+            .env("POLICY_BASE_URL", url)
+            .stderr(std::process::Stdio::null())
             .status()
             .expect("sh");
         assert!(status.success(), "the seeder must never fail an update");
@@ -1145,127 +1179,249 @@ mod tests {
         (link, content)
     }
 
-    /// Write a release directory the seeder will accept.
-    fn fake_release(dir: &std::path::Path, version: &str, walking: &str) {
+    /// A directory standing in for the Hub repo at some revision.
+    fn fake_hub(dir: &std::path::Path, marker: &str) {
+        std::fs::create_dir_all(dir).expect("mkdir");
+        for name in policies_robotd_expects() {
+            std::fs::write(dir.join(&name), format!("{marker}-{name}")).expect("policy");
+        }
+    }
+
+    /// A release directory, still carrying its own copy of the set.
+    fn fake_release(dir: &std::path::Path, version: &str) {
         std::fs::create_dir_all(dir.join("policies")).expect("mkdir");
         std::fs::write(
             dir.join("version.toml"),
             format!("version = \"{version}\"\n"),
         )
         .expect("version.toml");
-        std::fs::write(dir.join("policies/alpha_walking.onnx"), walking).expect("policy");
+        for name in policies_robotd_expects() {
+            std::fs::write(dir.join("policies").join(&name), format!("release-{name}"))
+                .expect("policy");
+        }
     }
 
-    /// A board with nothing installed gets the release's set, and `robotd`'s default path
-    /// resolves through the symlink to a real file.
+    /// **The pin is in two places and they must agree.** `seed-policies.sh` runs from inside a
+    /// release and cannot read Cargo.toml, so it carries the repo and the version as literals —
+    /// the same trap `setup-gstreamer.sh` and `setup-board.sh` already carry, where a drift is a
+    /// board running weights nobody can name.
     #[test]
-    fn seeding_fills_an_empty_policy_directory() {
-        let tmp = tempfile::tempdir().unwrap();
-        let release = tmp.path().join("release");
-        let root = tmp.path().join("policies");
-        std::fs::create_dir_all(&root).unwrap();
-        fake_release(&release, "0.10.0", "walking-A");
+    fn seed_policies_pins_the_same_policy_set() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let manifest: toml::Value =
+            toml::from_str(&std::fs::read_to_string(root.join("Cargo.toml")).unwrap()).unwrap();
+        let meta = &manifest["workspace"]["metadata"]["policies"];
+        let version = meta["version"].as_str().unwrap();
+        let repo = meta["repo"].as_str().unwrap();
 
-        let (link, content) = seed(&release, &root);
-        assert_eq!(link.as_deref(), Some("releases/seed-0.10.0"));
-        assert_eq!(content.as_deref(), Some("walking-A"));
+        let script = std::fs::read_to_string(root.join("scripts/seed-policies.sh")).unwrap();
+        for expected in [
+            format!("POLICY_VERSION=\"${{POLICY_VERSION:-{version}}}\""),
+            format!("POLICY_REPO=\"${{POLICY_REPO:-{repo}}}\""),
+        ] {
+            assert!(
+                script.contains(&expected),
+                "seed-policies.sh must carry the line {expected:?}"
+            );
+        }
     }
 
-    /// **The symlink is relative to its own directory**, the way the updater writes `current`
-    /// (updater-design.md §7.1). An absolute target resolves against whatever the root happened
-    /// to be when it was written, which is how a `current` that looks right points nowhere.
+    /// **The download list must be exactly what `robotd` can ask for.**
+    ///
+    /// A name the script fetches and robotd never wants is dead weight on the eMMC and in the
+    /// download. A name robotd defaults to and the script does not fetch is a slot that will not
+    /// load — reported as degraded, on every board, for a file nobody noticed was missing from a
+    /// list in a shell script.
     #[test]
-    fn the_current_link_is_relative_to_its_own_directory() {
-        let tmp = tempfile::tempdir().unwrap();
-        let release = tmp.path().join("release");
-        let root = tmp.path().join("policies");
-        std::fs::create_dir_all(&root).unwrap();
-        fake_release(&release, "0.10.0", "walking-A");
+    fn the_download_list_is_exactly_what_robotd_defaults_to() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let script = std::fs::read_to_string(root.join("scripts/seed-policies.sh")).unwrap();
+        let line = script
+            .lines()
+            .find(|l| l.starts_with("POLICY_FILES="))
+            .expect("seed-policies.sh must declare POLICY_FILES");
+        let mut listed: Vec<String> = line
+            .trim_start_matches("POLICY_FILES=")
+            .trim_matches('"')
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect();
+        listed.sort();
 
-        let (link, _) = seed(&release, &root);
-        let link = link.expect("a link");
-        assert!(
-            !link.starts_with('/'),
-            "an absolute target breaks the moment the root moves: {link}"
+        assert_eq!(
+            listed,
+            policies_robotd_expects(),
+            "the fetch list and robotd's own defaults have drifted"
         );
-        assert!(root.join("current").join("alpha_walking.onnx").exists());
     }
 
-    /// Re-running the same release changes nothing. This runs on every update, so a seeder that
-    /// rewrote the directory each time would churn the eMMC for no reason.
+    /// The ordinary path: nothing installed, the Hub reachable, the pinned set arrives whole.
     #[test]
-    fn seeding_the_same_release_twice_is_a_no_op() {
+    fn the_pinned_set_is_downloaded_from_the_hub() {
         let tmp = tempfile::tempdir().unwrap();
+        let hub = tmp.path().join("hub");
+        let root = tmp.path().join("policies");
+        fake_hub(&hub, "hub");
+        std::fs::create_dir_all(&root).unwrap();
+        fake_release(&tmp.path().join("release"), "0.10.0");
+
+        let (link, content) = seed(&tmp.path().join("release"), &root, "v1", Some(&hub));
+        assert_eq!(link.as_deref(), Some("releases/seed-v1"));
+        assert_eq!(content.as_deref(), Some("hub-alpha_walking.onnx"));
+
+        let installed = std::fs::read_dir(root.join("releases/seed-v1"))
+            .unwrap()
+            .count();
+        assert_eq!(installed, policies_robotd_expects().len(), "the whole set");
+    }
+
+    /// **The pinned set already installed means no network at all.** This runs inside every
+    /// update, and re-downloading seven megabytes each time to arrive at the same bytes would be
+    /// both slow and a way to spend the hook's timeout budget on nothing.
+    #[test]
+    fn an_already_pinned_set_is_not_downloaded_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hub = tmp.path().join("hub");
+        let root = tmp.path().join("policies");
         let release = tmp.path().join("release");
-        let root = tmp.path().join("policies");
+        fake_hub(&hub, "hub");
         std::fs::create_dir_all(&root).unwrap();
-        fake_release(&release, "0.10.0", "walking-A");
+        fake_release(&release, "0.10.0");
 
-        let first = seed(&release, &root);
-        assert_eq!(seed(&release, &root), first);
+        let first = seed(&release, &root, "v1", Some(&hub));
+        // No Hub at all the second time: reaching for one would fall back and change the answer.
+        assert_eq!(seed(&release, &root, "v1", None), first);
     }
 
-    /// A newer daemon replaces an older seed of ours. While the release is the only source of
-    /// policies, a daemon update is still how a retrained gait reaches a board — a seeder that
-    /// only ever filled an empty directory would freeze every board on whatever first seeded it.
+    /// Bumping the pin is how a retrained gait ships, so it has to actually refetch.
     #[test]
-    fn a_newer_release_replaces_an_older_seed() {
+    fn bumping_the_pin_fetches_the_new_set() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("policies");
+        let release = tmp.path().join("release");
         std::fs::create_dir_all(&root).unwrap();
+        fake_release(&release, "0.10.0");
 
-        let old = tmp.path().join("old");
-        fake_release(&old, "0.10.0", "walking-A");
-        seed(&old, &root);
+        let v1 = tmp.path().join("hub-v1");
+        fake_hub(&v1, "one");
+        seed(&release, &root, "v1", Some(&v1));
 
-        let new = tmp.path().join("new");
-        fake_release(&new, "0.11.0", "walking-B");
-        let (link, content) = seed(&new, &root);
-        assert_eq!(link.as_deref(), Some("releases/seed-0.11.0"));
-        assert_eq!(content.as_deref(), Some("walking-B"));
+        let v2 = tmp.path().join("hub-v2");
+        fake_hub(&v2, "two");
+        let (link, content) = seed(&release, &root, "v2", Some(&v2));
+        assert_eq!(link.as_deref(), Some("releases/seed-v2"));
+        assert_eq!(content.as_deref(), Some("two-alpha_walking.onnx"));
+    }
+
+    /// **A board that cannot reach the Hub keeps a gait.** Transitional, for exactly as long as
+    /// the release still carries a copy — but while it does, a provisioning step that needs the
+    /// network must not be the difference between a duck that walks and one that does not.
+    #[test]
+    fn an_unreachable_hub_falls_back_on_the_release_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("policies");
+        let release = tmp.path().join("release");
+        std::fs::create_dir_all(&root).unwrap();
+        fake_release(&release, "0.10.0");
+
+        let (link, content) = seed(&release, &root, "v1", None);
+        assert_eq!(link.as_deref(), Some("releases/seed-release-0.10.0"));
+        assert_eq!(content.as_deref(), Some("release-alpha_walking.onnx"));
+    }
+
+    /// And the fallback must not stick. It is named for the release rather than the pin precisely
+    /// so the next update reads it as "not the pinned set" and tries the Hub again — otherwise one
+    /// bad network moment would freeze a board on the release copy forever.
+    #[test]
+    fn the_fallback_is_replaced_once_the_hub_is_reachable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("policies");
+        let release = tmp.path().join("release");
+        let hub = tmp.path().join("hub");
+        std::fs::create_dir_all(&root).unwrap();
+        fake_release(&release, "0.10.0");
+        fake_hub(&hub, "hub");
+
+        seed(&release, &root, "v1", None);
+        let (link, content) = seed(&release, &root, "v1", Some(&hub));
+        assert_eq!(link.as_deref(), Some("releases/seed-v1"));
+        assert_eq!(content.as_deref(), Some("hub-alpha_walking.onnx"));
     }
 
     /// **A set this script did not install is never touched.**
     ///
-    /// The rule the whole handover rests on. Once anything else puts policies there — a bundle
-    /// from the Hub, or whatever tool publishes them — the release must stop overwriting it, or
-    /// the next unrelated daemon update silently reverts somebody's gait. No flag, no config: a
-    /// `current` that is not one of ours ends the seeding for good.
+    /// The rule the whole handover rests on. Once anything else puts policies there — `robotctl
+    /// policy`, or whatever tool publishes them — the release must stop replacing it, or the next
+    /// unrelated daemon update silently reverts somebody's gait. No flag, no config.
     #[test]
     fn policies_this_script_did_not_install_are_left_alone() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("policies");
-        std::fs::create_dir_all(root.join("releases/1.2.0")).unwrap();
+        let hub = tmp.path().join("hub");
+        fake_hub(&hub, "hub");
+        std::fs::create_dir_all(root.join("releases/from-a-tool")).unwrap();
         std::fs::write(
-            root.join("releases/1.2.0/alpha_walking.onnx"),
-            "from-the-hub",
+            root.join("releases/from-a-tool/alpha_walking.onnx"),
+            "installed-by-something-else",
         )
         .unwrap();
-        std::os::unix::fs::symlink("releases/1.2.0", root.join("current")).unwrap();
+        std::os::unix::fs::symlink("releases/from-a-tool", root.join("current")).unwrap();
 
         let release = tmp.path().join("release");
-        fake_release(&release, "0.11.0", "walking-B");
+        fake_release(&release, "0.10.0");
 
-        let (link, content) = seed(&release, &root);
-        assert_eq!(link.as_deref(), Some("releases/1.2.0"));
-        assert_eq!(content.as_deref(), Some("from-the-hub"));
+        let (link, content) = seed(&release, &root, "v1", Some(&hub));
+        assert_eq!(link.as_deref(), Some("releases/from-a-tool"));
+        assert_eq!(content.as_deref(), Some("installed-by-something-else"));
     }
 
-    /// Seeds accumulate one per release otherwise, and every dev push is a release.
-    ///
-    /// Twenty pushes at seven megabytes of policy set each is 140 MB of an eMMC, in a directory
-    /// nothing else prunes — the kind of growth noticed as a full disk months later rather than
-    /// as the thing that caused it.
+    /// A partial download must never become the live set. `robotd` would refuse the truncated
+    /// file at load and report degraded, which is the right end state — but the set it is
+    /// refusing should not have replaced a working one to get there.
     #[test]
-    fn old_seeds_are_pruned_to_the_current_and_previous() {
+    fn a_partial_download_does_not_replace_a_working_set() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("policies");
+        let release = tmp.path().join("release");
         std::fs::create_dir_all(&root).unwrap();
+        fake_release(&release, "0.10.0");
+
+        let good = tmp.path().join("hub-v1");
+        fake_hub(&good, "one");
+        seed(&release, &root, "v1", Some(&good));
+
+        // A revision that is missing one file, which is what a half-published set looks like.
+        let broken = tmp.path().join("hub-v2");
+        fake_hub(&broken, "two");
+        std::fs::remove_file(broken.join("roulade.onnx")).unwrap();
+
+        let (link, content) = seed(&release, &root, "v2", Some(&broken));
+        assert_ne!(
+            link.as_deref(),
+            Some("releases/seed-v2"),
+            "a set missing a file must not be installed as the pinned one"
+        );
+        assert_eq!(
+            content.as_deref(),
+            Some("one-alpha_walking.onnx"),
+            "and the board keeps something that works"
+        );
+    }
+
+    /// Seeds accumulate one per pin otherwise, at seven megabytes each, in a directory nothing
+    /// else prunes — growth noticed as a full eMMC months later rather than as its cause.
+    #[test]
+    fn old_sets_are_pruned_to_the_current_and_previous() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("policies");
+        let release = tmp.path().join("release");
+        std::fs::create_dir_all(&root).unwrap();
+        fake_release(&release, "0.10.0");
 
         for n in 1..=4 {
-            let release = tmp.path().join(format!("rel-{n}"));
-            fake_release(&release, &format!("0.10.{n}"), &format!("walking-{n}"));
-            seed(&release, &root);
+            let hub = tmp.path().join(format!("hub-{n}"));
+            fake_hub(&hub, &format!("v{n}"));
+            seed(&release, &root, &format!("v{n}"), Some(&hub));
         }
 
         let mut kept: Vec<String> = std::fs::read_dir(root.join("releases"))
@@ -1274,84 +1430,33 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
         kept.sort();
-        assert_eq!(
-            kept,
-            vec!["seed-0.10.3".to_string(), "seed-0.10.4".to_string()],
-            "the current seed and the one it replaced, and nothing older"
-        );
+        assert_eq!(kept, vec!["seed-v3".to_string(), "seed-v4".to_string()]);
     }
 
-    /// **The previous seed is kept, and it is the only recovery for one specific case.**
-    ///
-    /// Rollback does not run hooks (`post_swap` is on the apply path only), so reverting the
-    /// daemon does not revert its policies. A release rolled back *because its policies were bad*
-    /// therefore leaves them in place, and re-pointing `current` at the kept seed by hand is what
-    /// undoes that. Pruning down to one would take that away.
+    /// The previous set is kept, and it is the only recovery for one specific case: **rollback
+    /// does not run hooks** (`post_swap` is on the apply path only), so reverting the daemon does
+    /// not revert its policies. A release rolled back because its policies were bad leaves them
+    /// running, and pointing `current` back at the kept set by hand is what undoes that.
     #[test]
-    fn the_seed_a_release_replaced_is_still_there_to_go_back_to() {
+    fn the_set_a_pin_replaced_is_still_there_to_go_back_to() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("policies");
+        let release = tmp.path().join("release");
         std::fs::create_dir_all(&root).unwrap();
+        fake_release(&release, "0.10.0");
 
-        let old = tmp.path().join("old");
-        fake_release(&old, "0.10.0", "walking-good");
-        seed(&old, &root);
+        let v1 = tmp.path().join("hub-v1");
+        fake_hub(&v1, "good");
+        seed(&release, &root, "v1", Some(&v1));
 
-        let new = tmp.path().join("new");
-        fake_release(&new, "0.11.0", "walking-bad");
-        seed(&new, &root);
-
-        assert_eq!(
-            std::fs::read_to_string(root.join("releases/seed-0.10.0/alpha_walking.onnx")).ok(),
-            Some("walking-good".to_string()),
-            "the policies the previous release ran are still on the board"
-        );
-    }
-
-    /// Pruning must not reach past the seeds. Anything else under `releases/` was installed by
-    /// something that is not this script — which is the rule the whole handover rests on, and
-    /// deleting it would be the loudest possible way to break it.
-    #[test]
-    fn pruning_only_removes_seeds_this_script_made() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("policies");
-        std::fs::create_dir_all(root.join("releases/1.2.0")).unwrap();
-        std::fs::write(
-            root.join("releases/1.2.0/alpha_walking.onnx"),
-            "from-the-hub",
-        )
-        .unwrap();
-
-        for n in 1..=3 {
-            let release = tmp.path().join(format!("rel-{n}"));
-            fake_release(&release, &format!("0.10.{n}"), "walking");
-            seed(&release, &root);
-        }
+        let v2 = tmp.path().join("hub-v2");
+        fake_hub(&v2, "bad");
+        seed(&release, &root, "v2", Some(&v2));
 
         assert_eq!(
-            std::fs::read_to_string(root.join("releases/1.2.0/alpha_walking.onnx")).ok(),
-            Some("from-the-hub".to_string()),
-            "a set this script did not install is not this script's to delete"
+            std::fs::read_to_string(root.join("releases/seed-v1/alpha_walking.onnx")).ok(),
+            Some("good-alpha_walking.onnx".to_string())
         );
-    }
-
-    /// A release with no version is not one to name a directory after, and a release with no
-    /// policies has nothing to seed. Both exit cleanly: this runs inside an update, and failing
-    /// would roll back a release over something that is not the release's fault.
-    #[test]
-    fn a_release_it_cannot_read_is_skipped_rather_than_fatal() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("policies");
-        std::fs::create_dir_all(&root).unwrap();
-
-        let no_version = tmp.path().join("no-version");
-        std::fs::create_dir_all(no_version.join("policies")).unwrap();
-        assert_eq!(seed(&no_version, &root), (None, None));
-
-        let no_policies = tmp.path().join("no-policies");
-        std::fs::create_dir_all(&no_policies).unwrap();
-        std::fs::write(no_policies.join("version.toml"), "version = \"0.10.0\"\n").unwrap();
-        assert_eq!(seed(&no_policies, &root), (None, None));
     }
 
     /// Every policy file in `policies/` must be packaged, at every packaging site.

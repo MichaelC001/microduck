@@ -6,9 +6,13 @@ checks that at load rather than discovering it mid-stride.
 ## This is a temporary home
 
 `robotd` no longer reads these from the release directory. It reads
-`/opt/robot/policies/current`, and `scripts/seed-policies.sh` — run by `hooks/postinstall` — is
-what copies these files there, for exactly as long as nothing else does. That script never
-overwrites a set it did not install, so publishing a real bundle is the whole handover.
+`/opt/robot/policies/current`, which `scripts/seed-policies.sh` fills by **downloading** the
+pinned set from `[workspace.metadata.policies]` on the Hub.
+
+These copies are now only a fallback, for a board with nothing installed that cannot reach the
+Hub on a first install. They go — along with the `--include` lines at the three packaging sites
+and `xtask`'s `every_policy_in_the_repo_is_packaged` — as soon as the Hub repo is populated and
+the fetch is proved on a board. That is the whole of the remaining migration.
 
 **These belong on the Hugging Face Hub**, delivered as a `policies` updater component that
 versions independently of the daemon — a gait retrain should not need a daemon release, and a

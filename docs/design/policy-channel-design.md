@@ -10,10 +10,11 @@ of §7 — `robotctl policy list`, `load` and `reset`, over `robot.loadPolicy` a
 A policy on the board can be tried and undone without editing a file or restarting anything, and
 `robotd` reads its policies from `/opt/robot/policies/current`, outside the release.
 
-**Not yet true**: nothing is on the Hub. Until something publishes a bundle, the daemon release
-still carries the `.onnx` files and seeds that directory from them (§9), so `origin` is only ever
-`official` or `local`; there is no library, no provenance sidecar, and no `check`, `update` or
-`search`. See [`roadmap.md`](../project/roadmap.md) §M8.
+**Not yet true**: `pollen-robotics/microduck-policies` does not exist yet, so every board is
+still on the transitional fallback in §9 — the copy the release carries. Creating that repo and
+tagging `v1` is what switches the fetch on; deleting `policies/` is what finishes §9. There is no
+library, no provenance sidecar, and no `check`, `update` or `search`, so `origin` is only ever
+`official` or `local`. See [`roadmap.md`](../project/roadmap.md) §M8.
 
 Companion to [`updater-design.md`](updater-design.md), which owns the update engine —
 components, sources, signing, the health gate, rollback — and to
@@ -240,11 +241,32 @@ The library lives at `/var/lib/robot/policies/`, outside every release directory
 much is done, and it is the part that matters: there is one runtime source for a policy, and no
 precedence rule between a release copy and anything else.
 
-**What fills that directory is a separate question, and today the answer is the release.**
-`scripts/seed-policies.sh`, run by `hooks/postinstall` on every update and by `install.sh` on a
-fresh board, copies the `.onnx` files the release still carries into
-`/opt/robot/policies/releases/seed-<version>/` and points `current` at it — the same
-`releases/` + `current` symlink layout the updater already swaps (§7.1 of the updater design).
+**What fills that directory is `scripts/seed-policies.sh`, and it downloads.**
+Run by `hooks/postinstall` on every update and by `install.sh` on a fresh board, it fetches the
+pinned set from the Hub into `/opt/robot/policies/releases/seed-<pin>/` and points `current` at
+it — the same `releases/` + `current` symlink layout the updater already swaps (§7.1 of the
+updater design).
+
+Fetching rather than copying is the point: it is the arrangement `setup-board.sh` already uses
+for ONNX Runtime and `setup-gstreamer.sh` for the plugins, which are the other two things a board
+needs and a release has no business carrying. The pin lives in `[workspace.metadata.policies]`
+and as literals in the script, with a test asserting they agree — `setup-gstreamer.sh`'s trap,
+because a script that runs from inside a release cannot read the manifest. **Bumping the pin is
+the whole of shipping a new gait**: no daemon release, no restart, and a board takes it at its
+next update.
+
+Three things it does not do. It does not re-download a set it already has, so an update whose pin
+is unchanged touches no network — which matters because the post-install hook runs under a
+120-second timeout and a hook that times out rolls the update back. It never installs a partial
+download: everything lands in a staging directory and `current` moves only once the whole set has
+arrived. And it does not replace a working set with an older one when a fetch fails — a
+half-published revision leaves the board on the gait it had, and the pin is retried at the next
+update.
+
+Nothing is signed, and that follows §2 rather than contradicting it: this is the same download a
+person could make, into a directory `robotd` shape-checks everything out of. The shape gate is
+also what catches a truncated file, which is why no hashes are pinned here to go stale on every
+retrain.
 
 One rule makes that a bootstrap rather than a second home: **it never touches a set it did not
 install**. A `current` pointing anywhere but a `seed-*` directory means something else put
@@ -266,10 +288,12 @@ This is the intended shape rather than a regression: two things with their own v
 not revert together. It is only sharp while the release is still the only source of policies,
 which is another reason not to leave that state sitting for long.
 
-The remaining half of this section — one `policies` component on the Hub, and `policies/` leaving
-this repository along with the `--include` lines in the two release workflows,
-`scripts/dev-push.sh` and `xtask`'s `every_policy_in_the_repo_is_packaged` — waits on something
-publishing a bundle. It also waits on one open question, §13.
+**One transitional branch remains.** The release still carries its copy of the set, and a board
+with *nothing* installed that cannot reach the Hub falls back on it, so a first install without a
+network gets a gait rather than none. That branch — and `policies/`, and the `--include` lines in
+the two release workflows and `scripts/dev-push.sh`, and `xtask`'s
+`every_policy_in_the_repo_is_packaged` — goes as soon as the Hub repo is populated and the fetch
+is proved on a board. It exists so that proving it cannot leave a duck that will not walk.
 
 **One component for the whole set, not one per slot.** The updater design sketched
 `model-walk`, `model-jump` and so on (§5.5), and per-slot components are what its own machinery
@@ -314,6 +338,8 @@ its meaning for the things that genuinely are models and not control policies, s
 | The fetch lives in `updaterd` | `robotctl` must not link an HTTP stack (§8) |
 | Policies live outside the release, seeded by it | One runtime source, and no precedence rule to get wrong (§9) |
 | Seeding never overwrites a set it did not install | The handover needs no flag: the first real install ends it (§9) |
+| The set is downloaded, not shipped | Same as ONNX Runtime and the plugins; bumping the pin ships a gait (§9) |
+| A failed fetch keeps the set already installed | A half-published revision must not downgrade a working gait (§9) |
 | Seeds are pruned to the current and previous | Unbounded 7 MB-per-release growth; the previous one is the hand-recovery after a rollback (§9) |
 | One `policy check`, routing internally | Two commands for one question is the confusion worth avoiding (§6) |
 
@@ -332,16 +358,15 @@ its meaning for the things that genuinely are models and not control policies, s
 
 ## 13. Open
 
-- **Whether the official set is an updater component at all, which is the same question as
-  whether it is signed.** Community policies are unsigned by §2, and that was a decision about
-  policies. This is a decision about the *engine*: every artifact the component path installs is
-  verified against a trusted key, unconditionally, by the same code that installs daemon
-  binaries. So an official set delivered as a component must be signed — not because a policy
-  needs a signature, but because that path has never had an unsigned mode and giving it one
-  would widen the hole well past policies. The fork is therefore: sign the official bundle and
-  keep the component (rollback, pin, golden, known-bad, the periodic check), or leave official
-  policies unsigned and have them arrive the same way community ones do, giving up all of that.
-  Nothing needs deciding until something publishes a bundle, and §9's seeding holds until then.
+- **Whether the official set ever becomes an updater component.** Delivery no longer needs one:
+  §9 fetches the pinned set from the Hub directly, the way the board's other prerequisites
+  arrive. So this is a question about what a component would *add* — rollback, pin, golden,
+  known-bad history and the periodic check — against a cost that is not about policies at all.
+  Every artifact the component path installs is signature-verified, unconditionally, by the same
+  code that installs daemon binaries. An official set delivered that way must therefore be
+  signed, not because a policy needs a signature but because that path has never had an unsigned
+  mode and giving it one would widen the hole well past policies. Worth revisiting if per-set
+  rollback turns out to be something anyone reaches for; nothing needs it today.
 - Whether the app surfaces any of this, and how much of §7 it needs. Everything here is
   reachable over the same socket `btd` already relays, so the answer is a UI question rather
   than a protocol one.
