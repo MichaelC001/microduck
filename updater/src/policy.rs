@@ -112,11 +112,11 @@ async fn tags(client: &reqwest::Client, repo: &str) -> Result<Vec<String>, Error
 
 /// What is installed against what the repo offers.
 pub async fn check(root: &Path) -> crate::proto::PolicyCheckResult {
+    // Nothing installed is not a network problem, and saying so through `unreachable` reported a
+    // healthy Hub as unreachable on a board whose only fault was having no set yet. An empty
+    // `repo` says it on its own, unambiguously — there is no other way to get one.
     let Some(source) = installed(root) else {
-        return crate::proto::PolicyCheckResult {
-            unreachable: Some("no policy set is installed, so there is nothing to check".into()),
-            ..Default::default()
-        };
+        return crate::proto::PolicyCheckResult::default();
     };
 
     let mut result = crate::proto::PolicyCheckResult {
@@ -340,14 +340,41 @@ mod tests {
         );
     }
 
-    /// A board with nothing installed has no repo to ask about, and says so rather than
-    /// inventing one — the repo is a property of the set, not of this daemon.
+    /// A board with nothing installed has no repo to ask about, and says so rather than inventing
+    /// one — the repo is a property of the set, not of this daemon.
+    ///
+    /// **And it is not a network failure.** Reporting it through `unreachable` made a board whose
+    /// only fault was having no set yet print "the Hub could not be reached", which sent the
+    /// reader after a problem that did not exist.
     #[tokio::test]
-    async fn a_board_with_no_set_reports_that_rather_than_guessing() {
+    async fn a_board_with_no_set_is_not_a_hub_that_cannot_be_reached() {
         let tmp = tempfile::tempdir().unwrap();
         let result = check(tmp.path()).await;
         assert!(result.repo.is_none());
         assert!(result.installed.is_none());
-        assert!(result.unreachable.unwrap().contains("nothing to check"));
+        assert!(
+            result.unreachable.is_none(),
+            "nothing installed is not a network problem: {:?}",
+            result.unreachable
+        );
+    }
+
+    /// A set whose provenance record is missing still counts as installed, and the version comes
+    /// from the directory name — which is the shape of a board seeded before the record existed.
+    /// The seeder back-fills it, but this must not report "nothing installed" in the meantime.
+    #[test]
+    fn a_set_without_a_record_is_still_a_set_on_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("releases/seed-v1")).unwrap();
+        std::fs::write(root.join("releases/seed-v1/alpha_walking.onnx"), "w").unwrap();
+        swap_current(root, "seed-v1").unwrap();
+
+        assert!(installed(root).is_none(), "no record, so no repo to name");
+        assert_eq!(
+            installed_files(root),
+            vec!["alpha_walking.onnx".to_string()],
+            "but the policies are plainly there"
+        );
     }
 }

@@ -58,12 +58,34 @@ POLICY_FILES="alpha_walking.onnx alpha_stand.onnx alpha_sitstand.onnx alpha_grou
 # the fallback below is for, and the next update tries again.
 CURL_OPTS="--fail --location --silent --show-error --connect-timeout 5 --max-time 8"
 
+# Where a set came from, written beside it.
+#
+# It is what lets `robotctl policy check` ask the Hub whether there is anything newer without
+# anybody configuring the repo a second time. One writer, one copy, no drift — and a set that a
+# different tool installs later carries its own, so "what is this and where is it from" has the
+# same answer however it arrived.
+#
+# Only written when missing, so an update does not rewrite the file just to change a timestamp.
+write_source() {
+    [ ! -f "$1/.source" ] || return 0
+    {
+        echo "repo=${POLICY_REPO}"
+        echo "version=${2}"
+        echo "fetched=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    } > "$1/.source" || echo "seed-policies: cannot record where this set came from" >&2
+}
+
 target="releases/seed-${POLICY_VERSION}"
 live="$(readlink "${POLICY_ROOT}/current" 2>/dev/null || true)"
 
 case "$live" in
     "$target")
-        exit 0 ;;                  # the pinned set is already installed; no network needed
+        # Already the pinned set, so no network is needed — but back-fill the provenance record
+        # if it is missing. A board seeded before that record existed would otherwise never gain
+        # one, because this is the branch it takes forever after, and `policy check` would report
+        # a robot with a perfectly good policy set as having nothing installed.
+        write_source "${POLICY_ROOT}/${target}" "${POLICY_VERSION}"
+        exit 0 ;;
     "")
         ;;                         # nothing installed yet
     releases/seed-*)
@@ -99,17 +121,7 @@ fi
 
 chmod 644 "$staging"/*.onnx 2>/dev/null || true
 
-# Where this set came from, beside the set itself.
-#
-# It is what lets `robotctl policy check` ask the Hub whether there is anything newer without
-# anybody configuring the repo a second time. One writer, one copy, no drift — and a set that a
-# different tool installs later carries its own, so the question "what is this and where is it
-# from" has the same answer however it arrived.
-{
-    echo "repo=${POLICY_REPO}"
-    echo "version=${POLICY_VERSION}"
-    echo "fetched=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-} > "${staging}/.source" || echo "seed-policies: cannot record where this set came from" >&2
+write_source "$staging" "${POLICY_VERSION}"
 
 rm -rf "${POLICY_ROOT:?}/${target}"
 mv "$staging" "${POLICY_ROOT}/${target}" \

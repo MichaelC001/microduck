@@ -1282,6 +1282,56 @@ mod tests {
         assert_eq!(seed(&root, "v1", None), first);
     }
 
+    /// **A set installed before the provenance record existed must gain one.**
+    ///
+    /// From a board: the fast path — the pinned set is already installed, so no network — exits
+    /// before anything is written, which is right for the policies and wrong for the record. A
+    /// board seeded by the previous version of this script would take that branch forever and
+    /// never gain one, and `robotctl policy check` reported a robot with a perfectly good set as
+    /// having nothing installed.
+    #[test]
+    fn a_set_with_no_provenance_record_gains_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("policies");
+        let seeded = root.join("releases/seed-v1");
+        std::fs::create_dir_all(&seeded).unwrap();
+        for name in policies_robotd_expects() {
+            std::fs::write(seeded.join(&name), "x").unwrap();
+        }
+        std::os::unix::fs::symlink("releases/seed-v1", root.join("current")).unwrap();
+        assert!(
+            !root.join("current/.source").exists(),
+            "the board's starting state"
+        );
+
+        // No Hub, deliberately: the point is that this happens on the branch that touches no
+        // network at all, which is the branch such a board takes every time.
+        seed(&root, "v1", None);
+
+        let record = std::fs::read_to_string(root.join("current/.source")).unwrap();
+        assert!(record.contains("version=v1"), "{record}");
+        assert!(record.contains("repo=pollen-robotics/"), "{record}");
+    }
+
+    /// And it is written once. This runs on every update, and rewriting the file each time just
+    /// to move a timestamp is churn on an eMMC for nothing.
+    #[test]
+    fn a_provenance_record_is_not_rewritten_on_every_update() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("policies");
+        let hub = tmp.path().join("hub");
+        fake_hub(&hub, "hub");
+        std::fs::create_dir_all(&root).unwrap();
+
+        seed(&root, "v1", Some(&hub));
+        let first = std::fs::read_to_string(root.join("current/.source")).unwrap();
+        seed(&root, "v1", Some(&hub));
+        assert_eq!(
+            std::fs::read_to_string(root.join("current/.source")).unwrap(),
+            first
+        );
+    }
+
     /// Bumping the pin is how a retrained gait ships, so it has to actually refetch.
     #[test]
     fn bumping_the_pin_fetches_the_new_set() {

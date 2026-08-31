@@ -2829,10 +2829,17 @@ fn run_policy_check(updater_socket: &Path, json: bool) -> Result<(), Failure> {
     }
     let check: proto::PolicyCheckResult = decode(&result)?;
 
-    match (&check.repo, &check.installed) {
-        (Some(repo), Some(installed)) => println!("installed  {installed}  (from {repo})"),
-        _ => println!("installed  nothing"),
-    }
+    let (Some(repo), Some(installed)) = (&check.repo, &check.installed) else {
+        // No set, or one too old to carry a provenance record. Either way there is no repo to
+        // ask about, and the fix is the same — the daemon's post-install hook installs the set,
+        // so the interesting question is why it did not.
+        println!("installed  nothing this daemon can identify");
+        println!("           the release's postinstall hook installs the official set;");
+        println!("           `robotctl health` says if a slot could not be loaded.");
+        return Ok(());
+    };
+    println!("installed  {installed}  (from {repo})");
+
     if let Some(why) = &check.unreachable {
         println!("the Hub    could not be reached — {why}");
         return Ok(());
