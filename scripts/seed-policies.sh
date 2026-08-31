@@ -75,7 +75,32 @@ ln -sfn "$target" "${POLICY_ROOT}/current.new" || {
     exit 0
 }
 if ! mv -T "${POLICY_ROOT}/current.new" "${POLICY_ROOT}/current" 2>/dev/null; then
-    rm -f "${POLICY_ROOT}/current" \
-        && mv "${POLICY_ROOT}/current.new" "${POLICY_ROOT}/current" \
-        || echo "seed-policies: cannot point ${POLICY_ROOT}/current at ${seed}" >&2
+    if ! { rm -f "${POLICY_ROOT}/current" \
+        && mv "${POLICY_ROOT}/current.new" "${POLICY_ROOT}/current"; }; then
+        echo "seed-policies: cannot point ${POLICY_ROOT}/current at ${seed}" >&2
+        exit 0
+    fi
 fi
+
+# Prune older seeds, keeping this one and the one it replaced.
+#
+# Every dev push is a new version, so a bench board doing twenty of them would otherwise carry
+# twenty copies of a seven-megabyte policy set on an eMMC — unbounded growth from a directory
+# nothing else prunes, which is the sort of thing that is noticed as a full disk months later.
+#
+# The previous one is kept on purpose, and it is the only recovery there is for a specific case:
+# **rollback does not run hooks**, so reverting the daemon does not revert its policies
+# (updater/src/engine.rs — `post_swap` is on the apply path only). A release rolled back because
+# its *policies* were bad therefore leaves them in place, and re-pointing `current` at the kept
+# seed by hand is what undoes that. A forward `update apply --version <older>` does it properly,
+# because that path does run the hook.
+#
+# `seed-*` only, and only inside `releases/` — anything else under this root belongs to whatever
+# installed it, which is the rule the whole handover rests on.
+for old_seed in "${POLICY_ROOT}"/releases/seed-*; do
+    [ -d "$old_seed" ] || continue
+    name="$(basename "$old_seed")"
+    [ "releases/${name}" != "$target" ] || continue
+    [ "releases/${name}" != "$live" ] || continue
+    rm -rf "$old_seed" || echo "seed-policies: cannot remove ${old_seed}" >&2
+done

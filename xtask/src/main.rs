@@ -1251,6 +1251,90 @@ mod tests {
         assert_eq!(content.as_deref(), Some("from-the-hub"));
     }
 
+    /// Seeds accumulate one per release otherwise, and every dev push is a release.
+    ///
+    /// Twenty pushes at seven megabytes of policy set each is 140 MB of an eMMC, in a directory
+    /// nothing else prunes — the kind of growth noticed as a full disk months later rather than
+    /// as the thing that caused it.
+    #[test]
+    fn old_seeds_are_pruned_to_the_current_and_previous() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("policies");
+        std::fs::create_dir_all(&root).unwrap();
+
+        for n in 1..=4 {
+            let release = tmp.path().join(format!("rel-{n}"));
+            fake_release(&release, &format!("0.10.{n}"), &format!("walking-{n}"));
+            seed(&release, &root);
+        }
+
+        let mut kept: Vec<String> = std::fs::read_dir(root.join("releases"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        kept.sort();
+        assert_eq!(
+            kept,
+            vec!["seed-0.10.3".to_string(), "seed-0.10.4".to_string()],
+            "the current seed and the one it replaced, and nothing older"
+        );
+    }
+
+    /// **The previous seed is kept, and it is the only recovery for one specific case.**
+    ///
+    /// Rollback does not run hooks (`post_swap` is on the apply path only), so reverting the
+    /// daemon does not revert its policies. A release rolled back *because its policies were bad*
+    /// therefore leaves them in place, and re-pointing `current` at the kept seed by hand is what
+    /// undoes that. Pruning down to one would take that away.
+    #[test]
+    fn the_seed_a_release_replaced_is_still_there_to_go_back_to() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("policies");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let old = tmp.path().join("old");
+        fake_release(&old, "0.10.0", "walking-good");
+        seed(&old, &root);
+
+        let new = tmp.path().join("new");
+        fake_release(&new, "0.11.0", "walking-bad");
+        seed(&new, &root);
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("releases/seed-0.10.0/alpha_walking.onnx")).ok(),
+            Some("walking-good".to_string()),
+            "the policies the previous release ran are still on the board"
+        );
+    }
+
+    /// Pruning must not reach past the seeds. Anything else under `releases/` was installed by
+    /// something that is not this script — which is the rule the whole handover rests on, and
+    /// deleting it would be the loudest possible way to break it.
+    #[test]
+    fn pruning_only_removes_seeds_this_script_made() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("policies");
+        std::fs::create_dir_all(root.join("releases/1.2.0")).unwrap();
+        std::fs::write(
+            root.join("releases/1.2.0/alpha_walking.onnx"),
+            "from-the-hub",
+        )
+        .unwrap();
+
+        for n in 1..=3 {
+            let release = tmp.path().join(format!("rel-{n}"));
+            fake_release(&release, &format!("0.10.{n}"), "walking");
+            seed(&release, &root);
+        }
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("releases/1.2.0/alpha_walking.onnx")).ok(),
+            Some("from-the-hub".to_string()),
+            "a set this script did not install is not this script's to delete"
+        );
+    }
+
     /// A release with no version is not one to name a directory after, and a release with no
     /// policies has nothing to seed. Both exit cleanly: this runs inside an update, and failing
     /// would roll back a release over something that is not the release's fault.

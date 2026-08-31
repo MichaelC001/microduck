@@ -253,6 +253,19 @@ to remember at handover — whatever ends up publishing bundles just installs on
 is over. A *newer* seed does replace an older one, because while the release is the only source
 of policies a daemon update is still how a retrained gait reaches a board.
 
+**Policies no longer roll back with the daemon**, and that is worth stating plainly because it
+used to be free. While they lived inside the release, reverting the release reverted them; now
+`current` is repointed by the postinstall hook, and rollback does not run hooks
+(`post_swap` is on the apply path only). So a release rolled back *because a policy in it was
+bad* leaves that policy running. Two ways back, and the first is the ordinary one: a forward
+`robotctl update apply daemon --version <older>` runs the hook and reseeds. Failing that, the
+seed the release replaced is still on the board — the seeder keeps the previous one for exactly
+this — and `current` can be pointed at it by hand.
+
+This is the intended shape rather than a regression: two things with their own version lines do
+not revert together. It is only sharp while the release is still the only source of policies,
+which is another reason not to leave that state sitting for long.
+
 The remaining half of this section — one `policies` component on the Hub, and `policies/` leaving
 this repository along with the `--include` lines in the two release workflows,
 `scripts/dev-push.sh` and `xtask`'s `every_policy_in_the_repo_is_packaged` — waits on something
@@ -301,6 +314,7 @@ its meaning for the things that genuinely are models and not control policies, s
 | The fetch lives in `updaterd` | `robotctl` must not link an HTTP stack (§8) |
 | Policies live outside the release, seeded by it | One runtime source, and no precedence rule to get wrong (§9) |
 | Seeding never overwrites a set it did not install | The handover needs no flag: the first real install ends it (§9) |
+| Seeds are pruned to the current and previous | Unbounded 7 MB-per-release growth; the previous one is the hand-recovery after a rollback (§9) |
 | One `policy check`, routing internally | Two commands for one question is the confusion worth avoiding (§6) |
 
 ## 12. Deferred, deliberately
