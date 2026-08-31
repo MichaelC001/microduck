@@ -22,9 +22,21 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// Where a release is mounted. Policy paths default under here, so an ordinary update
-/// carries the policy with the binaries that were trained against it.
+/// Where a release is mounted.
 pub const RELEASE_DIR: &str = "/opt/robot/daemon/current";
+
+/// Where the official policy set lives — **outside the release directory**, on purpose.
+///
+/// A gait retrain should not need a daemon release, and a daemon fix should not re-download six
+/// megabytes of unchanged weights. So the two version independently, and the daemon reads its
+/// policies from one place regardless of what put them there.
+///
+/// Today what puts them there is the daemon's own postinstall hook, which seeds this directory
+/// from the copies the release still carries. That is a bootstrap, not the destination: it stops
+/// the moment anything installs a real set here and repoints `current`, and `current` being a
+/// symlink beside a `releases/` directory is exactly the shape the updater already swaps
+/// atomically. See `docs/design/policy-channel-design.md` §9.
+pub const POLICY_DIR: &str = "/opt/robot/policies/current";
 
 /// Where a provisioned robot keeps it, alongside the updater's own config.
 pub const DEFAULT_PATH: &str = "/etc/robot/robotd.toml";
@@ -721,7 +733,7 @@ impl PolicyParams {
     }
 
     pub fn resolved(&self) -> ResolvedPolicy {
-        let release = |name: &str| PathBuf::from(RELEASE_DIR).join("policies").join(name);
+        let release = |name: &str| PathBuf::from(POLICY_DIR).join(name);
         let path = |field: &Option<PathBuf>, default: Option<&str>| -> Option<PathBuf> {
             match field {
                 Some(p) if is_none_sentinel(p) => None,
@@ -1207,6 +1219,32 @@ mod tests {
         }
     }
 
+    /// **The default policy path must not be inside the release directory.**
+    ///
+    /// That coupling is the whole thing this move undoes: while it held, a gait retrain needed a
+    /// daemon release and a daemon fix re-shipped six megabytes of unchanged weights. It would
+    /// also come back silently — a default rewritten in terms of `RELEASE_DIR` still resolves to
+    /// a real file on a real board, and nothing else would notice.
+    #[test]
+    fn the_default_policies_live_outside_the_release() {
+        let resolved = super::PolicyParams::default().resolved();
+        for slot in super::Slot::ALL {
+            let Some(path) = resolved.slot(slot) else {
+                continue;
+            };
+            assert!(
+                path.starts_with(super::POLICY_DIR),
+                "{slot} resolves to {}",
+                path.display()
+            );
+            assert!(
+                !path.starts_with(super::RELEASE_DIR),
+                "{slot} is back inside the release: {}",
+                path.display()
+            );
+        }
+    }
+
     /// Round-tripping every slot through its own name, so a rename cannot half-land: `parse`
     /// and `as_str` disagreeing would make a slot loadable under a name nothing reports.
     #[test]
@@ -1258,11 +1296,9 @@ mod tests {
         assert!(params.resolved().walk.ends_with("mine.onnx"));
 
         params.set_slot(Slot::Walk, None);
-        assert!(
-            params
-                .resolved()
-                .walk
-                .ends_with("policies/alpha_walking.onnx"),
+        assert_eq!(
+            params.resolved().walk,
+            std::path::Path::new(super::POLICY_DIR).join("alpha_walking.onnx"),
             "reset must restore the default, not empty the slot"
         );
     }
@@ -1476,7 +1512,7 @@ mod tests {
                 .and_then(|p| p.file_name())
                 .map(|n| n.to_string_lossy().into_owned())
         };
-        assert!(p.walk.ends_with("policies/alpha_walking.onnx"));
+        assert_eq!(p.walk, PathBuf::from(POLICY_DIR).join("alpha_walking.onnx"));
         assert_eq!(name(&p.stand).as_deref(), Some("alpha_stand.onnx"));
         assert_eq!(name(&p.sitstand).as_deref(), Some("alpha_sitstand.onnx"));
         assert_eq!(
@@ -1509,7 +1545,7 @@ mod tests {
         let p = Params::load(&path, true).unwrap().policy.resolved();
 
         assert_eq!(p.mode, Mode::Roller);
-        assert!(p.walk.ends_with("policies/roller.onnx"));
+        assert_eq!(p.walk, PathBuf::from(POLICY_DIR).join("roller.onnx"));
         assert_eq!(
             p.stand, None,
             "the prototype never runs standing in roller mode"

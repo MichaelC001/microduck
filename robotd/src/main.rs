@@ -366,7 +366,7 @@ impl SlotErrors {
 /// downloaded policy `local` or a scp'd one `community`, and both are worse than the origin
 /// appearing when it can be known. `docs/design/policy-channel-design.md` §2.
 fn origin_of(path: &std::path::Path) -> &'static str {
-    if path.starts_with(params::RELEASE_DIR) {
+    if path.starts_with(params::POLICY_DIR) {
         "official"
     } else {
         "local"
@@ -4815,12 +4815,10 @@ mod tests {
         });
 
         assert!(policy.slot(Slot::Walk).is_none(), "the override is dropped");
-        assert!(
-            policy
-                .resolved()
-                .walk
-                .ends_with("policies/alpha_walking.onnx"),
-            "and the slot resolves to the release's own policy"
+        assert_eq!(
+            policy.resolved().walk,
+            PathBuf::from(params::POLICY_DIR).join("alpha_walking.onnx"),
+            "and the slot resolves to this robot's own policy"
         );
         let reason = errors.get(Slot::Walk).expect("the reason is kept");
         assert!(reason.contains("51"), "and it names the shape: {reason}");

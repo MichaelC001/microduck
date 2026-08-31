@@ -5,6 +5,11 @@ checks that at load rather than discovering it mid-stride.
 
 ## This is a temporary home
 
+`robotd` no longer reads these from the release directory. It reads
+`/opt/robot/policies/current`, and `scripts/seed-policies.sh` — run by `hooks/postinstall` — is
+what copies these files there, for exactly as long as nothing else does. That script never
+overwrites a set it did not install, so publishing a real bundle is the whole handover.
+
 **These belong on the Hugging Face Hub**, delivered as a `policies` updater component that
 versions independently of the daemon — a gait retrain should not need a daemon release, and a
 daemon fix should not re-download 6 MB of unchanged weights. `deploy/updater.toml` already

@@ -36,7 +36,7 @@ pub enum Kind {
     Choice(&'static [&'static str]),
     /// Free text (an ALSA device, a socket path...).
     Text,
-    /// A filesystem path, or absent meaning the release's own copy; the literal `"none"`
+    /// A filesystem path, or absent meaning this robot's own copy; the literal `"none"`
     /// disables the slot outright.
     OptionalPath,
     /// A list of whole numbers, edited as comma-separated text ("4, 5, 9").
@@ -121,12 +121,12 @@ pub const REGISTRY: &[Entry] = &[
     entry(
         "policy.walk",
         Kind::OptionalPath,
-        "Walking policy; unset = the release's",
+        "Walking policy; unset = this robot's own",
     ),
     entry(
         "policy.stand",
         Kind::OptionalPath,
-        "Standing policy; unset = the release's",
+        "Standing policy; unset = this robot's own",
     ),
     entry(
         "policy.sitstand",

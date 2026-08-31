@@ -5,14 +5,15 @@ Status: draft · Date: 2026-08-31 · Owner: pierre
 Where the ONNX policies come from, how someone tries one they did not train, and what
 "reset" puts back.
 
-**Built so far** (2026-08-31): everything §3, §4 and §5 describe, plus the local half of §7 —
-`robotctl policy list`, `load` and `reset`, over `robot.loadPolicy` and `robot.policies`. A
-policy on the board can be tried and undone without editing a file or restarting anything.
+**Built so far** (2026-08-31): everything §3, §4, §5 and §9's runtime half, plus the local part
+of §7 — `robotctl policy list`, `load` and `reset`, over `robot.loadPolicy` and `robot.policies`.
+A policy on the board can be tried and undone without editing a file or restarting anything, and
+`robotd` reads its policies from `/opt/robot/policies/current`, outside the release.
 
-**Not yet true**: nothing is on the Hub. The `policies` component of §9 does not exist, so every
-slot is still filled from the release directory and `origin` is only ever `official` or `local`;
-there is no library, no provenance sidecar, and no `check`, `update` or `search`. Those are
-slices 2 and 3 in [`roadmap.md`](../project/roadmap.md) §M8.
+**Not yet true**: nothing is on the Hub. Until something publishes a bundle, the daemon release
+still carries the `.onnx` files and seeds that directory from them (§9), so `origin` is only ever
+`official` or `local`; there is no library, no provenance sidecar, and no `check`, `update` or
+`search`. See [`roadmap.md`](../project/roadmap.md) §M8.
 
 Companion to [`updater-design.md`](updater-design.md), which owns the update engine —
 components, sources, signing, the health gate, rollback — and to
@@ -235,11 +236,27 @@ The library lives at `/var/lib/robot/policies/`, outside every release directory
 
 ## 9. Leaving the artifact
 
-The official set becomes one `policies` component on the Hub: one repo, one manifest, one
-signature, one version line. `robotd.toml`'s defaults point at its install dir instead of
-`current/policies/`, and `policies/` leaves this repository along with the `--include` lines in
-the two release workflows, `scripts/dev-push.sh`, and `xtask`'s
-`every_policy_in_the_repo_is_packaged` test that keeps those three honest.
+`robotd` reads its policies from `/opt/robot/policies/current`, not from inside the release. That
+much is done, and it is the part that matters: there is one runtime source for a policy, and no
+precedence rule between a release copy and anything else.
+
+**What fills that directory is a separate question, and today the answer is the release.**
+`scripts/seed-policies.sh`, run by `hooks/postinstall` on every update and by `install.sh` on a
+fresh board, copies the `.onnx` files the release still carries into
+`/opt/robot/policies/releases/seed-<version>/` and points `current` at it — the same
+`releases/` + `current` symlink layout the updater already swaps (§7.1 of the updater design).
+
+One rule makes that a bootstrap rather than a second home: **it never touches a set it did not
+install**. A `current` pointing anywhere but a `seed-*` directory means something else put
+policies there, and the release stops overwriting them for good. No flag, no config, and nothing
+to remember at handover — whatever ends up publishing bundles just installs one, and the seeding
+is over. A *newer* seed does replace an older one, because while the release is the only source
+of policies a daemon update is still how a retrained gait reaches a board.
+
+The remaining half of this section — one `policies` component on the Hub, and `policies/` leaving
+this repository along with the `--include` lines in the two release workflows,
+`scripts/dev-push.sh` and `xtask`'s `every_policy_in_the_repo_is_packaged` — waits on something
+publishing a bundle. It also waits on one open question, §13.
 
 **One component for the whole set, not one per slot.** The updater design sketched
 `model-walk`, `model-jump` and so on (§5.5), and per-slot components are what its own machinery
@@ -282,6 +299,8 @@ its meaning for the things that genuinely are models and not control policies, s
 | Community policies are not signature-verified | The safety layer and the shape gate are the boundary, not the key (§2) |
 | One `policies` component, not one per slot | The set is trained as a family; per-slot overrides already cover the rest (§9) |
 | The fetch lives in `updaterd` | `robotctl` must not link an HTTP stack (§8) |
+| Policies live outside the release, seeded by it | One runtime source, and no precedence rule to get wrong (§9) |
+| Seeding never overwrites a set it did not install | The handover needs no flag: the first real install ends it (§9) |
 | One `policy check`, routing internally | Two commands for one question is the confusion worth avoiding (§6) |
 
 ## 12. Deferred, deliberately
@@ -299,6 +318,16 @@ its meaning for the things that genuinely are models and not control policies, s
 
 ## 13. Open
 
+- **Whether the official set is an updater component at all, which is the same question as
+  whether it is signed.** Community policies are unsigned by §2, and that was a decision about
+  policies. This is a decision about the *engine*: every artifact the component path installs is
+  verified against a trusted key, unconditionally, by the same code that installs daemon
+  binaries. So an official set delivered as a component must be signed — not because a policy
+  needs a signature, but because that path has never had an unsigned mode and giving it one
+  would widen the hole well past policies. The fork is therefore: sign the official bundle and
+  keep the component (rollback, pin, golden, known-bad, the periodic check), or leave official
+  policies unsigned and have them arrive the same way community ones do, giving up all of that.
+  Nothing needs deciding until something publishes a bundle, and §9's seeding holds until then.
 - Whether the app surfaces any of this, and how much of §7 it needs. Everything here is
   reachable over the same socket `btd` already relays, so the answer is a UI question rather
   than a protocol one.

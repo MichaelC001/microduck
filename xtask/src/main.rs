@@ -1121,6 +1121,155 @@ mod tests {
         }
     }
 
+    /// Run `scripts/seed-policies.sh` against a throwaway tree.
+    ///
+    /// Returns what `current` points at afterwards, and what the walking policy contains through
+    /// it — the two things a robot actually depends on.
+    fn seed(release: &std::path::Path, root: &std::path::Path) -> (Option<String>, Option<String>) {
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask/ has a parent")
+            .join("scripts/seed-policies.sh");
+        let status = std::process::Command::new("sh")
+            .arg(&script)
+            .arg(release)
+            .arg(root)
+            .status()
+            .expect("sh");
+        assert!(status.success(), "the seeder must never fail an update");
+
+        let link = std::fs::read_link(root.join("current"))
+            .ok()
+            .map(|p| p.display().to_string());
+        let content = std::fs::read_to_string(root.join("current/alpha_walking.onnx")).ok();
+        (link, content)
+    }
+
+    /// Write a release directory the seeder will accept.
+    fn fake_release(dir: &std::path::Path, version: &str, walking: &str) {
+        std::fs::create_dir_all(dir.join("policies")).expect("mkdir");
+        std::fs::write(
+            dir.join("version.toml"),
+            format!("version = \"{version}\"\n"),
+        )
+        .expect("version.toml");
+        std::fs::write(dir.join("policies/alpha_walking.onnx"), walking).expect("policy");
+    }
+
+    /// A board with nothing installed gets the release's set, and `robotd`'s default path
+    /// resolves through the symlink to a real file.
+    #[test]
+    fn seeding_fills_an_empty_policy_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let release = tmp.path().join("release");
+        let root = tmp.path().join("policies");
+        std::fs::create_dir_all(&root).unwrap();
+        fake_release(&release, "0.10.0", "walking-A");
+
+        let (link, content) = seed(&release, &root);
+        assert_eq!(link.as_deref(), Some("releases/seed-0.10.0"));
+        assert_eq!(content.as_deref(), Some("walking-A"));
+    }
+
+    /// **The symlink is relative to its own directory**, the way the updater writes `current`
+    /// (updater-design.md §7.1). An absolute target resolves against whatever the root happened
+    /// to be when it was written, which is how a `current` that looks right points nowhere.
+    #[test]
+    fn the_current_link_is_relative_to_its_own_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let release = tmp.path().join("release");
+        let root = tmp.path().join("policies");
+        std::fs::create_dir_all(&root).unwrap();
+        fake_release(&release, "0.10.0", "walking-A");
+
+        let (link, _) = seed(&release, &root);
+        let link = link.expect("a link");
+        assert!(
+            !link.starts_with('/'),
+            "an absolute target breaks the moment the root moves: {link}"
+        );
+        assert!(root.join("current").join("alpha_walking.onnx").exists());
+    }
+
+    /// Re-running the same release changes nothing. This runs on every update, so a seeder that
+    /// rewrote the directory each time would churn the eMMC for no reason.
+    #[test]
+    fn seeding_the_same_release_twice_is_a_no_op() {
+        let tmp = tempfile::tempdir().unwrap();
+        let release = tmp.path().join("release");
+        let root = tmp.path().join("policies");
+        std::fs::create_dir_all(&root).unwrap();
+        fake_release(&release, "0.10.0", "walking-A");
+
+        let first = seed(&release, &root);
+        assert_eq!(seed(&release, &root), first);
+    }
+
+    /// A newer daemon replaces an older seed of ours. While the release is the only source of
+    /// policies, a daemon update is still how a retrained gait reaches a board — a seeder that
+    /// only ever filled an empty directory would freeze every board on whatever first seeded it.
+    #[test]
+    fn a_newer_release_replaces_an_older_seed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("policies");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let old = tmp.path().join("old");
+        fake_release(&old, "0.10.0", "walking-A");
+        seed(&old, &root);
+
+        let new = tmp.path().join("new");
+        fake_release(&new, "0.11.0", "walking-B");
+        let (link, content) = seed(&new, &root);
+        assert_eq!(link.as_deref(), Some("releases/seed-0.11.0"));
+        assert_eq!(content.as_deref(), Some("walking-B"));
+    }
+
+    /// **A set this script did not install is never touched.**
+    ///
+    /// The rule the whole handover rests on. Once anything else puts policies there — a bundle
+    /// from the Hub, or whatever tool publishes them — the release must stop overwriting it, or
+    /// the next unrelated daemon update silently reverts somebody's gait. No flag, no config: a
+    /// `current` that is not one of ours ends the seeding for good.
+    #[test]
+    fn policies_this_script_did_not_install_are_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("policies");
+        std::fs::create_dir_all(root.join("releases/1.2.0")).unwrap();
+        std::fs::write(
+            root.join("releases/1.2.0/alpha_walking.onnx"),
+            "from-the-hub",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("releases/1.2.0", root.join("current")).unwrap();
+
+        let release = tmp.path().join("release");
+        fake_release(&release, "0.11.0", "walking-B");
+
+        let (link, content) = seed(&release, &root);
+        assert_eq!(link.as_deref(), Some("releases/1.2.0"));
+        assert_eq!(content.as_deref(), Some("from-the-hub"));
+    }
+
+    /// A release with no version is not one to name a directory after, and a release with no
+    /// policies has nothing to seed. Both exit cleanly: this runs inside an update, and failing
+    /// would roll back a release over something that is not the release's fault.
+    #[test]
+    fn a_release_it_cannot_read_is_skipped_rather_than_fatal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("policies");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let no_version = tmp.path().join("no-version");
+        std::fs::create_dir_all(no_version.join("policies")).unwrap();
+        assert_eq!(seed(&no_version, &root), (None, None));
+
+        let no_policies = tmp.path().join("no-policies");
+        std::fs::create_dir_all(&no_policies).unwrap();
+        std::fs::write(no_policies.join("version.toml"), "version = \"0.10.0\"\n").unwrap();
+        assert_eq!(seed(&no_policies, &root), (None, None));
+    }
+
     /// Every policy file in `policies/` must be packaged, at every packaging site.
     ///
     /// The `--include` list exists in three copies (the two workflows and `dev-push.sh`), and

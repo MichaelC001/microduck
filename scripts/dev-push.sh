@@ -379,6 +379,7 @@ cargo run -p xtask -- package \
     --include "scripts/setup-rkaiq.sh=scripts/setup-rkaiq.sh" \
     --include "scripts/rkaiq-modinfo-shim.c=scripts/rkaiq-modinfo-shim.c" \
     --include "scripts/setup-login.sh=scripts/setup-login.sh" \
+    --include "scripts/seed-policies.sh=scripts/seed-policies.sh" \
     --include "scripts/robot-rescue=scripts/robot-rescue" \
     --include "scripts/robot-boot-check=scripts/robot-boot-check" \
     --include "updater/systemd/robot-boot-check.service=systemd/robot-boot-check.service" \
