@@ -796,7 +796,7 @@ enum PolicyCommand {
     Load {
         /// `walk`, `stand`, `sitstand`, `ground_pick`, `kick_left`, `kick_right` or `roulade`.
         slot: String,
-        /// A file on this robot, or a Hub repo to fetch it from.
+        /// A file on this robot, a Hub repo to fetch it from, or `none` to switch the slot off.
         ///
         /// A path if it exists here; otherwise `org/name`, optionally with `@revision` and
         /// `:file` — `RemiFabre/microduck-flamingo-cycle`, or `…@v2`, or `…:policy.onnx`. The
@@ -2617,6 +2617,11 @@ fn swap_settled(
 /// report a different one.
 fn slot_holds(state: &proto::PolicySlot, path: Option<&Path>) -> bool {
     match path {
+        // A disabled slot reports no path at all, the same as one this robot never had — the
+        // difference is that config says so, which `overridden` is what carries.
+        Some(path) if robotd_params::is_none_sentinel(path) => {
+            state.path.is_none() && state.overridden
+        }
         Some(path) => state.path.as_deref() == Some(&*path.display().to_string()),
         None => !state.overridden,
     }
@@ -2694,7 +2699,14 @@ fn run_policy(
         PolicyCommand::Load { slot, source, json } => {
             let slot = slot_of(slot)?;
             let local = PathBuf::from(source);
-            let path = if local.exists() {
+            // Checked before the file test, so `none` means the sentinel even on the day
+            // somebody has a file called that. It is the same literal `[policy] <slot> = "none"`
+            // uses, and disabling a slot is a real thing to want: a policy that does its own
+            // standing needs the standing network out of the way, or command magnitude hands the
+            // robot to that instead.
+            let path = if robotd_params::is_none_sentinel(&local) {
+                local
+            } else if local.exists() {
                 // Resolved against *this* shell's working directory, because that is what the
                 // person typing it meant. The daemon refuses a relative path outright — its
                 // working directory is not the caller's — so sending one would only produce a
@@ -2806,6 +2818,9 @@ fn run_policy(
                 // changes one, and naming all seven read as though seven had been altered.
                 for slot in &changing {
                     match path.as_deref() {
+                        Some(path) if robotd_params::is_none_sentinel(path) => {
+                            println!("{slot} is switched off");
+                        }
                         Some(path) => println!("{slot} is now running {}", path.display()),
                         None => println!("{slot} is back to this robot's own policy"),
                     }
@@ -3991,6 +4006,39 @@ mod tests {
 
         let changing = slots_the_request_changes(&policies_of(slots), &Slot::ALL, None);
         assert_eq!(changing, vec![Slot::Walk]);
+    }
+
+    /// **Switching a slot off is a state of its own**, and the command has to be able to reach
+    /// it: the first community policy anyone will try does its own two-foot stand, so the
+    /// standing network has to be out of the way or command magnitude hands the robot to that
+    /// instead. Before this, that meant editing the file `policy load` exists to stop editing.
+    #[test]
+    fn disabling_a_slot_is_settled_when_it_reports_no_policy() {
+        let off = Path::new("none");
+
+        let running = policies_of(vec![slot_state(Slot::Stand, Some("/opt/x.onnx"), false)]);
+        assert!(!slot_holds(&running.slots[0], Some(off)));
+        assert_eq!(
+            slots_the_request_changes(&running, &[Slot::Stand], Some(off)),
+            vec![Slot::Stand]
+        );
+
+        let mut disabled = slot_state(Slot::Stand, None, true);
+        disabled.origin = None;
+        let disabled = policies_of(vec![disabled]);
+        assert!(slot_holds(&disabled.slots[0], Some(off)));
+        assert!(slots_the_request_changes(&disabled, &[Slot::Stand], Some(off)).is_empty());
+    }
+
+    /// A slot the robot simply does not have looks the same as a disabled one from the outside —
+    /// no path — and must not be mistaken for one. `overridden` is the difference: config said so.
+    #[test]
+    fn an_empty_slot_is_not_a_disabled_one() {
+        let empty = policies_of(vec![slot_state(Slot::Stand, None, false)]);
+        assert!(
+            !slot_holds(&empty.slots[0], Some(Path::new("none"))),
+            "roller mode has no standing network, and nobody asked for that"
+        );
     }
 
     /// A slot that fell back counts as changing, whatever its path says. It reads as

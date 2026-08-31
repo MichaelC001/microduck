@@ -217,6 +217,20 @@ Add `@v2` for a revision, and `:policy.onnx` for a repo carrying more than one p
 yet). `robotctl policy list` marks it `community`, and `sudo robotctl policy reset walk` puts your
 own back.
 
+Some policies need a slot out of the way. `flamingo-cycle` does its own two-foot stand, so the
+standing network has to be off or the robot hands itself to that whenever the command is zero:
+
+```
+sudo robotctl policy load walk RemiFabre/microduck-flamingo-cycle
+```
+```
+sudo robotctl policy load stand none
+```
+
+`none` switches a slot off, the same as `[policy] stand = "none"`. `sudo robotctl policy reset`
+puts everything back. Driving it takes the `control.py` in that repo, over a forwarded socket —
+its README has the commands, and the twist slots carry `[flag, side, 0]` rather than a velocity.
+
 A policy whose manifest says it will not run here — the wrong observation width, a newer daemon,
 a different robot — is refused before it downloads. One with no manifest is accepted and checked
 the usual way, at load. **Nothing a stranger publishes is verified by anybody**: what makes it

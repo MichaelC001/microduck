@@ -3097,6 +3097,16 @@ fn load_policy_request(
 
     let path = match p.path.as_deref() {
         None => None,
+        // The literal that turns a slot off, exactly as `[policy] <slot> = "none"` does. It names
+        // no file, so there is nothing to make absolute and nothing to open — and it has to be
+        // reachable from here, because the one published community policy that needs a slot
+        // disabled is the reason a person would ever want to.
+        Some(path) if params::is_none_sentinel(std::path::Path::new(path)) => {
+            if slot.is_none() {
+                return proto::IntentResult::refused("a slot to disable, or omit both to reset");
+            }
+            Some(PathBuf::from("none"))
+        }
         Some(path) => {
             let path = PathBuf::from(path);
             // `robotd`'s working directory is not the caller's, so a relative path would name a
@@ -5005,6 +5015,60 @@ mod tests {
 
         assert!(!result.accepted);
         assert!(result.reason.unwrap().contains("omit both"));
+    }
+
+    /// The sentinel that switches a slot off has to reach the loop: it names no file, so the
+    /// absolute-path rule and the shape check both have to stand aside for it. This is what
+    /// `RemiFabre/microduck-flamingo-cycle` needs — it does its own two-foot stand, so the
+    /// standing network must not be selectable by command magnitude.
+    #[test]
+    fn a_slot_can_be_switched_off_by_name() {
+        let s = RobotState::new(&Params::default(), false, false);
+        let intents = Arc::new(Intents::new());
+
+        let result: proto::IntentResult = dispatch(
+            &s,
+            &intents,
+            proto::Id::Number(1),
+            &proto::Call::RobotLoadPolicy(proto::LoadPolicyParams {
+                slot: Some("stand".into()),
+                path: Some("none".into()),
+            }),
+        )
+        .result_as()
+        .unwrap();
+
+        assert!(result.accepted, "{:?}", result.reason);
+        assert_eq!(
+            intents.take_policy_change(),
+            Some(intents::PolicyChange::Slot {
+                slot: Slot::Stand,
+                path: Some(PathBuf::from("none"))
+            })
+        );
+    }
+
+    /// But "switch off" needs a slot to switch off. Without one it is indistinguishable from
+    /// asking to reset everything, and guessing between those two is not on.
+    #[test]
+    fn switching_off_with_no_slot_is_refused() {
+        let s = RobotState::new(&Params::default(), false, false);
+        let intents = Arc::new(Intents::new());
+
+        let result: proto::IntentResult = dispatch(
+            &s,
+            &intents,
+            proto::Id::Number(1),
+            &proto::Call::RobotLoadPolicy(proto::LoadPolicyParams {
+                slot: None,
+                path: Some("none".into()),
+            }),
+        )
+        .result_as()
+        .unwrap();
+
+        assert!(!result.accepted);
+        assert!(intents.take_policy_change().is_none());
     }
 
     /// Writing an override a disabled loop will never read is a config edit that silently does

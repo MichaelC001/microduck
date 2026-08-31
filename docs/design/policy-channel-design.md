@@ -404,6 +404,12 @@ reject the majority of it. And the numbers it is checked against are published i
 `duck_ipc_proto` rather than duplicated, with a compile-time assertion in `duck_control` that the
 two agree — a contract with whoever publishes a policy belongs where both sides can see it.
 
+**A slot can be switched off**, with `none` — the literal `[policy] <slot> = "none"` already
+used. Not an afterthought: the first community policy anyone will try does its own two-foot
+stand, and `will_stand` hands the robot to the standing network whenever command magnitude is
+zero, which is exactly the state that policy is in when it is standing on two feet. Without a way
+to say `stand none`, running it meant editing the file this whole command exists to stop editing.
+
 `robotctl policy search microduck` lists what is out there, marking each hit's origin. No tag
 filter: a shared name is what the published policies have in common, and a tag is worth adding
 once there is something to tag.

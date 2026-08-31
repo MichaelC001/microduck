@@ -585,7 +585,11 @@ pub struct PolicyParams {
 }
 
 /// The literal that disables an optional policy slot, per the prototype's `--x-policy None`.
-fn is_none_sentinel(path: &std::path::Path) -> bool {
+///
+/// Public because three places need to agree on it: this crate resolving config, `robotctl`
+/// accepting `policy load <slot> none`, and `robotd` recognising it on the wire. A second spelling
+/// of it somewhere would be a slot that looks disabled in a file and is not.
+pub fn is_none_sentinel(path: &std::path::Path) -> bool {
     path.as_os_str().eq_ignore_ascii_case("none")
 }
 
