@@ -5,10 +5,13 @@ checks that at load rather than discovering it mid-stride.
 
 ## This is a temporary home
 
-**These belong on the Hugging Face Hub**, delivered as a `model` updater component that
+**These belong on the Hugging Face Hub**, delivered as a `policies` updater component that
 versions independently of the daemon — a gait retrain should not need a daemon release, and a
 daemon fix should not re-download 6 MB of unchanged weights. `deploy/updater.toml` already
 describes that component and deliberately leaves it unconfigured until the repos exist.
+
+How that lands, and what happens to the paths below, is
+[`docs/design/policy-channel-design.md`](../docs/design/policy-channel-design.md).
 
 They are vendored here because they were not on the Hub yet and the daemon cannot move without
 them. Committing them makes a release self-contained, which is the property that makes the
@@ -16,7 +19,7 @@ update path testable end to end: one `robotctl update apply` turns a standing ro
 walking one.
 
 Removing this directory later is the whole migration: point the `[policy]` paths in
-`deploy/robotd.toml` at wherever the model component installs, and drop the `--include`
+`deploy/robotd.toml` at wherever the `policies` component installs, and drop the `--include`
 lines from `.github/workflows/dev.yml`, `.github/workflows/_build-release.yml` and
 `scripts/dev-push.sh` — all three, and `xtask`'s `every_policy_in_the_repo_is_packaged`
 test is what keeps the three lists honest until then.
