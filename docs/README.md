@@ -62,6 +62,7 @@ thinking is not lost and does not get mistaken for a decision.
 | | |
 |---|---|
 | [`autonomous_behavior.md`](ideas/autonomous_behavior.md) | The behavior stack: what the runtime's brain has to give up, and the ideas the chorale and theremin work left behind. |
+| [`policy-moves.md`](ideas/policy-moves.md) | What runs when you press a button today, and what it would take for a one-shot move to be config rather than code. |
 
 ## Elsewhere
 
