@@ -87,11 +87,30 @@ fn installed_files(root: &Path) -> Vec<String> {
     names
 }
 
+/// A tag's version, as a list of numbers, or `None` when it is not a version at all.
+///
+/// `v3` is `[3]`, `v1.2.0` is `[1, 2, 0]`, `nightly` is nothing. Numbers rather than a string
+/// compare, because `v10` has to sort above `v9` and lexically it does not.
+fn version_of(tag: &str) -> Option<Vec<u64>> {
+    let parts: Vec<u64> = tag
+        .trim_start_matches(['v', 'V'])
+        .split(['.', '-', '_'])
+        .map(|part| part.parse().ok())
+        .collect::<Option<Vec<u64>>>()?;
+    (!parts.is_empty()).then_some(parts)
+}
+
 /// Tags in a Hub repo, newest first.
 ///
-/// "Newest" is the repo's own order reversed, not a semver sort: a policy repo is not obliged to
-/// use semver, and inventing an ordering for `bouncy-2` against `v10` would be a guess presented
-/// as a fact. The Hub lists refs oldest-first.
+/// **The Hub returns refs in no useful order and carries no dates on them.** Our own set comes
+/// back as `v3, v1, v2`, so neither the list nor its reverse says which is newest — and an
+/// earlier version of this took the reverse and confidently reported v2 as newer than v3.
+///
+/// Ordering is therefore by version: the numbers in the tag, compared as numbers. A tag that is
+/// not a version keeps its place at the end and never counts as newest, so
+/// `robotctl policy update` cannot land on somebody's `experimental` because it sorted oddly —
+/// naming it explicitly still works. That is a narrower claim than an ordering over arbitrary
+/// names, which is the guess worth not making.
 async fn tags(client: &reqwest::Client, repo: &str) -> Result<Vec<String>, Error> {
     let url = format!("https://huggingface.co/api/models/{repo}/refs");
     let bytes = http::get_bytes(client, &url, None).await?;
@@ -106,7 +125,13 @@ async fn tags(client: &reqwest::Client, repo: &str) -> Result<Vec<String>, Error
                 .collect()
         })
         .unwrap_or_default();
-    names.reverse();
+    // Versions first and highest first; everything else after, in the order the Hub gave it.
+    names.sort_by(|a, b| match (version_of(a), version_of(b)) {
+        (Some(a), Some(b)) => b.cmp(&a),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    });
     Ok(names)
 }
 
@@ -138,7 +163,7 @@ pub async fn check(root: &Path) -> crate::proto::PolicyCheckResult {
         // is installed knows more than one shown an error.
         Err(e) => result.unreachable = Some(e.to_string()),
         Ok(versions) => {
-            result.available = versions.first().cloned();
+            result.available = versions.iter().find(|t| version_of(t).is_some()).cloned();
             result.versions = versions;
         }
     }
@@ -161,11 +186,19 @@ pub async fn install(
 
     let version = match version {
         Some(version) => version.to_owned(),
+        // The newest *version*, not merely the first tag: a repo whose tags are all names rather
+        // than versions has no newest, and picking one would be a coin toss with a robot's gait
+        // riding on it.
         None => tags(&client, &source.repo)
             .await?
             .into_iter()
-            .next()
-            .ok_or_else(|| Error::Network(format!("{} has no tags to install", source.repo)))?,
+            .find(|tag| version_of(tag).is_some())
+            .ok_or_else(|| {
+                Error::Network(format!(
+                    "{} has no version tags — name a revision to install",
+                    source.repo
+                ))
+            })?,
     };
 
     let previous = Some(source.version.clone()).filter(|v| *v != version);
@@ -480,6 +513,53 @@ mod tests {
         assert_eq!(PolicyManifest::default().incompatibility(here()), None);
         let sparse = manifest(serde_json::json!({ "name": "something", "unknown_field": 3 }));
         assert_eq!(sparse.incompatibility(here()), None);
+    }
+
+    /// **The Hub returns tags in no useful order, and this is the order it actually returned.**
+    ///
+    /// `v3, v1, v2` for `pollen-robotics/microduck-policies`, with no dates on any of them. The
+    /// rule used to be "the list, reversed", which made v2 the newest and had a board report
+    /// "newest v2 — up to date" while listing v3 underneath it.
+    #[test]
+    fn the_newest_tag_is_the_highest_version_not_the_first_listed() {
+        let mut tags = vec!["v3".to_string(), "v1".to_string(), "v2".to_string()];
+        tags.sort_by(|a, b| match (version_of(a), version_of(b)) {
+            (Some(a), Some(b)) => b.cmp(&a),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        });
+        assert_eq!(tags, ["v3", "v2", "v1"]);
+    }
+
+    /// Numbers compare as numbers, so a repo that gets past nine does not go backwards.
+    #[test]
+    fn ten_is_newer_than_nine() {
+        assert!(version_of("v10") > version_of("v9"));
+        assert!(version_of("v1.2.0") > version_of("v1.1.9"));
+        assert_eq!(version_of("v3"), Some([3].to_vec()));
+    }
+
+    /// A tag that is not a version is never the newest, so `policy update` with no argument
+    /// cannot land on somebody's scratch tag. Naming it explicitly still works.
+    #[test]
+    fn a_name_that_is_not_a_version_is_never_newest() {
+        assert_eq!(version_of("experimental"), None);
+        assert_eq!(version_of("v2-rc"), None, "not a plain version either");
+
+        let mut tags = ["experimental", "v1", "v2"].map(str::to_owned);
+        tags.sort_by(|a, b| match (version_of(a), version_of(b)) {
+            (Some(a), Some(b)) => b.cmp(&a),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        });
+        assert_eq!(tags.first().unwrap(), "v2");
+        assert_eq!(
+            tags.iter().find(|t| version_of(t).is_some()).unwrap(),
+            "v2",
+            "and the selection skips it even if it sorted first"
+        );
     }
 
     /// Origin is the org, and nothing else.
