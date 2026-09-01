@@ -168,6 +168,13 @@ otherwise and a bare expiry would hand walk a robot on one leg. So a skill decla
 supplying the ending the policy does not have, which is the two-phase shape the sit toggle
 already uses on its way up.
 
+**Adding a skill needs no restart.** `robot.reloadPolicies` re-reads `[policy]` from disk and
+rebuilds at the home pose with torque on throughout — so a skill written by `robotctl policy add`
+is one the robot has seconds later, without `systemctl restart robotd` dropping motor control and
+putting the robot on the floor. The mode is carried over rather than adopted from the file,
+because `robot.setMode` deliberately does not write config and a live switch must not be undone
+by adding a bow. `[safety]` and `[control]` are still read once at startup.
+
 **A running skill has no fall reflex.** The limp-fall predictor is only consulted while the
 controller is not `busy()`, and any active skill makes it busy. That was uncontroversial when
 every one-shot was under a second — a kick is over before a fall could develop — and it is worth

@@ -789,15 +789,15 @@ enum PolicyCommand {
     /// Add a one-shot skill — a policy the robot runs when asked, by name.
     ///
     /// `robotctl policy add polite-bow fffiloni/microduck-polite-bow-b1d864` fetches it, reads
-    /// how long it runs from its manifest, and writes the entry. Then `robotctl policy do
-    /// polite-bow`, or a pad button once bindings exist.
+    /// how long it runs from its manifest, and writes the entry. Then `robotctl robot do polite-bow`,
+    /// or a pad button once bindings exist.
     ///
     /// A policy that ends itself needs nothing else. One that holds until told otherwise —
     /// `kind: perpetual`, like the published flamingo — has no length of its own, so `--hold`
     /// and `--unwind` say how long to hold it and how long to come back before the gait takes
     /// over. Without those the robot would be handed back mid-pose.
     Add {
-        /// What to call it. This is what `robotctl policy do` and a pad button will use.
+        /// What to call it. This is what `robotctl robot do <name>` and a pad button will use.
         name: String,
         /// A file on this robot, or a Hub repo — `org/name`, optionally `@revision` and `:file`.
         source: String,
@@ -2703,7 +2703,7 @@ fn run_policy(
             return run_policy_search(updater_socket, query, *json);
         }
         PolicyCommand::Add { .. } | PolicyCommand::Remove { .. } => {
-            return run_policy_skill(updater_socket, config, &command);
+            return run_policy_skill(updater_socket, robot_socket, config, &command);
         }
         _ => {}
     }
@@ -2963,6 +2963,7 @@ fn twist_of(spec: &str) -> Result<[f64; 3], Failure> {
 /// restart, with no code anywhere naming it.
 fn run_policy_skill(
     updater_socket: &Path,
+    robot_socket: &Path,
     config: &Path,
     command: &PolicyCommand,
 ) -> Result<(), Failure> {
@@ -2976,7 +2977,8 @@ fn run_policy_skill(
         if *json {
             println!("{}", compact(&serde_json::json!({ "removed": removed })));
         } else if removed {
-            println!("{name} removed — restart robotd for it to take effect");
+            println!("{name} removed");
+            report_reload(robot_socket);
         } else {
             println!("no skill named {name:?} in {}", config.display());
         }
@@ -3086,8 +3088,31 @@ fn run_policy_skill(
         // consequence is worth stating rather than discovering with the robot on one foot.
         println!("  no unwind: the gait takes over the moment it ends");
     }
-    println!("  `sudo systemctl restart robotd`, then `robotctl policy do {name}`");
+    report_reload(robot_socket);
+    println!("  `robotctl robot do {name}` runs it, once the policy is driving");
     Ok(())
+}
+
+/// Tell `robotd` to re-read its skills, and say whether it did.
+///
+/// A skill written into config is not one the robot has until the loop resolves it again, and
+/// telling somebody to restart the daemon for that would be a poor answer to "I added a skill" —
+/// the whole point of the command is that trying one is cheap. An unreachable robot is not a
+/// failure here: the config is written either way, and the next start picks it up.
+fn report_reload(robot_socket: &Path) {
+    let reloaded = (|| -> Result<bool, Failure> {
+        let mut client = Client::connect_to("robotd", robot_socket)?;
+        client.hello()?;
+        let result: proto::IntentResult =
+            decode(&result_of(client.call(&proto::Call::RobotReloadPolicies)?)?)?;
+        Ok(result.accepted)
+    })();
+    match reloaded {
+        Ok(true) => println!("  the robot is re-reading its skills"),
+        Ok(false) | Err(_) => {
+            println!("  robotd did not pick it up — it will at the next start");
+        }
+    }
 }
 
 /// Fetch a policy for a skill entry, reporting what arrived.

@@ -993,6 +993,12 @@ fn spawn_control_thread(
     let fake = args.fake;
     let port = params.bus.port.clone();
     let params = params.clone();
+    // So a reload can re-read `[policy]` without a restart. The path rather than the loaded
+    // params, because the point is to pick up what has been written since.
+    let params_path = args
+        .params
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(params::DEFAULT_PATH));
 
     std::thread::Builder::new()
         .name("control".into())
@@ -1015,6 +1021,7 @@ fn spawn_control_thread(
                     state,
                     intents,
                     params,
+                    params_path,
                     period,
                     poweroff,
                 ));
@@ -1029,7 +1036,7 @@ fn spawn_control_thread(
             // afterwards. Retrying the read alone was not enough: execution never got there.
             runtime.block_on(async move {
                 if let Some(io) = open_bus_waiting(&port, &state).await {
-                    control_loop(io, state, intents, params, period, poweroff).await;
+                    control_loop(io, state, intents, params, params_path, period, poweroff).await;
                 }
             });
         })
@@ -1339,6 +1346,8 @@ async fn control_loop<T: RobotIo>(
     state: Arc<RobotState>,
     intents: Arc<Intents>,
     params: Params,
+    // Where `[policy]` is re-read from on a reload, so adding a skill needs no restart.
+    params_path: PathBuf,
     period: Duration,
     poweroff: PowerOff,
 ) {
@@ -2140,8 +2149,36 @@ async fn control_loop<T: RobotIo>(
                         candidate.set_slot(slot, None);
                     }
                 }
-                // Config is already right; only the loaded sessions are stale.
-                intents::PolicyChange::Reload => {}
+                // Re-read `[policy]` from disk, so a skill added since startup is one this
+                // robot has without a restart.
+                //
+                // **Only `[policy]`, and the mode is kept.** The daemons read their config once
+                // at startup and that stays true of everything else here — re-reading `[safety]`
+                // or `[control]` under a running loop is a different and much larger promise.
+                // The mode is carried over because `robot.setMode` deliberately does not write
+                // config: adopting the file's mode here would undo a live switch as a side
+                // effect of adding a skill.
+                //
+                // A file that will not parse leaves the robot exactly as it is. It is the
+                // caller's file and their mistake to fix, and dropping a working policy set over
+                // a syntax error would be the worse of the two outcomes.
+                intents::PolicyChange::Reload => match params::Params::load(&params_path, false) {
+                    Ok(fresh) => {
+                        let mode = candidate.mode;
+                        candidate = fresh.policy;
+                        candidate.mode = mode;
+                        // A file may name a skill this board cannot load; the same check
+                        // startup runs drops it and reports degraded rather than failing.
+                        drop_unloadable_overrides(&mut candidate, &mut slot_errors);
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            path = %params_path.display(),
+                            "reload: config will not parse; keeping what is running"
+                        );
+                    }
+                },
             }
             let cfg = candidate.resolved();
             match try_controller(&cfg, params.safety.limp_fall) {
@@ -3248,7 +3285,20 @@ fn dispatch(
             // Not refused for being down. A skill on a fallen robot is the human's call, and
             // refusing it is how a robot ends up unable to do the thing that would have
             // righted it.
-            let result = if queue_skill(state, intents, &p.skill) {
+            // Refused before the name is even looked at, because "accepted" followed by
+            // nothing is the worst answer available: the loop drops a skill request whenever
+            // the policy is not driving, and it says so only in the journal. That silence cost
+            // an evening once already.
+            let result = if !intents.enabled() {
+                // Only the pad can start the policy: `robotctl robot` has `init` and `relax`
+                // and no `enable`, so naming a command here would be naming one that does not
+                // exist.
+                proto::IntentResult::refused("the policy is not driving — press Start on the pad")
+            } else if !state.homed.load(Ordering::Relaxed) {
+                proto::IntentResult::refused(
+                    "the robot is still going to its home pose; try again in a moment",
+                )
+            } else if queue_skill(state, intents, &p.skill) {
                 proto::IntentResult::accepted()
             } else {
                 let policies = state.policies.load();
@@ -4142,6 +4192,9 @@ mod tests {
         let s = state(); // default params: every walk-mode skill configured
         let intents = Intents::new();
         let id = || proto::Id::Number(1);
+        // A skill needs the policy driving, which is the pad's Start and the home ramp done.
+        intents.set_enabled(true);
+        s.homed.store(true, Ordering::Relaxed);
 
         let accepted: proto::IntentResult = dispatch(
             &s,
@@ -4171,6 +4224,7 @@ mod tests {
             ..Default::default()
         }];
         let unconfigured = RobotState::new(&params, false, false);
+        unconfigured.homed.store(true, Ordering::Relaxed);
         let refused: proto::IntentResult = dispatch(
             &unconfigured,
             &intents,
@@ -4252,6 +4306,7 @@ mod tests {
             loop_state,
             Arc::clone(&intents),
             params,
+            PathBuf::from("/nonexistent/robotd.toml"),
             Duration::from_millis(2),
             poweroff,
         ));
@@ -4523,6 +4578,7 @@ mod tests {
             loop_state,
             Arc::clone(&intents),
             params,
+            PathBuf::from("/nonexistent/robotd.toml"),
             Duration::from_millis(2),
             noop_poweroff(),
         ));
@@ -4592,6 +4648,7 @@ mod tests {
             loop_state,
             Arc::clone(&intents),
             params,
+            PathBuf::from("/nonexistent/robotd.toml"),
             Duration::from_millis(2),
             noop_poweroff(),
         ));
@@ -4643,6 +4700,7 @@ mod tests {
             loop_state,
             Arc::new(Intents::new()),
             params,
+            PathBuf::from("/nonexistent/robotd.toml"),
             Duration::from_millis(2),
             noop_poweroff(),
         ));
@@ -5420,6 +5478,115 @@ mod tests {
         );
     }
 
+    /// **A skill asked for while the policy is not driving is refused, not accepted.**
+    ///
+    /// The loop drops a skill request unless `enabled` and homed, and said so only in the
+    /// journal — so the answer to a client was "accepted" followed by a robot that did nothing.
+    /// That is the same silence that made a policy load look broken earlier, and it is worth a
+    /// sentence rather than a log line nobody is tailing.
+    ///
+    /// The message names the pad and nothing else, because nothing else can start the policy:
+    /// `robotctl robot` has `init` and `relax` and no `enable`.
+    #[test]
+    fn a_skill_before_start_is_refused_with_what_to_do() {
+        let s = RobotState::new(&Params::default(), false, false);
+        let intents = Arc::new(Intents::new());
+
+        let result: proto::IntentResult = dispatch(
+            &s,
+            &intents,
+            proto::Id::Number(1),
+            &proto::Call::RobotDo(proto::DoParams {
+                skill: "roulade".into(),
+            }),
+        )
+        .result_as()
+        .unwrap();
+
+        assert!(!result.accepted);
+        let reason = result.reason.unwrap();
+        assert!(reason.contains("Start"), "{reason}");
+        assert_eq!(intents.take_skills().skills, 0, "and nothing was queued");
+    }
+
+    /// Enabled but still ramping home is its own answer — it resolves on its own in a second,
+    /// which "press Start" would send somebody chasing the wrong thing.
+    #[test]
+    fn a_skill_mid_ramp_says_to_wait() {
+        let s = RobotState::new(&Params::default(), false, false);
+        let intents = Arc::new(Intents::new());
+        intents.set_enabled(true);
+
+        let result: proto::IntentResult = dispatch(
+            &s,
+            &intents,
+            proto::Id::Number(1),
+            &proto::Call::RobotDo(proto::DoParams {
+                skill: "roulade".into(),
+            }),
+        )
+        .result_as()
+        .unwrap();
+
+        assert!(!result.accepted);
+        assert!(result.reason.unwrap().contains("home pose"));
+    }
+
+    /// **A reload picks up a skill added since startup.**
+    ///
+    /// Adding one is a config write, and a robot only has the skills its loop resolved — so
+    /// without re-reading the file, `policy add` meant `systemctl restart robotd`, which is a
+    /// poor answer to "I want to try a gait".
+    #[test]
+    fn a_reload_re_reads_the_skills_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("robotd.toml");
+        std::fs::write(&config, "[policy]\n").unwrap();
+        assert_eq!(
+            params::Params::load(&config, false)
+                .unwrap()
+                .policy
+                .resolved()
+                .skills
+                .len(),
+            3,
+            "the built-in three"
+        );
+
+        std::fs::write(
+            &config,
+            "[policy]\n[[policy.skill]]\nname = \"polite-bow\"\npath = \"/srv/bow.onnx\"\nduration = 4.0\n",
+        )
+        .unwrap();
+        let names: Vec<String> = params::Params::load(&config, false)
+            .unwrap()
+            .policy
+            .resolved()
+            .skills
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        assert!(names.contains(&"polite-bow".to_string()), "{names:?}");
+    }
+
+    /// **A live mode switch survives a reload.** `robot.setMode` deliberately does not write
+    /// config, so adopting the file's mode would undo a switch as a side effect of adding a
+    /// skill — a duck on wheels quietly going back to legs because somebody tried a bow.
+    #[test]
+    fn a_reload_keeps_the_mode_the_robot_is_in() {
+        let mut on_disk = params::PolicyParams::default();
+        assert_eq!(on_disk.mode, Mode::Walk, "the file says walk");
+
+        // What the loop does: take the file's `[policy]`, keep the mode it is running.
+        let live = Mode::Roller;
+        on_disk.mode = live;
+        assert_eq!(on_disk.resolved().mode, Mode::Roller);
+        assert!(
+            on_disk.resolved().walk.ends_with("roller.onnx"),
+            "and the roller's own networks with it"
+        );
+    }
+
     /// **A reload must not touch anybody's overrides.**
     ///
     /// `Reload` and `ResetAll` both name no slot and no path, and while the intent was a pair of
@@ -5668,6 +5835,7 @@ mod tests {
             state,
             intents,
             Params::default(),
+            PathBuf::from("/nonexistent/robotd.toml"),
             period,
             noop_poweroff(),
         )
