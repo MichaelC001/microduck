@@ -446,6 +446,60 @@ needs one: `ball_kick_left.onnx` answers to `kick_left`, and `roulade.onnx` says
 makes the ask to a community publisher "add these fields" rather than "adopt our format", and it
 means one reader understands both shapes.
 
+### 9.4 What the set's manifest says, and adding to it
+
+The file at the root of `pollen-robotics/microduck-policies`, in full. Shown here rather than
+checked in: a copy in this repository would be a second source of truth for something that
+versions on the Hub, and a test over the copy would pass while a board downloaded something else.
+
+```json
+{
+  "schema_version": 1,
+  "model_api": 1,
+  "obs_len": 61,
+  "action_len": 14,
+  "robot": { "model": "microduck", "hw_rev": 1, "servos": "xl330", "control_hz": 50 },
+  "description": "The policy set a microduck ships with: walking, standing, and the one-shots its buttons run.",
+  "policies": [
+    { "file": "alpha_walking.onnx",     "kind": "perpetual" },
+    { "file": "alpha_stand.onnx",       "kind": "perpetual" },
+    { "file": "alpha_sitstand.onnx",    "kind": "perpetual" },
+    { "file": "roller.onnx",            "kind": "perpetual" },
+    { "file": "alpha_ground_pick.onnx", "kind": "scripted" },
+    { "file": "roller_crouch.onnx",     "kind": "scripted" },
+    { "file": "roulade.onnx",           "kind": "episodic", "duration_s": 1.0, "chain": true },
+    { "file": "ball_kick_left.onnx",    "name": "kick_left",  "kind": "episodic", "duration_s": 0.5 },
+    { "file": "ball_kick_right.onnx",   "name": "kick_right", "kind": "episodic", "duration_s": 0.5 }
+  ]
+}
+```
+
+Read that against what a robot does with it. The nine `file` entries are the download list, so
+the seeder fetches exactly these. The three `episodic` ones with a `duration_s` become skills —
+which reproduces the built-in three exactly, and is the check that the manifest is *right* rather
+than merely plausible. `ball_kick_left.onnx` carries a `name` because its role differs from its
+training run; `roulade.onnx` does not, because the file's stem is already the name.
+
+`alpha_ground_pick.onnx` is `scripted` and that word earns its place. It writes a phase over time
+rather than a constant, and calling it `episodic` would load it as a generic one-shot and feed it
+an all-zero command — a robot moving plausibly and wrongly, which `duck_control::obs`'s header
+calls the hardest failure to see. Marking it `scripted` keeps it out of the skill list while
+still declaring that it exists.
+
+**Adding a policy to the set** is then four steps and no daemon release:
+
+1. Upload the `.onnx` to the repo.
+2. Add an entry to `manifest.json`. `kind` decides what happens next: `episodic` with a
+   `duration_s` becomes a skill a robot can be asked for by name; `perpetual` is a gait, which
+   needs a slot pointed at it; `scripted` is neither and is simply recorded.
+3. Tag the revision — `hf repos tag create pollen-robotics/microduck-policies v4`.
+4. On a robot: `robotctl policy update`.
+
+A new episodic policy is then `robotctl robot do <name>` and can go on a button, with nothing
+edited and nothing rebuilt. `[workspace.metadata.policies]` in the root `Cargo.toml` decides
+which tag a *freshly provisioned* board installs, and bumping that does need a release — the pin
+is a floor, not a ceiling.
+
 **One guard is on the board, because it cannot be anywhere else.** A set entry may not answer to
 `ground_pick` or `sit_toggle`: those have their own arm of the cascade, and a second network
 behind either name would be fed an all-zero command it was never trained on. Nothing in this
@@ -635,6 +689,19 @@ its meaning for the things that genuinely are models and not control policies, s
 - **Signing community policies**, and any curated-org scheme that would require it.
 
 ## 15. Open
+
+- **None of this is reachable remotely.** Every policy method is refused over BLE, and over
+  WebRTC all but the `robot.policies` read. The refusals are written as deferrals rather than
+  rules, and each says what would lift it: the reads (`policies`, `check`, `search`) change
+  nothing and are the easy half; the mutations are a question about who is *watching*, since a
+  gait that goes wrong walks badly and nothing detects that but a person looking at the robot.
+  WebRTC has the sharper version — §4 of `remote-webrtc.md` means any LAN peer inherits whatever
+  is opened.
+
+  The pad bindings are further out than the rest: they have **no wire surface at all**.
+  `robotctl pad bind` edits the config file directly, so there is nothing for a phone to call.
+  Exposing them means new methods and a decision about which daemon owns them — `configd` owns
+  config, but `padd` is the reader and `robotd` is the authority on which skills exist.
 
 - **A running skill has no fall reflex** for its whole duration (§10.2). Fine for a half-second
   kick; a skill configured to hold for ten seconds is ten seconds without one.

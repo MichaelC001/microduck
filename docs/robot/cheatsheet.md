@@ -354,6 +354,26 @@ points elsewhere.
 cannot be empty. Some policies need that: one that does its own standing wants the standing
 network out of the way, or the robot hands itself to that whenever the command is zero.
 
+#### Publishing a policy for every robot
+
+A policy in the official set reaches every robot, and adding one is four steps with no daemon
+release:
+
+1. Upload the `.onnx` to `pollen-robotics/microduck-policies`.
+2. Add an entry to its `manifest.json`:
+   ```json
+   { "file": "polite-bow.onnx", "kind": "episodic", "duration_s": 4.0 }
+   ```
+3. Tag it — `hf repos tag create pollen-robotics/microduck-policies v4`.
+4. On a robot: `sudo robotctl policy update`.
+
+`kind` decides what happens: **`episodic`** with a `duration_s` becomes a skill the robot answers
+to by name, ready for `robot do` and a button; **`perpetual`** is a gait, which needs a slot
+pointed at it; **`scripted`** is a policy the daemon drives itself, like the ground pick.
+
+The manifest, and what each field does, is in
+[`../design/policy-channel-design.md`](../design/policy-channel-design.md) §9.4.
+
 The shape a policy has to have and what else is checked at load are in
 [`../design/robotd-design.md`](../design/robotd-design.md) §2.3; where policies come from, what
 `official` means, and how a skill declares itself are in
