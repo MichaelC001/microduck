@@ -616,6 +616,72 @@ pub fn summary(model: &Model) -> Vec<String> {
         .collect()
 }
 
+/// Print what this robot's config changes, and nothing else.
+///
+/// **"What has been changed on this robot" is the first question support asks**, and until now
+/// the only way to answer it was the editor — a full-screen TUI, over ssh, on a robot somebody is
+/// already having trouble with. The comparison was there all along; it was just unreachable
+/// without taking over the terminal.
+///
+/// Divergences only, because that is the question. The shipped file sets four keys and comments
+/// out the rest, so a robot that has never been touched prints nothing at all — which is itself
+/// the answer, and a shorter one than a hundred lines of defaults.
+///
+/// A key written out with its default value is *not* a divergence and does not appear. The
+/// shipped file does exactly that in places, and reporting it as a change would bury the two
+/// lines that matter under the ones that do not.
+pub fn list(path: &Path, json: bool) -> Result<(), String> {
+    let model = Model::load(path)?;
+    let changed: Vec<Row> = model.rows().into_iter().filter(Row::differs).collect();
+
+    if json {
+        let entries: Vec<serde_json::Value> = changed
+            .iter()
+            .map(|row| {
+                serde_json::json!({
+                    "key": row.entry.key,
+                    "value": row.effective(),
+                    "default": row.default,
+                    "doc": row.entry.doc,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string(&entries).map_err(|e| e.to_string())?
+        );
+        return Ok(());
+    }
+
+    if changed.is_empty() {
+        println!(
+            "{} changes nothing — every value is the default",
+            path.display()
+        );
+        return Ok(());
+    }
+
+    let width = changed
+        .iter()
+        .map(|row| row.entry.key.len())
+        .max()
+        .unwrap_or(0);
+    for row in &changed {
+        println!(
+            "{:width$}  {}  (default {})",
+            row.entry.key,
+            row.effective(),
+            row.default
+        );
+    }
+    println!(
+        "\n{} {} differ from the default. `sudo robotctl configure` edits them; `u` reverts one.",
+        changed.len(),
+        if changed.len() == 1 { "key" } else { "keys" }
+    );
+    Ok(())
+}
+
 // ── the terminal UI ──────────────────────────────────────────────────────────
 //
 // One screen: feature switches first, then every section; a footer carrying the selected
@@ -1007,6 +1073,40 @@ fn draw(
 
 #[cfg(test)]
 mod tests {
+    /// And a robot mid-experiment names every leftover. This is the set a flamingo trial leaves
+    /// behind, which is what the command exists for: `cmd_alpha` at pass-through, a slot pointed
+    /// at somebody's file, another switched off, and a fall gate widened.
+    #[test]
+    fn a_touched_config_names_every_key_that_differs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("robotd.toml");
+        std::fs::write(
+            &path,
+            "[control]\ncmd_alpha = 1.0\n\
+             [policy]\nwalk = \"/home/pierre/mine.onnx\"\nstand = \"none\"\n\
+             [safety]\nlimp_fall_tilt_z = -0.80\n",
+        )
+        .unwrap();
+
+        let model = super::Model::load(&path).unwrap();
+        let mut changed: Vec<&'static str> = model
+            .rows()
+            .iter()
+            .filter(|row| row.differs())
+            .map(|row| row.entry.key)
+            .collect();
+        changed.sort();
+        assert_eq!(
+            changed,
+            [
+                "control.cmd_alpha",
+                "policy.stand",
+                "policy.walk",
+                "safety.limp_fall_tilt_z"
+            ]
+        );
+    }
+
     use super::*;
 
     /// The shipped example, which is real config with real comments — the thing edits must

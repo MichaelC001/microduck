@@ -105,6 +105,16 @@ robotctl monitor --json --hz 50 > run.jsonl
 sudo robotctl configure
 ```
 
+What has been changed on this robot, and nothing else:
+
+```
+robotctl configure --list
+```
+
+A robot nobody has touched prints nothing — that is the answer. Add `--json` for a support
+bundle. It needs no root and no terminal, which is the point: it is the first question to ask
+about a robot behaving oddly, and until now answering it meant a full-screen editor over ssh.
+
 An interactive editor over `/etc/robot/robotd.toml`: every key the daemons know, the feature
 switches first (policy on/off, walk/roller, limp-fall, audio, pet detection, battery
 shutdown, camera and video quality…), current value against default, one line of doc. SPACE toggles, ENTER types a

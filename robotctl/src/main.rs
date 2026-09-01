@@ -189,6 +189,17 @@ enum Namespace {
         /// The file to edit. The default is where a provisioned robot keeps it.
         #[arg(long, default_value = robotd_params::DEFAULT_PATH)]
         file: PathBuf,
+
+        /// Print what this robot changes from the defaults, and exit.
+        ///
+        /// The question support asks first, answerable over ssh without a full-screen editor.
+        /// A robot nobody has touched prints nothing, which is the answer.
+        #[arg(long)]
+        list: bool,
+
+        /// With `--list`, emit JSON for a support bundle.
+        #[arg(long, requires = "list")]
+        json: bool,
     },
 
     /// The gamepad. Pair one, see what is paired, forget one.
@@ -3792,8 +3803,13 @@ fn run(cli: Cli) -> Result<(), Failure> {
         Namespace::Chorale { off, piece } => {
             return run_chorale(&cli.robot_socket, off, piece);
         }
-        Namespace::Configure { file } => {
-            return configure::run(&file).map_err(|e| Failure::new(exit::FAILED, e));
+        Namespace::Configure { file, list, json } => {
+            let result = if list {
+                configure::list(&file, json)
+            } else {
+                configure::run(&file)
+            };
+            return result.map_err(|e| Failure::new(exit::FAILED, e));
         }
         Namespace::Update { command } => command,
     };
