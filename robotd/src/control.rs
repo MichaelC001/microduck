@@ -46,12 +46,12 @@ const GROUND_PICK_END_PHASE: f64 = 0.7;
 /// 1 s is enough on the robot — velstand owns the tail of the rise fine.
 const RISE_SECS: f64 = 1.0;
 
-/// How recently a roulade request must have arrived, at the end of a roll, for another to
-/// chain. The prototype chains on "X still held at the window boundary"; here the client
-/// holds the button by re-sending the request every tick, so "held" is "a request landed
-/// within the last few ticks". 150 ms is seven ticks — generous against a dropped packet,
-/// far too short to mistake a fresh press for a hold.
-const ROULADE_CHAIN_WINDOW: f64 = 0.15;
+/// How recently a request must have arrived, at the end of a chaining skill's window, for
+/// another to start. The prototype chains roulade on "X still held at the window boundary";
+/// here the client holds the button by re-sending the request every tick, so "held" is "a
+/// request landed within the last few ticks". 150 ms is seven ticks — generous against a
+/// dropped packet, far too short to mistake a fresh press for a hold.
+const CHAIN_WINDOW: f64 = 0.15;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Tuning {
@@ -84,21 +84,16 @@ impl Default for Tuning {
 }
 
 /// The scripted-skill numbers, resolved per mode by `params`.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SkillTuning {
     /// One ground-pick cycle, seconds.
     pub ground_pick_period: f64,
     pub ground_pick_action_scale: f64,
     /// Gain multiplier while the pick runs.
     pub ground_pick_gain_ratio: f64,
-    /// How long a kick window stays on the kick network, seconds.
-    pub kick_duration: f64,
-    /// One roulade — one forward roll, seconds. The prototype's measured single-roll time.
-    pub roulade_duration: f64,
-    /// Action scale while a roulade runs.
-    pub roulade_action_scale: f64,
-    /// Gain multiplier while a roulade runs.
-    pub roulade_gain_ratio: f64,
+    /// The one-shot skills, in priority order — name, duration, whether holding chains, and
+    /// what each changes about the robot while it runs. Config, resolved over the built-ins.
+    pub skills: Vec<robotd_params::SkillDef>,
 }
 
 impl Default for SkillTuning {
@@ -107,21 +102,21 @@ impl Default for SkillTuning {
             ground_pick_period: 4.0,
             ground_pick_action_scale: 1.0,
             ground_pick_gain_ratio: 1.0,
-            kick_duration: 0.5,
-            roulade_duration: 1.0,
-            roulade_action_scale: 1.0,
-            roulade_gain_ratio: 1.0,
+            skills: Vec::new(),
         }
     }
 }
 
 /// One tick's worth of decisions, for the caller to act on and report.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Step {
     pub targets: [f64; NUM_JOINTS],
-    /// Which network drove, as the wire label: `walk`, `stand`, `ground_pick`, `kick_left`,
-    /// `kick_right`, `sit`, `rise`.
-    pub label: &'static str,
+    /// Which network drove, as the wire label: `walk`, `stand`, `ground_pick`, `sit`, `rise`,
+    /// or a configured skill's own name.
+    ///
+    /// Borrowed for the fixed set and owned for a skill, whose name comes from config rather
+    /// than from this build — which is the whole point of a skill being config.
+    pub label: std::borrow::Cow<'static, str>,
     /// What the gain should be for this tick.
     pub gain: u16,
     /// A scripted move is mid-flight — the robot is moving regardless of the twist, so
@@ -142,6 +137,20 @@ enum Sit {
     },
 }
 
+/// A one-shot skill mid-flight.
+#[derive(Debug, Clone, Copy)]
+struct ActiveSkill {
+    /// Index into the resolved skill list, which is also [`Net::Skill`]'s index.
+    index: usize,
+    /// Seconds left in this window.
+    remaining: f64,
+    /// Seconds left during which another request still counts as the button being held.
+    /// Roulade's chaining, generalised: counted down every tick, refreshed by each request
+    /// that lands while the skill runs, and positive at the end of a window means start
+    /// another.
+    chain: f64,
+}
+
 pub struct Controller {
     policy: Policy,
     tuning: Tuning,
@@ -155,14 +164,11 @@ pub struct Controller {
     previous: Option<[f64; NUM_JOINTS]>,
     /// Ground-pick phase, 0..[`GROUND_PICK_END_PHASE`]. `None` when inactive.
     ground_pick: Option<f64>,
-    /// An active kick window: which leg, and seconds remaining.
-    kick: Option<(bool, f64)>,
-    /// An active roulade: seconds remaining in the current roll.
-    roulade: Option<f64>,
-    /// Seconds since a roulade request would still count as "the button is held" — counts
-    /// down every tick, refreshed by each request that arrives while a roll runs. At the
-    /// end of a roll, positive means chain another.
-    roulade_chain: f64,
+    /// The one-shot skill driving right now: which one, and how long it has left.
+    ///
+    /// One field where there were three, because a kick and a roulade were the same thing
+    /// with different numbers.
+    active: Option<ActiveSkill>,
     sit: Sit,
 }
 
@@ -175,9 +181,7 @@ impl Controller {
             last_action: [0.0; ACTION_LEN],
             previous: None,
             ground_pick: None,
-            kick: None,
-            roulade: None,
-            roulade_chain: 0.0,
+            active: None,
             sit: Sit::Up,
         }
     }
@@ -204,8 +208,7 @@ impl Controller {
     /// parked, not travelling.
     pub fn busy(&self) -> bool {
         self.ground_pick.is_some()
-            || self.kick.is_some()
-            || self.roulade.is_some()
+            || self.active.is_some()
             || matches!(self.sit, Sit::Rising { .. })
     }
 
@@ -223,37 +226,48 @@ impl Controller {
         Ok(())
     }
 
-    /// Start a kick window. Blocked while any scripted move runs, as the prototype blocks it.
-    pub fn start_kick(&mut self, left: bool) -> Result<(), &'static str> {
-        if !self.policy.has_kick(left) {
-            return Err("no kick policy loaded for that leg");
-        }
-        if self.kick.is_some() || self.ground_pick.is_some() || self.roulade.is_some() {
-            return Err("a scripted move is already running");
-        }
-        self.kick = Some((left, self.skills.kick_duration));
-        Ok(())
+    /// Every one-shot skill this robot has, in priority order — what a client may ask for.
+    pub fn skill_names(&self) -> Vec<String> {
+        self.skills
+            .skills
+            .iter()
+            .take(self.policy.skill_count())
+            .map(|skill| skill.name.clone())
+            .collect()
     }
 
-    /// A roulade request: start a roll, or — arriving while one runs — keep the chain alive.
+    /// Start a one-shot skill, or — for a chaining one already running — keep the chain alive.
     ///
-    /// `Ok(true)` started a roll; `Ok(false)` refreshed a running one (the caller should
-    /// stay quiet: a held button lands here fifty times a second). The prototype gates the
-    /// X press on nothing but the ground pick — a roulade can preempt a kick's tail or roll
-    /// out of the seat, and both stay as they were.
-    pub fn request_roulade(&mut self) -> Result<bool, &'static str> {
-        if self.roulade.is_some() {
-            self.roulade_chain = ROULADE_CHAIN_WINDOW;
-            return Ok(false);
-        }
-        if !self.policy.has_roulade() {
-            return Err("no roulade policy loaded");
+    /// `Ok(true)` started it; `Ok(false)` refreshed a running one, and the caller should stay
+    /// quiet about that, because a held button lands here fifty times a second.
+    ///
+    /// The gating is the prototype's, generalised. A scripted move blocks another, except that
+    /// a chaining skill may preempt one that is not chaining — which is how the X press could
+    /// always roll out of a kick's tail or out of the seat. A ground pick blocks everything, as
+    /// it always has.
+    pub fn start_skill(&mut self, index: usize) -> Result<bool, &'static str> {
+        let Some(def) = self.skills.skills.get(index) else {
+            return Err("no such skill on this robot");
+        };
+        let (duration, chains) = (def.duration, def.chain);
+
+        if let Some(active) = &mut self.active {
+            if active.index == index && chains {
+                active.chain = CHAIN_WINDOW;
+                return Ok(false);
+            }
+            if !chains {
+                return Err("a scripted move is already running");
+            }
         }
         if self.ground_pick.is_some() {
             return Err("a ground pick is running");
         }
-        self.roulade = Some(self.skills.roulade_duration);
-        self.roulade_chain = 0.0;
+        self.active = Some(ActiveSkill {
+            index,
+            remaining: duration,
+            chain: 0.0,
+        });
         Ok(true)
     }
 
@@ -311,22 +325,19 @@ impl Controller {
         // Expire windows first, so a tick after the deadline runs the next thing rather
         // than one more frame of a finished move — the prototype checks its timers at the
         // same point relative to inference.
-        if let Some((_, remaining)) = self.kick
-            && remaining <= 0.0
+        // The end of a window is a fork, as the prototype forks a roll: the button still held
+        // — a request landed within the chain window — restarts it, and released hands back.
+        // Only a chaining skill can take the first branch, so a kick still ends when it ends.
+        if let Some(active) = self.active
+            && active.remaining <= 0.0
         {
-            self.kick = None;
-        }
-        // The end of a roll is a fork, as the prototype forks it: the button still held
-        // (a request landed within the chain window) restarts the window — the policy
-        // re-initiates a roll from wherever it landed — and released hands back.
-        if let Some(remaining) = self.roulade
-            && remaining <= 0.0
-        {
-            self.roulade = if self.roulade_chain > 0.0 {
-                Some(self.skills.roulade_duration)
-            } else {
-                None
-            };
+            let def = self.skills.skills.get(active.index);
+            let chains = def.is_some_and(|d| d.chain) && active.chain > 0.0;
+            self.active = chains.then(|| ActiveSkill {
+                remaining: def.map_or(0.0, |d| d.duration),
+                chain: 0.0,
+                ..active
+            });
         }
         if let Sit::Rising { remaining } = self.sit
             && remaining <= 0.0
@@ -334,18 +345,21 @@ impl Controller {
             self.sit = Sit::Up;
         }
 
-        // Re-encode the command for the active skill and pick the network. The priority
-        // chain is the prototype's: roulade > kick > ground pick > sit/rise > stand > walk.
-        let (net, effective, label) = if self.roulade.is_some() {
-            // Trained with every command slot at zero; it rolls as soon as it is switched
-            // in, so being selected IS the trigger.
-            (Net::Roulade, Command::default(), "roulade")
-        } else if let Some((left, _)) = self.kick {
-            // The kick networks are trained with every command slot at zero — head and
-            // body included, whatever the client is holding.
-            let net = if left { Net::KickLeft } else { Net::KickRight };
-            let label = if left { "kick_left" } else { "kick_right" };
-            (net, Command::default(), label)
+        // Re-encode the command for the active skill and pick the network. The priority chain
+        // is the prototype's, with its three one-shots now one entry: skill > ground pick >
+        // sit/rise > stand-by-magnitude > walk, and the skills themselves ordered by config.
+        let (net, effective, label) = if let Some(active) = self.active {
+            // Every skill here is trained with the whole command block at zero — head and body
+            // included, whatever the client is holding — and being selected IS the trigger.
+            // That is what made the kick and roulade arms the same arm.
+            let label = self
+                .skills
+                .skills
+                .get(active.index)
+                .map_or(std::borrow::Cow::Borrowed("skill"), |d| {
+                    std::borrow::Cow::Owned(d.name.clone())
+                });
+            (Net::Skill(active.index), Command::default(), label)
         } else if let Some(phase) = self.ground_pick {
             // The twist slots carry the phase encoding; head and body are zero-padded,
             // mirroring the training env's `zero_command_padding`.
@@ -354,7 +368,7 @@ impl Controller {
                 twist: [angle.cos(), angle.sin(), 0.0],
                 ..Command::default()
             };
-            (Net::GroundPick, c, "ground_pick")
+            (Net::GroundPick, c, "ground_pick".into())
         } else {
             let mut c = *command;
             match self.sit {
@@ -362,11 +376,11 @@ impl Controller {
                 // body slots stay live — the prototype keeps them in the buffer too.
                 Sit::Sitting => {
                     c.twist = [1.0, 0.0, 0.0];
-                    (Net::SitStand, c, "sit")
+                    (Net::SitStand, c, "sit".into())
                 }
                 Sit::Rising { .. } => {
                     c.twist = [0.0; 3];
-                    (Net::SitStand, c, "rise")
+                    (Net::SitStand, c, "rise".into())
                 }
                 Sit::Up => {
                     if body_active {
@@ -375,9 +389,9 @@ impl Controller {
                     let standing = self.policy.will_stand(c.twist_magnitude())
                         || (body_active && self.policy.has_standing());
                     if standing {
-                        (Net::Stand, c, "stand")
+                        (Net::Stand, c, "stand".into())
                     } else {
-                        (Net::Walk, c, "walk")
+                        (Net::Walk, c, "walk".into())
                     }
                 }
             }
@@ -400,13 +414,30 @@ impl Controller {
         // standing network exists — which is how a kick window and the sitstand rise end up
         // at standing gain in the prototype, so they do here too.
         let standing_tuned = matches!(net, Net::Stand)
-            || (matches!(net, Net::KickLeft | Net::KickRight | Net::SitStand)
+            || (matches!(net, Net::Skill(_) | Net::SitStand)
                 && self.policy.will_stand(effective.twist_magnitude()));
         let (scale, gain) = match net {
-            Net::Roulade => (
-                self.skills.roulade_action_scale,
-                (self.tuning.gain as f64 * self.skills.roulade_gain_ratio).round() as u16,
-            ),
+            // A skill's own overrides, falling back to the gait's — which is how a kick keeps
+            // running at the standing tuning it was tuned against while a roulade can ask for
+            // something else.
+            Net::Skill(index) => {
+                let overrides = self.skills.skills.get(index).map(|d| &d.params);
+                let scale = overrides
+                    .and_then(|o| o.action_scale)
+                    .unwrap_or(if standing_tuned {
+                        self.tuning.standing_action_scale
+                    } else {
+                        self.tuning.action_scale
+                    });
+                let ratio = overrides.and_then(|o| o.gain_ratio).unwrap_or({
+                    if standing_tuned {
+                        self.tuning.standing_gain_ratio
+                    } else {
+                        1.0
+                    }
+                });
+                (scale, (self.tuning.gain as f64 * ratio).round() as u16)
+            }
             Net::GroundPick => (
                 self.skills.ground_pick_action_scale,
                 (self.tuning.gain as f64 * self.skills.ground_pick_gain_ratio).round() as u16,
@@ -460,12 +491,9 @@ impl Controller {
                 self.ground_pick = None;
             }
         }
-        if let Some((_, remaining)) = self.kick.as_mut() {
-            *remaining -= dt;
-        }
-        if let Some(remaining) = self.roulade.as_mut() {
-            *remaining -= dt;
-            self.roulade_chain = (self.roulade_chain - dt).max(0.0);
+        if let Some(active) = self.active.as_mut() {
+            active.remaining -= dt;
+            active.chain = (active.chain - dt).max(0.0);
         }
         if let Sit::Rising { remaining } = &mut self.sit {
             *remaining -= dt;
@@ -509,12 +537,11 @@ mod tests {
         assert_eq!(s.ground_pick_period, 4.0);
         assert_eq!(s.ground_pick_action_scale, 1.0);
         assert_eq!(s.ground_pick_gain_ratio, 1.0);
-        assert_eq!(s.kick_duration, 0.5);
-        assert_eq!(s.roulade_duration, 1.0, "one roll, the measured time");
-        assert_eq!(s.roulade_action_scale, 1.0);
-        assert_eq!(
-            s.roulade_gain_ratio, 1.0,
-            "a roll runs at full walking gain"
+        // The one-shots' numbers live with the skills now — `robotd_params` owns the built-in
+        // three and asserts their durations, and this struct simply carries the resolved list.
+        assert!(
+            s.skills.is_empty(),
+            "a bare tuning has no skills of its own"
         );
     }
 

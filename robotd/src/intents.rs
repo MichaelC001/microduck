@@ -73,27 +73,45 @@ impl Default for PoseIntent {
 /// single last-writer slot would lose.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SkillRequests {
+    /// Phase-scripted, and still its own thing until the descriptor grows a command generator.
     pub ground_pick: bool,
-    pub kick_left: bool,
-    pub kick_right: bool,
+    /// Latched, and driven internally by the shutdown sit and the seated-boot rise as well as
+    /// by a button, which is why it is not one of the configurable one-shots either.
     pub sit_toggle: bool,
-    /// Start a roll — or, arriving while one runs, chain another. Clients hold a button
-    /// down by sending this every tick, so unlike the others it is a *level* in practice.
-    pub roulade: bool,
+    /// The configurable one-shots, as a mask over the resolved skill list.
+    ///
+    /// A mask and not a queue for the same reason the whole set was one before: two buttons in
+    /// one tick should both arrive, and the priority order decides which wins. A chaining skill
+    /// is a *level* in practice — a client holds the button by re-sending every tick.
+    pub skills: u32,
 }
 
 impl SkillRequests {
     pub fn any(&self) -> bool {
-        self.ground_pick || self.kick_left || self.kick_right || self.sit_toggle || self.roulade
+        self.ground_pick || self.sit_toggle || self.skills != 0
+    }
+
+    /// The indices requested, lowest first — which is priority order, since the skill list is
+    /// ordered by config.
+    pub fn requested(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..MAX_SKILLS).filter(move |i| self.skills & (1 << i) != 0)
     }
 }
 
-// Bit positions for the skill-request mask.
+// Bit positions for the two skills that are not in the configurable list.
 const SKILL_GROUND_PICK: u32 = 1 << 0;
-const SKILL_KICK_LEFT: u32 = 1 << 1;
-const SKILL_KICK_RIGHT: u32 = 1 << 2;
-const SKILL_SIT_TOGGLE: u32 = 1 << 3;
-const SKILL_ROULADE: u32 = 1 << 4;
+const SKILL_SIT_TOGGLE: u32 = 1 << 1;
+
+/// How many configurable one-shots a robot may have, bounded by the mask being a `u32`.
+///
+/// Not a number anybody should reach: every skill's network is loaded and warmed at startup, so
+/// thirty of them is thirty ONNX sessions and thirty warm-up inferences before the first tick.
+/// The ceiling is here so that exceeding it is a refusal with a reason rather than a silently
+/// ignored button.
+pub const MAX_SKILLS: usize = 30;
+
+/// Bits the two non-configurable skills occupy at the bottom of the mask.
+const SKILL_BITS: usize = 2;
 
 /// How fresh a wheee hold must be to still count as held. `padd` re-notifies every tick
 /// (20 ms) while the trigger is down, so anything much older means the client stopped
@@ -303,17 +321,27 @@ impl Intents {
             .store(open.to_bits(), std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Queue a one-shot skill for the loop's next tick.
-    pub fn request_skill(&self, skill: duck_ipc_proto::Skill) {
-        let bit = match skill {
-            duck_ipc_proto::Skill::GroundPick => SKILL_GROUND_PICK,
-            duck_ipc_proto::Skill::KickLeft => SKILL_KICK_LEFT,
-            duck_ipc_proto::Skill::KickRight => SKILL_KICK_RIGHT,
-            duck_ipc_proto::Skill::SitToggle => SKILL_SIT_TOGGLE,
-            duck_ipc_proto::Skill::Roulade => SKILL_ROULADE,
-        };
+    /// Queue the ground pick, which is not one of the configurable one-shots.
+    pub fn request_ground_pick(&self) {
         self.skills
-            .fetch_or(bit, std::sync::atomic::Ordering::Relaxed);
+            .fetch_or(SKILL_GROUND_PICK, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Queue the sit toggle, likewise.
+    pub fn request_sit_toggle(&self) {
+        self.skills
+            .fetch_or(SKILL_SIT_TOGGLE, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Queue a configurable one-shot by its index in the resolved skill list.
+    pub fn request_skill(&self, index: usize) {
+        if index >= MAX_SKILLS {
+            return;
+        }
+        self.skills.fetch_or(
+            1 << (index + SKILL_BITS),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     /// Take the pending skill requests, leaving none. Once per tick, like the power request.
@@ -321,10 +349,8 @@ impl Intents {
         let bits = self.skills.swap(0, std::sync::atomic::Ordering::Relaxed);
         SkillRequests {
             ground_pick: bits & SKILL_GROUND_PICK != 0,
-            kick_left: bits & SKILL_KICK_LEFT != 0,
-            kick_right: bits & SKILL_KICK_RIGHT != 0,
             sit_toggle: bits & SKILL_SIT_TOGGLE != 0,
-            roulade: bits & SKILL_ROULADE != 0,
+            skills: bits >> SKILL_BITS,
         }
     }
 

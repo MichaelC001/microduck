@@ -308,9 +308,9 @@ struct PolicyNames {
     stand: Option<String>,
     sitstand: Option<String>,
     ground_pick: Option<String>,
-    kick_left: Option<String>,
-    kick_right: Option<String>,
-    roulade: Option<String>,
+    /// The configurable one-shots this robot has, in priority order — the names a client may
+    /// ask for, and the answer to "what can this robot do".
+    skills: Vec<String>,
 }
 
 impl PolicyNames {
@@ -325,9 +325,7 @@ impl PolicyNames {
             stand: name(&policy.stand),
             sitstand: name(&policy.sitstand),
             ground_pick: name(&policy.ground_pick),
-            kick_left: name(&policy.kick_left),
-            kick_right: name(&policy.kick_right),
-            roulade: name(&policy.roulade),
+            skills: policy.skills.iter().map(|s| s.name.clone()).collect(),
         }
     }
 }
@@ -1275,19 +1273,20 @@ fn try_controller(
             ground_pick_period: policy_cfg.ground_pick_period,
             ground_pick_action_scale: policy_cfg.ground_pick_action_scale,
             ground_pick_gain_ratio: policy_cfg.ground_pick_gain_ratio,
-            kick_duration: policy_cfg.kick_duration,
-            roulade_duration: policy_cfg.roulade_duration,
-            roulade_action_scale: policy_cfg.roulade_action_scale,
-            roulade_gain_ratio: policy_cfg.roulade_gain_ratio,
+            skills: policy_cfg.skills.clone(),
         };
         let paths = PolicyPaths {
             walk: policy_cfg.walk.clone(),
             stand: policy_cfg.stand.clone(),
             sitstand: policy_cfg.sitstand.clone(),
             ground_pick: policy_cfg.ground_pick.clone(),
-            kick_left: policy_cfg.kick_left.clone(),
-            kick_right: policy_cfg.kick_right.clone(),
-            roulade: policy_cfg.roulade.clone(),
+            // Only the skills whose file resolves — a slot switched off with `"none"` is
+            // already filtered out by `resolved_skills`.
+            skills: policy_cfg
+                .skills
+                .iter()
+                .filter_map(|skill| skill.resolved_path())
+                .collect(),
         };
         match Policy::load(&paths, DEFAULT_STANDING_THRESHOLD) {
             Ok(mut policy) => {
@@ -1686,26 +1685,26 @@ async fn control_loop<T: RobotIo>(
                     if requests.ground_pick {
                         outcome("ground_pick", controller.start_ground_pick());
                     }
-                    if requests.kick_left {
-                        outcome("kick_left", controller.start_kick(true));
-                    }
-                    if requests.kick_right {
-                        outcome("kick_right", controller.start_kick(false));
-                    }
                     if requests.sit_toggle {
                         match controller.sit_toggle() {
                             Ok(direction) => tracing::warn!(direction, "sit toggle"),
                             Err(reason) => tracing::warn!(reason, "sit toggle refused"),
                         }
                     }
-                    if requests.roulade {
-                        // A held button lands here every tick; only the start of a roll is
-                        // journal-worthy. `Ok(false)` is a chain refresh, and stays quiet.
-                        match controller.request_roulade() {
-                            Ok(true) => tracing::warn!(skill = "roulade", "skill started"),
+                    // The configurable one-shots, in priority order. A held button lands here
+                    // every tick, so only the *start* of one is journal-worthy: `Ok(false)` is a
+                    // chain refresh and stays quiet.
+                    for index in requests.requested() {
+                        let name = controller
+                            .skill_names()
+                            .get(index)
+                            .cloned()
+                            .unwrap_or_else(|| index.to_string());
+                        match controller.start_skill(index) {
+                            Ok(true) => tracing::warn!(skill = %name, "skill started"),
                             Ok(false) => {}
                             Err(reason) => {
-                                tracing::debug!(skill = "roulade", reason, "skill refused");
+                                tracing::debug!(skill = %name, reason, "skill refused");
                             }
                         }
                     }
@@ -2290,7 +2289,7 @@ async fn control_loop<T: RobotIo>(
                     coast.known_positions(hold),
                     params.safety.gain_limp,
                     true,
-                    "limp_fall",
+                    "limp_fall".into(),
                 ),
                 LimpFall::Posing { .. } => (
                     // Past the end of the ramp the target is the pose itself — the state
@@ -2301,7 +2300,7 @@ async fn control_loop<T: RobotIo>(
                         .unwrap_or(DEFAULT_POSITION),
                     params.safety.limp_fall_pose_gain,
                     true,
-                    "limp_pose",
+                    "limp_pose".into(),
                 ),
                 LimpFall::Idle => unreachable!("in_limp_fall excludes Idle"),
             },
@@ -2317,7 +2316,7 @@ async fn control_loop<T: RobotIo>(
                     ),
                     Err(e) => {
                         tracing::warn!(error = %e, "inference failed; holding");
-                        (hold, policy_cfg.gain, false, "held")
+                        (hold, policy_cfg.gain, false, "held".into())
                     }
                 }
             }
@@ -2329,9 +2328,9 @@ async fn control_loop<T: RobotIo>(
                     .expect("just checked it is Some"),
                 policy_cfg.gain,
                 true,
-                "homing",
+                "homing".into(),
             ),
-            _ => (hold, policy_cfg.gain, false, "held"),
+            _ => (hold, policy_cfg.gain, false, "held".into()),
         };
         state.moving.store(moving, Ordering::Relaxed);
 
@@ -2535,7 +2534,7 @@ async fn control_loop<T: RobotIo>(
                     limited_by: limits.iter().map(|l| limit_name(*l).to_owned()).collect(),
                 },
                 head: command.head,
-                policy: policy_label.to_owned(),
+                policy: policy_label.into_owned(),
                 safety: proto::SafetyState {
                     fallen: safety.fallen(),
                     // Limp means "the robot is actually at limp gain" — which now happens
@@ -2930,7 +2929,7 @@ async fn handle(
         // useful to say about a velocity that is superseded 20 ms later.
         let Some(id) = request.id.clone() else {
             if let Ok(call) = call {
-                apply_intent(&intents, &call);
+                apply_intent(&state, &intents, &call);
             }
             continue;
         };
@@ -2967,7 +2966,7 @@ async fn handle(
 /// Apply a continuous intent. Shared by the notification path and the request path, so a
 /// client that sends `robot.move` with an `id` is not silently ignored — the spec permits
 /// either, and refusing one because of a framing choice would be a surprise.
-fn apply_intent(intents: &Intents, call: &proto::Call) -> bool {
+fn apply_intent(state: &RobotState, intents: &Intents, call: &proto::Call) -> bool {
     match call {
         proto::Call::RobotMove(p) => {
             intents.set_twist([p.vx, p.vy, p.vyaw]);
@@ -2999,7 +2998,7 @@ fn apply_intent(intents: &Intents, call: &proto::Call) -> bool {
         // would be pure overhead. The one-shot press stays a request (`dispatch` refuses
         // it with a reason); the loop arbitrates either way.
         proto::Call::RobotDo(p) => {
-            intents.request_skill(p.skill);
+            queue_skill(state, intents, &p.skill);
             true
         }
         // Same story for the wheee hold, which arrives per tick while the trigger is down.
@@ -3170,6 +3169,37 @@ fn load_policy_request(
     proto::IntentResult::accepted()
 }
 
+/// Turn a skill name into a request the loop will see, or `false` if this robot has no such
+/// skill.
+///
+/// The two that are not in the configurable list keep their names: `ground_pick` writes a
+/// scripted phase rather than a constant, and `sit_toggle` is latched and is driven internally
+/// by the shutdown sit and the seated-boot rise as well as by a button. Everything else is an
+/// index into what config says this robot can do.
+///
+/// One load of the published names for the whole decision: they are the *current* mode's, and
+/// reading them twice could straddle a mode switch.
+fn queue_skill(state: &RobotState, intents: &Intents, skill: &str) -> bool {
+    let policies = state.policies.load();
+    match skill {
+        "ground_pick" if policies.ground_pick.is_some() => {
+            intents.request_ground_pick();
+            true
+        }
+        "sit_toggle" if policies.sitstand.is_some() => {
+            intents.request_sit_toggle();
+            true
+        }
+        name => match policies.skills.iter().position(|s| s == name) {
+            Some(index) => {
+                intents.request_skill(index);
+                true
+            }
+            None => false,
+        },
+    }
+}
+
 fn dispatch(
     state: &RobotState,
     intents: &Intents,
@@ -3181,7 +3211,7 @@ fn dispatch(
         | proto::Call::RobotHead(_)
         | proto::Call::RobotPose(_)
         | proto::Call::RobotMouth(_) => {
-            apply_intent(intents, call);
+            apply_intent(state, intents, call);
             proto::Response::ok(Some(id), &proto::IntentResult::accepted())
         }
 
@@ -3215,24 +3245,31 @@ fn dispatch(
         // down; the loop still arbitrates against whatever move is mid-flight, exactly as
         // the prototype's buttons did.
         proto::Call::RobotDo(p) => {
-            let policies = state.policies.load();
-            let configured = match p.skill {
-                // One load for the whole decision: these are the *current* mode's networks, and
-                // reading them field by field could straddle a mode switch.
-                proto::Skill::GroundPick => policies.ground_pick.is_some(),
-                proto::Skill::KickLeft => policies.kick_left.is_some(),
-                proto::Skill::KickRight => policies.kick_right.is_some(),
-                proto::Skill::SitToggle => policies.sitstand.is_some(),
-                proto::Skill::Roulade => policies.roulade.is_some(),
-            };
-            // Not refused for being down. A skill on a fallen robot is the human's call,
-            // and refusing it is how a robot ends up unable to do the thing that would
-            // have righted it.
-            let result = if !configured {
-                proto::IntentResult::refused("no policy configured for that skill")
-            } else {
-                intents.request_skill(p.skill);
+            // Not refused for being down. A skill on a fallen robot is the human's call, and
+            // refusing it is how a robot ends up unable to do the thing that would have
+            // righted it.
+            let result = if queue_skill(state, intents, &p.skill) {
                 proto::IntentResult::accepted()
+            } else {
+                let policies = state.policies.load();
+                let mut known: Vec<&str> = Vec::new();
+                if policies.ground_pick.is_some() {
+                    known.push("ground_pick");
+                }
+                if policies.sitstand.is_some() {
+                    known.push("sit_toggle");
+                }
+                let mut known: Vec<String> = known.into_iter().map(str::to_owned).collect();
+                known.extend(policies.skills.iter().cloned());
+                proto::IntentResult::refused(if known.is_empty() {
+                    "this robot has no skills configured".to_owned()
+                } else {
+                    format!(
+                        "no skill named {:?}; this robot has {}",
+                        p.skill,
+                        known.join(", ")
+                    )
+                })
             };
             proto::Response::ok(Some(id), &result)
         }
@@ -3439,9 +3476,7 @@ fn dispatch(
                     stand: policies.stand.clone(),
                     sitstand: policies.sitstand.clone(),
                     ground_pick: policies.ground_pick.clone(),
-                    kick_left: policies.kick_left.clone(),
-                    kick_right: policies.kick_right.clone(),
-                    roulade: policies.roulade.clone(),
+                    skills: policies.skills.clone(),
                     unavailable: state.policy_error.load_full().map_or_else(
                         || {
                             policies.walk.is_none().then(|| {
@@ -3849,7 +3884,7 @@ mod tests {
         let mut off = Params::default();
         off.policy.enabled = false;
         let none = PolicyNames::of(&off.policy.resolved());
-        assert!(none.walk.is_none() && none.roulade.is_none());
+        assert!(none.walk.is_none() && none.skills.is_empty());
     }
 
     #[test]
@@ -4113,7 +4148,7 @@ mod tests {
             &intents,
             id(),
             &proto::Call::RobotDo(proto::DoParams {
-                skill: proto::Skill::GroundPick,
+                skill: "ground_pick".into(),
             }),
         )
         .result_as()
@@ -4124,24 +4159,32 @@ mod tests {
             "the request must be queued"
         );
 
-        // A slot disabled with the `"none"` sentinel is a robot without that skill; asking
-        // must refuse, not queue. (The roller preset no longer serves as the example — its
-        // rebased line carries the kicks and the sit like walking does.)
+        // A skill switched off with the `"none"` sentinel is a robot without it; asking must
+        // refuse, not queue — and the refusal names what this robot *does* have, since the set
+        // is config and a client cannot assume it.
         let mut params = Params::default();
-        params.policy.kick_left = Some("none".into());
+        params.policy.skills = vec![params::SkillDef {
+            name: "kick_left".into(),
+            path: Some(PathBuf::from("none")),
+            duration: 0.5,
+            chain: false,
+            params: params::SkillOverrides::default(),
+        }];
         let unconfigured = RobotState::new(&params, false, false);
         let refused: proto::IntentResult = dispatch(
             &unconfigured,
             &intents,
             id(),
             &proto::Call::RobotDo(proto::DoParams {
-                skill: proto::Skill::KickLeft,
+                skill: "kick_left".into(),
             }),
         )
         .result_as()
         .unwrap();
         assert!(!refused.accepted);
-        assert!(!intents.take_skills().kick_left, "a refusal must not queue");
+        let reason = refused.reason.unwrap();
+        assert!(reason.contains("roulade"), "names what it has: {reason}");
+        assert_eq!(intents.take_skills().skills, 0, "a refusal must not queue");
 
         // A fall never refuses a skill: `fallen` is a report, not a wall. Refusing here is
         // how a robot ends up unable to do the thing that would have righted it.
@@ -4151,7 +4194,7 @@ mod tests {
             &intents,
             id(),
             &proto::Call::RobotDo(proto::DoParams {
-                skill: proto::Skill::SitToggle,
+                skill: "sit_toggle".into(),
             }),
         )
         .result_as()
@@ -4166,6 +4209,7 @@ mod tests {
     fn pose_and_mouth_intents_reach_their_slots() {
         let intents = Intents::new();
         assert!(apply_intent(
+            &RobotState::new(&Params::default(), false, false),
             &intents,
             &proto::Call::RobotPose(proto::PoseParams {
                 z: -0.01,
@@ -4175,6 +4219,7 @@ mod tests {
             }),
         ));
         assert!(apply_intent(
+            &RobotState::new(&Params::default(), false, false),
             &intents,
             &proto::Call::RobotMouth(proto::MouthParams { open: 0.5 }),
         ));
@@ -5317,6 +5362,62 @@ mod tests {
             result.reason
         );
         assert!(intents.take_policy_change().is_some());
+    }
+
+    /// **The index a client's skill name resolves to must be the index the loop runs.**
+    ///
+    /// Three lists are derived from the resolved skills — the names `robot.policies` publishes,
+    /// the paths handed to `Policy`, and the definitions the controller reads for durations —
+    /// and a client's request is routed by *position* in the first. If they ever disagreed in
+    /// length or order, asking for one skill would run another, which is the kind of wrong that
+    /// looks like a bad policy rather than a bad index.
+    ///
+    /// They agree because `resolved_skills` drops anything whose path does not resolve, so every
+    /// surviving entry contributes exactly one element to each list. This pins that.
+    #[test]
+    fn every_derived_skill_list_is_the_same_length_and_order() {
+        let mut params = Params::default();
+        params.policy.skills = vec![
+            params::SkillDef {
+                name: "polite-bow".into(),
+                path: Some(PathBuf::from("/srv/bow.onnx")),
+                duration: 4.0,
+                chain: false,
+                params: params::SkillOverrides::default(),
+            },
+            // Switched off, so it must contribute to none of the three.
+            params::SkillDef {
+                name: "kick_right".into(),
+                path: Some(PathBuf::from("none")),
+                duration: 0.5,
+                chain: false,
+                params: params::SkillOverrides::default(),
+            },
+        ];
+        let resolved = params.policy.resolved();
+
+        let published = PolicyNames::of(&resolved).skills;
+        let paths: Vec<_> = resolved
+            .skills
+            .iter()
+            .filter_map(|s| s.resolved_path())
+            .collect();
+
+        assert_eq!(
+            published,
+            vec![
+                "roulade".to_string(),
+                "kick_left".to_string(),
+                "polite-bow".to_string()
+            ],
+            "kick_right is switched off and roulade keeps its place"
+        );
+        assert_eq!(paths.len(), published.len(), "one path per published name");
+        assert_eq!(
+            resolved.skills.len(),
+            published.len(),
+            "and one definition per path"
+        );
     }
 
     /// **A reload must not touch anybody's overrides.**

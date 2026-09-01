@@ -567,15 +567,15 @@ pub struct PolicyParams {
     pub ground_pick_action_scale: Option<f64>,
     /// Gain multiplier while the ground pick runs.
     pub ground_pick_gain_ratio: f64,
-    /// How long a kick window stays on the kick network, seconds.
-    pub kick_duration: f64,
-    /// One roulade — one forward roll, seconds. Holding the button chains rolls; this is
-    /// the length of each. The prototype's measured single-roll time.
-    pub roulade_duration: f64,
-    /// Action scale while a roulade runs.
-    pub roulade_action_scale: f64,
-    /// Gain multiplier while a roulade runs.
-    pub roulade_gain_ratio: f64,
+    /// The one-shot skills this robot has, in priority order.
+    ///
+    /// Empty means the built-in three — kicks and roulade, with the numbers they have always
+    /// had — so a board that updates onto this keeps working with nothing written. An entry
+    /// merges by name: naming `roulade` changes that one, naming anything else adds a skill.
+    /// The file stays a list of decisions rather than a copy of the defaults, which is what
+    /// `robotctl configure` promises about every other key here.
+    #[serde(default, rename = "skill", skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<SkillDef>,
     /// Scale actions with battery voltage: effective scale × (nominal / measured). The
     /// servos' effective kP tracks their supply, so this holds the robot's response steady
     /// as the pack sags. Off by default, as in the prototype.
@@ -591,6 +591,119 @@ pub struct PolicyParams {
 /// of it somewhere would be a slot that looks disabled in a file and is not.
 pub fn is_none_sentinel(path: &std::path::Path) -> bool {
     path.as_os_str().eq_ignore_ascii_case("none")
+}
+
+/// A one-shot skill: a network, how long it drives, and what it changes while it does.
+///
+/// **The thing this replaces was three hardcoded arms that differed in four numbers.** Kicks and
+/// roulade wrote the same all-zero command into the same kind of window; they differed in
+/// duration, action scale, gain ratio, and whether holding the button chained another. A
+/// community policy like `polite-bow` — zero command, four seconds, selecting it is the trigger —
+/// is a fifth set of the same four numbers, and could not be added without a daemon release.
+///
+/// Deliberately *only* the zero-command family. `walk` and `stand` are the fallback pair chosen
+/// by command magnitude, `sitstand` is latched and driven internally by the shutdown sit and the
+/// seated-boot rise, and `ground_pick` writes a scripted phase rather than a constant. Those stay
+/// where they are until something needs them not to; see `docs/ideas/policy-moves.md`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillDef {
+    /// What a client asks for — `robot.do {skill: "roulade"}` — and what a pad button binds to.
+    pub name: String,
+
+    /// The `.onnx`. Absent means this robot's own copy, by convention `<name>.onnx` in the
+    /// policy directory, so a built-in needs no path and a fetched one carries the path
+    /// `robotctl policy load` wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
+
+    /// Seconds the network drives before handing back to walk or stand.
+    pub duration: f64,
+
+    /// Whether a request arriving while it runs starts another when this one finishes — how a
+    /// client maps "the button is held" onto a one-shot. Roulade does; a kick does not.
+    #[serde(default)]
+    pub chain: bool,
+
+    /// What this skill changes about the robot while it runs, and only while it runs.
+    #[serde(default)]
+    pub params: SkillOverrides,
+}
+
+/// Parameters a skill changes for its duration, restored when it ends.
+///
+/// **Raw parameter names, not a vocabulary of our own.** `cmd_alpha` rather than an invented
+/// `smoothing = "off"`: one set of names for a person to learn, and `robotctl configure` already
+/// documents every one of them.
+///
+/// **A named set rather than "any key".** A skill that could widen a joint limit or lengthen the
+/// deadman would be reaching past the layer that makes a stranger's policy safe to try at all —
+/// which is the entire argument for allowing one on the robot. Everything here is tuning or a
+/// threshold that a *move* legitimately owns for its own duration.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct SkillOverrides {
+    /// Scales raw policy output into a joint offset, as `[policy] action_scale` does.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action_scale: Option<f64>,
+
+    /// Multiplier on the running gain, so a move can be softer or stiffer than the gait.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gain_ratio: Option<f64>,
+
+    /// `[control] cmd_alpha` while this runs. The one that matters for a policy reading a *flag*
+    /// rather than a velocity: smoothing turns a 0→1 step into a ramp through fractional values
+    /// no network was trained on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cmd_alpha: Option<f64>,
+
+    /// `[safety] limp_fall_tilt_z` while this runs. A move that leans further than the gait does
+    /// otherwise reads as a fall in progress — the published flamingo policy holds at ~24°
+    /// against a gate set at ~26°.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limp_fall_tilt_z: Option<f64>,
+}
+
+impl SkillDef {
+    /// The file this skill runs, resolved the way every other policy path resolves.
+    pub fn resolved_path(&self) -> Option<PathBuf> {
+        match &self.path {
+            Some(p) if is_none_sentinel(p) => None,
+            Some(p) => Some(p.clone()),
+            None => Some(PathBuf::from(POLICY_DIR).join(format!("{}.onnx", self.name))),
+        }
+    }
+}
+
+/// The skills a robot has when its config says nothing — today's three, with today's numbers.
+///
+/// A board that updates onto this keeps its kicks and its roulade with no config written and no
+/// migration run, which is the whole reason absence resolves to something rather than nothing.
+fn builtin_skills() -> Vec<SkillDef> {
+    let kick = |name: &str, file: &str| SkillDef {
+        name: name.to_owned(),
+        // The kick files are `ball_kick_*.onnx`, which is not `<name>.onnx` — the names are the
+        // roles and the files are the training runs, an indirection `policies/README.md` argued
+        // for and this keeps.
+        path: Some(PathBuf::from(POLICY_DIR).join(file)),
+        duration: 0.5,
+        chain: false,
+        params: SkillOverrides::default(),
+    };
+    vec![
+        // Order is priority, replacing the hardcoded `roulade > kick` precedence.
+        SkillDef {
+            name: "roulade".to_owned(),
+            path: None,
+            duration: 1.0,
+            // Holding the button chains rolls, which is how the prototype maps a held trigger
+            // onto a one-shot.
+            chain: true,
+            params: SkillOverrides::default(),
+        },
+        kick("kick_left", "ball_kick_left.onnx"),
+        kick("kick_right", "ball_kick_right.onnx"),
+    ]
 }
 
 /// One policy slot, named — the seven `[policy]` path keys as a value rather than a field name.
@@ -690,10 +803,8 @@ pub struct ResolvedPolicy {
     pub ground_pick_period: f64,
     pub ground_pick_action_scale: f64,
     pub ground_pick_gain_ratio: f64,
-    pub kick_duration: f64,
-    pub roulade_duration: f64,
-    pub roulade_action_scale: f64,
-    pub roulade_gain_ratio: f64,
+    /// The one-shot skills, config merged over the built-ins, in priority order.
+    pub skills: Vec<SkillDef>,
     pub voltage_adapt: bool,
     pub nominal_voltage: f64,
 }
@@ -715,6 +826,28 @@ impl ResolvedPolicy {
 }
 
 impl PolicyParams {
+    /// The built-in skills with config merged over them, by name.
+    ///
+    /// Merge rather than replace, for the reason every other key in this file resolves the way it
+    /// does: the file is a list of decisions, not a copy of the defaults. Adding `polite-bow` is
+    /// one entry and does not mean re-declaring the three that were already there — and forgetting
+    /// to re-declare one cannot silently remove it, which is the failure mode of the other rule.
+    ///
+    /// A named skill keeps the built-in's position in the priority order; a new one goes last.
+    pub fn resolved_skills(&self) -> Vec<SkillDef> {
+        let mut resolved = builtin_skills();
+        for configured in &self.skills {
+            match resolved.iter_mut().find(|s| s.name == configured.name) {
+                Some(builtin) => *builtin = configured.clone(),
+                None => resolved.push(configured.clone()),
+            }
+        }
+        // A skill whose path is the `"none"` sentinel is switched off, which is how a built-in is
+        // removed without a second mechanism for it.
+        resolved.retain(|s| s.resolved_path().is_some());
+        resolved
+    }
+
     /// What config says about one slot: `None` unset (resolve the mode's default), `Some("none")`
     /// disabled outright, `Some(path)` an override.
     pub fn slot(&self, slot: Slot) -> &Option<PathBuf> {
@@ -817,10 +950,7 @@ impl PolicyParams {
                 Mode::Roller => 0.8,
             }),
             ground_pick_gain_ratio: self.ground_pick_gain_ratio,
-            kick_duration: self.kick_duration,
-            roulade_duration: self.roulade_duration,
-            roulade_action_scale: self.roulade_action_scale,
-            roulade_gain_ratio: self.roulade_gain_ratio,
+            skills: self.resolved_skills(),
             voltage_adapt: self.voltage_adapt,
             nominal_voltage: self.nominal_voltage,
         }
@@ -907,10 +1037,7 @@ impl Default for PolicyParams {
             ground_pick_period: None,
             ground_pick_action_scale: None,
             ground_pick_gain_ratio: 1.0,
-            kick_duration: 0.5,
-            roulade_duration: 1.0,
-            roulade_action_scale: 1.0,
-            roulade_gain_ratio: 1.0,
+            skills: Vec::new(),
             voltage_adapt: false,
             nominal_voltage: 7.4,
         }
@@ -1243,6 +1370,124 @@ mod tests {
         }
     }
 
+    /// **Absence resolves to the three a robot has always had.** A board updating onto this
+    /// writes no config and runs no migration, and still has its kicks and its roulade.
+    #[test]
+    fn no_configured_skills_means_the_built_in_three() {
+        let resolved = super::PolicyParams::default().resolved();
+        let names: Vec<&str> = resolved.skills.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["roulade", "kick_left", "kick_right"]);
+        assert!(
+            resolved.skills.iter().all(|s| s.resolved_path().is_some()),
+            "each names a file"
+        );
+    }
+
+    /// Adding one skill does not mean re-declaring the others — the file is a list of decisions.
+    /// A rule where config replaced the lot would make forgetting an entry a silent removal.
+    #[test]
+    fn a_new_skill_is_added_without_re_declaring_the_built_ins() {
+        use std::path::PathBuf;
+
+        let params = super::PolicyParams {
+            skills: vec![super::SkillDef {
+                name: "polite-bow".into(),
+                path: Some(PathBuf::from(
+                    "/var/lib/robot/policies/x/y/main/policy.onnx",
+                )),
+                duration: 4.0,
+                chain: false,
+                params: super::SkillOverrides::default(),
+            }],
+            ..Default::default()
+        };
+
+        let names: Vec<String> = params
+            .resolved()
+            .skills
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        assert_eq!(names, ["roulade", "kick_left", "kick_right", "polite-bow"]);
+    }
+
+    /// Naming a built-in changes it and keeps its place in the priority order — a retuned
+    /// roulade must not become the last thing the cascade considers.
+    #[test]
+    fn naming_a_built_in_retunes_it_in_place() {
+        let params = super::PolicyParams {
+            skills: vec![super::SkillDef {
+                name: "roulade".into(),
+                path: None,
+                duration: 2.5,
+                chain: false,
+                params: super::SkillOverrides {
+                    action_scale: Some(0.7),
+                    ..Default::default()
+                },
+            }],
+            ..Default::default()
+        };
+
+        let resolved = params.resolved();
+        assert_eq!(resolved.skills[0].name, "roulade", "still first");
+        assert_eq!(resolved.skills[0].duration, 2.5);
+        assert_eq!(resolved.skills[0].params.action_scale, Some(0.7));
+        assert_eq!(resolved.skills.len(), 3, "and nothing was added");
+    }
+
+    /// The `"none"` sentinel removes a built-in, so taking one away needs no second mechanism —
+    /// it is the same word that switches off a policy slot.
+    #[test]
+    fn a_built_in_can_be_switched_off_by_name() {
+        use std::path::PathBuf;
+
+        let params = super::PolicyParams {
+            skills: vec![super::SkillDef {
+                name: "kick_left".into(),
+                path: Some(PathBuf::from("none")),
+                duration: 0.5,
+                chain: false,
+                params: super::SkillOverrides::default(),
+            }],
+            ..Default::default()
+        };
+
+        let names: Vec<String> = params
+            .resolved()
+            .skills
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        assert_eq!(names, ["roulade", "kick_right"]);
+    }
+
+    /// A skill with no path runs `<name>.onnx` from this robot's own set, so a built-in needs no
+    /// path written and a fetched one carries what `policy load` recorded.
+    #[test]
+    fn a_skill_without_a_path_runs_its_own_name() {
+        let resolved = super::PolicyParams::default().resolved();
+        let roulade = &resolved.skills[0];
+        assert_eq!(
+            roulade.resolved_path().unwrap(),
+            std::path::Path::new(super::POLICY_DIR).join("roulade.onnx")
+        );
+        // The kicks are the exception the built-ins spell out: their files are named for the
+        // training run, not the role.
+        let kick = resolved
+            .skills
+            .iter()
+            .find(|s| s.name == "kick_left")
+            .unwrap();
+        assert!(
+            kick.resolved_path()
+                .unwrap()
+                .ends_with("ball_kick_left.onnx"),
+            "{:?}",
+            kick.resolved_path()
+        );
+    }
+
     /// **A config that disables the walking slot must not panic.**
     ///
     /// It reached a board: `robotctl policy load walk none` wrote `walk = "none"`, and resolving
@@ -1570,10 +1815,22 @@ mod tests {
         assert_eq!(p.ground_pick_period, 4.0);
         assert_eq!(p.ground_pick_action_scale, 1.0);
         assert_eq!(p.ground_pick_gain_ratio, 1.0);
-        assert_eq!(p.kick_duration, 0.5);
-        assert_eq!(p.roulade_duration, 1.0, "one roll, the measured time");
-        assert_eq!(p.roulade_action_scale, 1.0);
-        assert_eq!(p.roulade_gain_ratio, 1.0);
+        // The three one-shots and their numbers, which used to be four flat keys here.
+        let skill = |name: &str| {
+            p.skills
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("no {name} skill"))
+        };
+        assert_eq!(skill("kick_left").duration, 0.5);
+        assert_eq!(skill("kick_right").duration, 0.5);
+        assert_eq!(
+            skill("roulade").duration,
+            1.0,
+            "one roll, the measured time"
+        );
+        assert!(skill("roulade").chain, "holding the button chains rolls");
+        assert!(!skill("kick_left").chain);
         assert!(!p.voltage_adapt, "off by default in the prototype");
         assert_eq!(p.nominal_voltage, 7.4);
 

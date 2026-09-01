@@ -252,6 +252,11 @@ impl Model {
                 input.into()
             }
             Kind::Text | Kind::OptionalPath => input.into(),
+            // A repeating table is not one value with one cursor, so this editor lists it and
+            // points at the commands that do manage it. See `Kind::Table`.
+            Kind::Table => {
+                return Err("edit the one-shot skills with `robotctl policy`".to_owned());
+            }
             Kind::IntegerList => {
                 let mut array = toml_edit::Array::new();
                 for word in input.split(',') {

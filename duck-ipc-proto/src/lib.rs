@@ -1310,7 +1310,7 @@ pub mod test_support {
             Call::RobotInit,
             Call::RobotRelax,
             Call::RobotDo(DoParams {
-                skill: Skill::GroundPick,
+                skill: "ground_pick".into(),
             }),
             Call::RobotPose(PoseParams {
                 z: -0.01,
@@ -1822,24 +1822,19 @@ pub struct ThereminState {
 ///
 /// An enum rather than a free string so a typo is [`code::INVALID_PARAMS`] at the door,
 /// not a silently ignored request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Skill {
-    /// Phase-scripted pick from the ground. One shot, ~3 s.
-    GroundPick,
-    /// Left-leg kick. One shot, half a second, blind to any ball.
-    KickLeft,
-    /// Right-leg kick.
-    KickRight,
-    /// Sit if standing, stand if sitting. The daemon knows which; the client need not.
-    SitToggle,
-    /// Forward roll, ~1 s. One request is one roll; a request that arrives while a roll
-    /// runs chains another when the current one completes — which is how a client maps
-    /// "button held" onto it: keep sending while the button is down.
-    Roulade,
-}
+/// Which one-shot skill to run, for [`Call::RobotDo`].
+///
+/// **A name, not an enumeration.** It was five variants — ground pick, the two kicks, the sit
+/// toggle and roulade — each of which needed a `Net`, a config slot and a branch in the control
+/// loop before a robot could do it. A robot's skills are now a list in its config, so what a
+/// client may ask for is whatever that robot has, and `robot.subscribe`'s acknowledgement is
+/// where a client learns the names rather than assuming them.
+///
+/// The five above are still the names a stock robot answers to. An unknown one is refused with
+/// the list it does know, which is the same shape as a bad policy slot.
+pub type Skill = String;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DoParams {
     pub skill: Skill,
@@ -2123,12 +2118,11 @@ pub struct SubscribeResult {
     pub sitstand: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ground_pick: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub kick_left: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub kick_right: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub roulade: Option<String>,
+    /// The configurable one-shot skills this robot has, in priority order, and the names
+    /// `robot.do` answers to. A list rather than a field per skill, because which skills a robot
+    /// has is now config: a client learns them here instead of assuming five.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<String>,
 }
 
 /// Whether the policy should run. Discrete intent — see [`method::ROBOT_ENABLE`].

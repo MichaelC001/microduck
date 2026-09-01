@@ -132,20 +132,41 @@ button. `ground_pick` stays too in the first pass: it is phase-scripted rather t
 zero-command, and generalising it means the descriptor grows a command generator before
 anything needs one.
 
+## Decided
+
+- **`[[skill]]`, not `[[move]]`** — the wire already says `robot.do {skill}`, and `SkillTuning`
+  and "one-shot skills" are the vocabulary in the code. One word, not two.
+- **Absent means the built-in three.** A board that updates onto this keeps its kicks and its
+  roulade with no config and no migration, and an entry merges by name — the file stays a list
+  of decisions rather than a copy of the defaults, which is what `robotctl configure` already
+  promises about every other key. `robotctl policy list` is where the resolved set is visible.
+- **Per-skill overrides are raw parameter names** in a `[skill.params]` table — `cmd_alpha`,
+  not an invented `smoothing = "off"`. Applied on entry, restored on exit. Bounded to a named
+  set: tuning from `[policy]`, and only the handful of `[safety]` keys a move legitimately
+  needs, because a skill that could widen a joint limit or the deadman would be reaching past
+  the layer that makes a stranger's policy safe to try in the first place.
+- **`Skill` becomes a string on the wire.** Nothing outside this workspace consumes the enum —
+  `duckctl` does not touch it — so the `API_VERSION` bump has no client to coordinate with.
+- **List order is priority**, replacing the hardcoded `roulade > kick` precedence.
+- **`robotctl configure` support comes second.** Adding and removing skills is
+  `robotctl policy`; the registry learning about repeating tables is the largest single piece
+  of this and is orthogonal to whether skills work.
+
 ## Open, and wanted before writing any of it
 
 - **Per-move parameter overrides.** A move may need a different `limp_fall_tilt_z` or
   `cmd_alpha` while it runs, restored after — flamingo leans ~24° against a fall gate set at
   ~26°. This is the mechanism that keeps a move from needing global config changes a person
   has to remember to undo.
-- **`Skill` becomes a string.** An open vocabulary on the wire, the five existing names
-  reserved. `API_VERSION` bump, and every client that switches on the enum has to enumerate
-  instead.
 - **The fixed slots go.** A move carries its own path, so `policy.kick_left` stops being a
   config key and `robotctl policy load kick_left <file>` has no slot to name.
-- **Where the binding lives.** `[pad] x = "polite-bow"` in `robotd.toml` means padd gains a
-  config dependency it does not have today (it links `duck-ipc-proto`, `gilrs` and `clap`,
-  and nothing else). One file keeps `robotctl configure` the single editor; the friction is
-  that the registry is a flat key list and `[[move]]` is an array of tables.
-- **Pending moves are an `AtomicU32` bitmask** in `robotd::intents`, so a move becomes an
+- **Pending skills are an `AtomicU32` bitmask** in `robotd::intents`, so a skill becomes an
   index. Fine to 32, worth knowing it is there.
+- **Every skill's network is loaded and warmed at controller build** — seven sessions today.
+  An open list means twenty community policies is twenty sessions and twenty warm-up
+  inferences at startup. Lazy-loading on first trigger is not the answer, since opening a
+  session is tens of milliseconds inside a 20 ms tick, so eager stays right and there is a
+  practical ceiling.
+- **Binding a skill to a pad button** is the next thing after this and is deliberately not
+  part of it: it touches a working input path, and it is far easier to get right once there is
+  something real to bind.

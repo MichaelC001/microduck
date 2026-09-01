@@ -386,14 +386,16 @@ fn main() -> std::process::ExitCode {
         // One-shot skills. Answered, because "refused, and here is why" is a real outcome —
         // there may be no kick policy on this robot, or another move mid-flight.
         for (fired, skill) in [
-            (ground_pick, proto::Skill::GroundPick),
-            (kick_left, proto::Skill::KickLeft),
-            (kick_right, proto::Skill::KickRight),
-            (sit_toggle, proto::Skill::SitToggle),
-            (roulade, proto::Skill::Roulade),
+            (ground_pick, "ground_pick"),
+            (kick_left, "kick_left"),
+            (kick_right, "kick_right"),
+            (sit_toggle, "sit_toggle"),
+            (roulade, "roulade"),
         ] {
             if fired {
-                let call = proto::Call::RobotDo(proto::DoParams { skill });
+                let call = proto::Call::RobotDo(proto::DoParams {
+                    skill: skill.to_owned(),
+                });
                 if let Err(e) = request(&mut stream, &mut next_id, &call) {
                     tracing::error!(error = %e, "skill request failed");
                     return std::process::ExitCode::FAILURE;
@@ -410,7 +412,7 @@ fn main() -> std::process::ExitCode {
             && let Err(e) = notify(
                 &mut stream,
                 &proto::Call::RobotDo(proto::DoParams {
-                    skill: proto::Skill::Roulade,
+                    skill: "roulade".to_owned(),
                 }),
             )
         {

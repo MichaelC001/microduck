@@ -41,6 +41,18 @@ pub enum Kind {
     OptionalPath,
     /// A list of whole numbers, edited as comma-separated text ("4, 5, 9").
     IntegerList,
+    /// A **repeating table** — `[[policy.skill]]` — rather than a single value.
+    ///
+    /// Listed here and not editable in place. Not an oversight and not laziness: every other
+    /// kind is one value with one cursor position, and a repeating table is a list a person adds
+    /// to, removes from and reorders. Rendering that inside a key/value editor would be a worse
+    /// tool than the commands that already do it — `robotctl policy` — which the doc line points
+    /// at.
+    ///
+    /// It is *in* the registry so the completeness test keeps meaning what it says: a section
+    /// this editor cannot edit is still a section it must know exists, or the next repeating
+    /// table added to `Params` goes unnoticed.
+    Table,
 }
 
 /// One key of `robotd.toml`.
@@ -119,6 +131,11 @@ pub const REGISTRY: &[Entry] = &[
          the mode a reboot comes back in",
     ),
     entry(
+        "policy.skill",
+        Kind::Table,
+        "One-shot skills, in priority order — add and remove with `robotctl policy`",
+    ),
+    entry(
         "policy.walk",
         Kind::OptionalPath,
         "Walking policy; unset = this robot's own",
@@ -185,22 +202,6 @@ pub const REGISTRY: &[Entry] = &[
         "policy.ground_pick_gain_ratio",
         Kind::Float,
         "Gain multiplier during the ground pick",
-    ),
-    entry("policy.kick_duration", Kind::Float, "Kick window, seconds"),
-    entry(
-        "policy.roulade_duration",
-        Kind::Float,
-        "One forward roll, seconds",
-    ),
-    entry(
-        "policy.roulade_action_scale",
-        Kind::Float,
-        "Action scale during a roulade",
-    ),
-    entry(
-        "policy.roulade_gain_ratio",
-        Kind::Float,
-        "Gain multiplier during a roulade",
     ),
     feature(
         "policy.voltage_adapt",
@@ -514,6 +515,11 @@ mod tests {
                     format!("[{section}]\n{key} = \"probe\"\n")
                 }
                 Kind::IntegerList => format!("[{section}]\n{key} = [1, 2]\n"),
+                // A repeating table's probe is one empty entry — enough to prove the key parses
+                // as a table array, which is the thing being asserted.
+                Kind::Table => {
+                    format!("[[{section}.{key}]]\nname = \"probe\"\nduration = 1.0\n")
+                }
             };
             let parsed: Result<Params, _> = toml::from_str(&probe);
             assert!(

@@ -403,15 +403,17 @@ enum RobotCommand {
         json: bool,
     },
 
-    /// Run a one-shot skill: `ground-pick`, `kick-left`, `kick-right`, `roulade`, or
-    /// `sit` (toggle).
+    /// Run a one-shot skill by name — `roulade`, `kick_left`, `ground_pick`, `sit_toggle`, or
+    /// whatever else this robot has.
     ///
-    /// The same requests the gamepad's buttons send, for a bench without a pad. The policy
-    /// must be enabled and driving; a skill whose network is not on this robot is refused
-    /// with a reason.
+    /// Not a fixed list any more: the one-shots are config, so a robot answers to the names in
+    /// its own `[[policy.skill]]` entries. `robotctl monitor` names them, and an unknown one is
+    /// refused with the ones this robot does have.
+    ///
+    /// The same requests the gamepad's buttons send, for a bench without a pad. The policy must
+    /// be enabled and driving.
     Do {
-        #[arg(value_enum)]
-        skill: SkillArg,
+        skill: String,
         #[arg(long)]
         json: bool,
     },
@@ -701,29 +703,6 @@ fn run_chorale(socket: &Path, off: bool, piece: Option<u8>) -> Result<(), Failur
 fn bar(fraction: f64) -> String {
     let filled = (fraction.clamp(0.0, 1.0) * 10.0).round() as usize;
     "█".repeat(filled)
-}
-
-#[derive(clap::ValueEnum, Clone, Copy, Debug)]
-enum SkillArg {
-    GroundPick,
-    KickLeft,
-    KickRight,
-    /// Sit if standing, stand if sitting.
-    Sit,
-    /// One forward roll. The gamepad chains rolls by holding X; one invocation is one roll.
-    Roulade,
-}
-
-impl SkillArg {
-    fn as_skill(self) -> proto::Skill {
-        match self {
-            SkillArg::GroundPick => proto::Skill::GroundPick,
-            SkillArg::KickLeft => proto::Skill::KickLeft,
-            SkillArg::KickRight => proto::Skill::KickRight,
-            SkillArg::Sit => proto::Skill::SitToggle,
-            SkillArg::Roulade => proto::Skill::Roulade,
-        }
-    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -2269,7 +2248,7 @@ fn run_robot(socket: &Path, command: RobotCommand) -> Result<(), Failure> {
         RobotCommand::Relax { json, .. } => (proto::Call::RobotRelax, *json),
         RobotCommand::Do { skill, json } => (
             proto::Call::RobotDo(proto::DoParams {
-                skill: skill.as_skill(),
+                skill: skill.clone(),
             }),
             *json,
         ),
