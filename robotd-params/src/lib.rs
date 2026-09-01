@@ -605,7 +605,7 @@ pub fn is_none_sentinel(path: &std::path::Path) -> bool {
 /// by command magnitude, `sitstand` is latched and driven internally by the shutdown sit and the
 /// seated-boot rise, and `ground_pick` writes a scripted phase rather than a constant. Those stay
 /// where they are until something needs them not to; see `docs/ideas/policy-moves.md`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SkillDef {
     /// What a client asks for — `robot.do {skill: "roulade"}` — and what a pad button binds to.
@@ -617,8 +617,37 @@ pub struct SkillDef {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
 
-    /// Seconds the network drives before handing back to walk or stand.
+    /// Seconds the network drives before handing back to walk or stand — or, when `unwind_s`
+    /// is set, before it starts coming back.
     pub duration: f64,
+
+    /// The twist this skill's network is fed while it runs.
+    ///
+    /// Zeros for most of them, which is what a policy trained with `zero_command_padding`
+    /// expects and what made kicks, roulade and `polite-bow` the same arm. A non-zero constant
+    /// is how a policy with its own command encoding becomes a one-shot: the published flamingo
+    /// reads `[flag, side, 0]`, so `[1, 1, 0]` is "lift the left leg".
+    ///
+    /// Head and body stay zeroed either way. Every one-shot published so far declares them
+    /// unused, and a skill that wanted them live would be a different shape than this.
+    #[serde(default)]
+    pub command: [f64; 3],
+
+    /// The twist fed for `unwind_s` after the window, before handing back.
+    ///
+    /// **This is what lets a policy with no ending of its own be a one-shot.** An episodic
+    /// policy returns itself to a safe pose — `polite-bow` is standing again after its four
+    /// seconds — so handing straight back to walk is fine. A perpetual one does not: it holds
+    /// until told otherwise, and handing back mid-hold gives walk a robot balanced on one foot.
+    /// Driving the idle command for a moment first is the daemon supplying the ending the policy
+    /// does not have, which is exactly what the sit toggle already does on its way up.
+    #[serde(default)]
+    pub unwind: [f64; 3],
+
+    /// Seconds spent on `unwind` before handing back. Zero — the default — means the policy ends
+    /// itself and the window simply expires.
+    #[serde(default)]
+    pub unwind_s: f64,
 
     /// Whether a request arriving while it runs starts another when this one finishes — how a
     /// client maps "the button is held" onto a one-shot. Roulade does; a kick does not.
@@ -688,6 +717,9 @@ fn builtin_skills() -> Vec<SkillDef> {
         path: Some(PathBuf::from(POLICY_DIR).join(file)),
         duration: 0.5,
         chain: false,
+        command: [0.0; 3],
+        unwind: [0.0; 3],
+        unwind_s: 0.0,
         params: SkillOverrides::default(),
     };
     vec![
@@ -699,6 +731,9 @@ fn builtin_skills() -> Vec<SkillDef> {
             // Holding the button chains rolls, which is how the prototype maps a held trigger
             // onto a one-shot.
             chain: true,
+            command: [0.0; 3],
+            unwind: [0.0; 3],
+            unwind_s: 0.0,
             params: SkillOverrides::default(),
         },
         kick("kick_left", "ball_kick_left.onnx"),
@@ -1397,7 +1432,7 @@ mod tests {
                 )),
                 duration: 4.0,
                 chain: false,
-                params: super::SkillOverrides::default(),
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -1425,6 +1460,7 @@ mod tests {
                     action_scale: Some(0.7),
                     ..Default::default()
                 },
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -1448,7 +1484,7 @@ mod tests {
                 path: Some(PathBuf::from("none")),
                 duration: 0.5,
                 chain: false,
-                params: super::SkillOverrides::default(),
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -1486,6 +1522,46 @@ mod tests {
             "{:?}",
             kick.resolved_path()
         );
+    }
+
+    /// **A policy that does not end itself needs the daemon to end it.**
+    ///
+    /// `polite-bow` is episodic: four seconds later it is standing again, so the window simply
+    /// expires and walk takes over a robot that is upright. The published flamingo is not — it
+    /// holds a foot up until told otherwise — and handing back mid-hold would give walk a robot
+    /// balanced on one leg. `unwind` is the daemon supplying the ending, which is what makes a
+    /// perpetual policy usable as a one-shot at all.
+    #[test]
+    fn a_skill_can_declare_how_it_comes_back() {
+        let params = super::PolicyParams {
+            skills: vec![super::SkillDef {
+                name: "flamingo".into(),
+                path: Some(std::path::PathBuf::from("/srv/flamingo.onnx")),
+                duration: 5.0,
+                chain: false,
+                // [flag, side, 0]: lift, then stand back on two feet before handing over.
+                command: [1.0, 1.0, 0.0],
+                unwind: [0.0, 1.0, 0.0],
+                unwind_s: 3.0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let resolved = params.resolved();
+        let flamingo = resolved.skills.last().unwrap();
+        assert_eq!(flamingo.command, [1.0, 1.0, 0.0]);
+        assert_eq!(flamingo.unwind, [0.0, 1.0, 0.0]);
+        assert_eq!(flamingo.unwind_s, 3.0);
+    }
+
+    /// And the common case declares none of it. A zero command with no unwind is what every
+    /// one-shot published so far is, and writing that out would be noise in every config file.
+    #[test]
+    fn the_built_ins_need_no_command_or_unwind() {
+        for skill in super::PolicyParams::default().resolved().skills {
+            assert_eq!(skill.command, [0.0; 3], "{} drives on zeros", skill.name);
+            assert_eq!(skill.unwind_s, 0.0, "{} ends itself", skill.name);
+        }
     }
 
     /// **A config that disables the walking slot must not panic.**

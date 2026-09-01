@@ -142,13 +142,28 @@ enum Sit {
 struct ActiveSkill {
     /// Index into the resolved skill list, which is also [`Net::Skill`]'s index.
     index: usize,
-    /// Seconds left in this window.
+    /// Whether it is doing the thing or coming back from it.
+    phase: SkillPhase,
+    /// Seconds left in this phase.
     remaining: f64,
     /// Seconds left during which another request still counts as the button being held.
     /// Roulade's chaining, generalised: counted down every tick, refreshed by each request
     /// that lands while the skill runs, and positive at the end of a window means start
     /// another.
     chain: f64,
+}
+
+/// Which half of a skill is running.
+///
+/// Most skills only ever have the first. The second exists for a policy that does not end
+/// itself — one that holds until told otherwise — where handing straight back to walk would
+/// give it a robot mid-pose.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SkillPhase {
+    /// Driving `command`, for `duration`.
+    Holding,
+    /// Driving `unwind`, for `unwind_s`, before handing back.
+    Unwinding,
 }
 
 pub struct Controller {
@@ -265,6 +280,7 @@ impl Controller {
         }
         self.active = Some(ActiveSkill {
             index,
+            phase: SkillPhase::Holding,
             remaining: duration,
             chain: 0.0,
         });
@@ -332,12 +348,30 @@ impl Controller {
             && active.remaining <= 0.0
         {
             let def = self.skills.skills.get(active.index);
-            let chains = def.is_some_and(|d| d.chain) && active.chain > 0.0;
-            self.active = chains.then(|| ActiveSkill {
-                remaining: def.map_or(0.0, |d| d.duration),
-                chain: 0.0,
-                ..active
-            });
+            self.active = match active.phase {
+                // A skill that does not end itself comes back first, so walk never inherits a
+                // robot mid-pose. `unwind_s` of zero — the common case — skips straight past.
+                SkillPhase::Holding if def.is_some_and(|d| d.unwind_s > 0.0) => Some(ActiveSkill {
+                    phase: SkillPhase::Unwinding,
+                    remaining: def.map_or(0.0, |d| d.unwind_s),
+                    ..active
+                }),
+                // The end of a window is a fork, as the prototype forks a roll: the button still
+                // held — a request landed within the chain window — restarts it, and released
+                // hands back. Only a chaining skill can take that branch, so a kick still ends
+                // when it ends, and a skill that unwound is finished either way.
+                SkillPhase::Holding | SkillPhase::Unwinding => {
+                    let chains = active.phase == SkillPhase::Holding
+                        && def.is_some_and(|d| d.chain)
+                        && active.chain > 0.0;
+                    chains.then(|| ActiveSkill {
+                        phase: SkillPhase::Holding,
+                        remaining: def.map_or(0.0, |d| d.duration),
+                        chain: 0.0,
+                        ..active
+                    })
+                }
+            };
         }
         if let Sit::Rising { remaining } = self.sit
             && remaining <= 0.0
@@ -349,17 +383,26 @@ impl Controller {
         // is the prototype's, with its three one-shots now one entry: skill > ground pick >
         // sit/rise > stand-by-magnitude > walk, and the skills themselves ordered by config.
         let (net, effective, label) = if let Some(active) = self.active {
-            // Every skill here is trained with the whole command block at zero — head and body
-            // included, whatever the client is holding — and being selected IS the trigger.
-            // That is what made the kick and roulade arms the same arm.
-            let label = self
-                .skills
-                .skills
-                .get(active.index)
-                .map_or(std::borrow::Cow::Borrowed("skill"), |d| {
-                    std::borrow::Cow::Owned(d.name.clone())
-                });
-            (Net::Skill(active.index), Command::default(), label)
+            // Head and body are zeroed whatever the phase — every one-shot published so far
+            // declares them unused, and a policy trained with `zero_command_padding` expects
+            // exactly that. Only the twist differs, and for most skills it is zero too, which is
+            // what made the kick and roulade arms the same arm.
+            let def = self.skills.skills.get(active.index);
+            let twist = def.map_or([0.0; 3], |d| match active.phase {
+                SkillPhase::Holding => d.command,
+                SkillPhase::Unwinding => d.unwind,
+            });
+            let label = def.map_or(std::borrow::Cow::Borrowed("skill"), |d| {
+                std::borrow::Cow::Owned(match active.phase {
+                    SkillPhase::Holding => d.name.clone(),
+                    SkillPhase::Unwinding => format!("{}:unwind", d.name),
+                })
+            });
+            let c = Command {
+                twist,
+                ..Command::default()
+            };
+            (Net::Skill(active.index), c, label)
         } else if let Some(phase) = self.ground_pick {
             // The twist slots carry the phase encoding; head and body are zero-padded,
             // mirroring the training env's `zero_command_padding`.

@@ -4168,7 +4168,7 @@ mod tests {
             path: Some(PathBuf::from("none")),
             duration: 0.5,
             chain: false,
-            params: params::SkillOverrides::default(),
+            ..Default::default()
         }];
         let unconfigured = RobotState::new(&params, false, false);
         let refused: proto::IntentResult = dispatch(
@@ -5383,7 +5383,7 @@ mod tests {
                 path: Some(PathBuf::from("/srv/bow.onnx")),
                 duration: 4.0,
                 chain: false,
-                params: params::SkillOverrides::default(),
+                ..Default::default()
             },
             // Switched off, so it must contribute to none of the three.
             params::SkillDef {
@@ -5391,7 +5391,7 @@ mod tests {
                 path: Some(PathBuf::from("none")),
                 duration: 0.5,
                 chain: false,
-                params: params::SkillOverrides::default(),
+                ..Default::default()
             },
         ];
         let resolved = params.policy.resolved();
