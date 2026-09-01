@@ -111,10 +111,13 @@ struct Args {
     /// How often to send intents. Matching the control rate exactly buys nothing — the loop
     /// reads the latest value once per tick — but staying at or above it keeps the added
     /// latency under one tick.
-    ///
-    /// refused below 1 rather than clamped: zero reaches `1.0 / 0.0` below, and
-    /// `Duration::from_secs_f64` panics on infinity instead of producing a very long period.
-    #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..))]
+    // Bounded both ways, and refused rather than clamped so the flag says what it did.
+    // Zero reaches `1.0 / 0.0` and `Duration::from_secs_f64` panics on infinity. The ceiling
+    // is the other half of the same line: a rate this loop cannot keep gives a period of 0 ns,
+    // `checked_sub` never has anything left to sleep on, and the pad spins on robotd's socket —
+    // the same busy loop `robotctl monitor` clamps for, and the range `control.hz` already
+    // rejects outside.
+    #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..=1000))]
     hz: u32,
 
     /// Deflection below this counts as centre. Analogue sticks rarely rest at exactly zero,
@@ -669,13 +672,23 @@ fn request(
 mod tests {
     use super::*;
 
-    /// the bug this catches: `--hz 0` used to reach `Duration::from_secs_f64(1.0 / 0.0)`, and
-    /// that panics on infinity rather than giving a very long period. so a typo killed the
+    /// The bug this catches: `--hz 0` used to reach `Duration::from_secs_f64(1.0 / 0.0)`, and
+    /// that panics on infinity rather than giving a very long period. So a typo killed the
     /// daemon at startup with a panic instead of saying which flag was wrong.
+    ///
+    /// The ceiling is the same line's other half, and the worse failure of the two: a period
+    /// that rounds to 0 ns leaves `checked_sub` nothing to sleep on, so the loop stops being
+    /// paced and spins on robotd's socket. A panic is at least loud.
     #[test]
-    fn a_zero_rate_is_refused_rather_than_divided_by() {
+    fn a_rate_this_loop_cannot_run_at_is_refused_rather_than_divided_by() {
         assert!(Args::try_parse_from(["padd", "--hz", "0"]).is_err());
         assert!(Args::try_parse_from(["padd", "--hz", "1"]).is_ok());
+        assert!(Args::try_parse_from(["padd", "--hz", "1000"]).is_ok());
+        assert!(Args::try_parse_from(["padd", "--hz", "1001"]).is_err());
+        assert!(
+            Args::try_parse_from(["padd", "--hz", "4294967295"]).is_err(),
+            "the top of a u32 is a 0 ns period, which is a spin loop"
+        );
         assert!(
             Args::try_parse_from(["padd"]).is_ok(),
             "the default still parses"
