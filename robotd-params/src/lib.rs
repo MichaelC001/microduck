@@ -780,7 +780,19 @@ impl PolicyParams {
         ResolvedPolicy {
             enabled: self.enabled,
             mode: self.mode,
-            walk: path(&self.walk, Some(walk_default)).expect("walk always has a default"),
+            // `walk` is the one slot that cannot be empty — a robot with no walking network has
+            // nothing to run — so the `"none"` sentinel does not apply to it and falls back to
+            // the mode's default instead.
+            //
+            // This used to be `.expect("walk always has a default")`, and a config saying
+            // `walk = "none"` panicked whichever thread resolved it. That thread is the control
+            // loop, so one line in a file killed the robot's control until somebody edited it
+            // back — the exact "a bad config line must not brick the board" failure the degraded
+            // health rule exists to prevent. `robot.loadPolicy` refuses to write it and
+            // `drop_unloadable_overrides` clears it at startup and reports degraded; this is the
+            // floor under both.
+            walk: path(&self.walk, Some(walk_default))
+                .unwrap_or_else(|| PathBuf::from(POLICY_DIR).join(walk_default)),
             stand: path(&self.stand, stand),
             sitstand: path(&self.sitstand, sitstand),
             ground_pick: path(&self.ground_pick, ground_pick),
@@ -1228,6 +1240,52 @@ mod tests {
                 crate::registry::Kind::OptionalPath,
                 "{key} must be a path slot"
             );
+        }
+    }
+
+    /// **A config that disables the walking slot must not panic.**
+    ///
+    /// It reached a board: `robotctl policy load walk none` wrote `walk = "none"`, and resolving
+    /// that killed the control thread — the daemon stayed up answering its socket while the robot
+    /// stopped ticking, and a restart panicked again at startup because the file still said it.
+    /// One line in a config file must never be able to do that.
+    #[test]
+    fn disabling_the_walking_slot_falls_back_rather_than_panicking() {
+        use super::{Mode, PolicyParams, Slot};
+        use std::path::PathBuf;
+
+        for mode in [Mode::Walk, Mode::Roller] {
+            let mut params = PolicyParams {
+                mode,
+                ..Default::default()
+            };
+            params.set_slot(Slot::Walk, Some(PathBuf::from("none")));
+            let resolved = params.resolved();
+            assert!(
+                resolved.walk.starts_with(super::POLICY_DIR),
+                "{mode:?} must fall back to its own walking policy, got {}",
+                resolved.walk.display()
+            );
+        }
+    }
+
+    /// Every *other* slot may legitimately be switched off, which is what running a community
+    /// policy that owns the whole command block needs. Only `walk` is special.
+    #[test]
+    fn every_other_slot_can_be_switched_off() {
+        use super::{PolicyParams, Slot};
+        use std::path::PathBuf;
+
+        let mut params = PolicyParams::default();
+        for slot in Slot::ALL {
+            params.set_slot(slot, Some(PathBuf::from("none")));
+        }
+        let resolved = params.resolved();
+        for slot in Slot::ALL {
+            if slot == Slot::Walk {
+                continue;
+            }
+            assert_eq!(resolved.slot(slot), None, "{slot} must be off");
         }
     }
 

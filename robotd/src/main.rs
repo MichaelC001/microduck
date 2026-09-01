@@ -449,6 +449,22 @@ fn drop_unloadable_overrides_with(
     if !policy_params.enabled {
         return;
     }
+    // A `walk = "none"` already in the file, from a `policy load walk none` this daemon used to
+    // accept. `resolved` now falls back rather than panicking, so the robot walks — but it walks
+    // with something the config does not name, which is exactly what this reports.
+    if policy_params
+        .slot(Slot::Walk)
+        .as_deref()
+        .is_some_and(params::is_none_sentinel)
+    {
+        tracing::error!("[policy] walk = \"none\" cannot be honoured; using this robot's own");
+        errors.set(
+            Slot::Walk,
+            "the walking policy cannot be switched off; using this robot's own".to_owned(),
+        );
+        policy_params.set_slot(Slot::Walk, None);
+    }
+
     for slot in Slot::ALL {
         if policy_params.slot(slot).is_none() {
             continue;
@@ -3102,8 +3118,24 @@ fn load_policy_request(
         // reachable from here, because the one published community policy that needs a slot
         // disabled is the reason a person would ever want to.
         Some(path) if params::is_none_sentinel(std::path::Path::new(path)) => {
-            if slot.is_none() {
-                return proto::IntentResult::refused("a slot to disable, or omit both to reset");
+            match slot {
+                None => {
+                    return proto::IntentResult::refused(
+                        "a slot to disable, or omit both to reset",
+                    );
+                }
+                // The one slot that cannot be empty: a robot with no walking network has nothing
+                // to run, and every other slot resolving to it is what makes the rest optional.
+                // Refused here rather than left to the config layer, which now falls back
+                // instead of honouring it — a request that would be quietly ignored is worse
+                // than one that is answered.
+                Some(Slot::Walk) => {
+                    return proto::IntentResult::refused(
+                        "the walking policy cannot be switched off — it is what every other \
+                         slot falls back to. `policy reset walk` returns it to this robot's own",
+                    );
+                }
+                Some(_) => {}
             }
             Some(PathBuf::from("none"))
         }
@@ -5045,6 +5077,63 @@ mod tests {
                 slot: Slot::Stand,
                 path: Some(PathBuf::from("none"))
             })
+        );
+    }
+
+    /// **The walking slot cannot be switched off**, and asking must be refused rather than
+    /// accepted-then-ignored.
+    ///
+    /// It was accepted, and `resolved` panicked on the result — in the control thread, so the
+    /// robot stopped ticking while the daemon carried on answering its socket, and the config it
+    /// had already written panicked the same way at every restart after.
+    #[test]
+    fn the_walking_slot_cannot_be_switched_off() {
+        let s = RobotState::new(&Params::default(), false, false);
+        let intents = Arc::new(Intents::new());
+
+        let result: proto::IntentResult = dispatch(
+            &s,
+            &intents,
+            proto::Id::Number(1),
+            &proto::Call::RobotLoadPolicy(proto::LoadPolicyParams {
+                slot: Some("walk".into()),
+                path: Some("none".into()),
+            }),
+        )
+        .result_as()
+        .unwrap();
+
+        assert!(!result.accepted);
+        let reason = result.reason.unwrap();
+        assert!(
+            reason.contains("policy reset walk"),
+            "with the way out: {reason}"
+        );
+        assert!(intents.take_policy_change().is_none(), "and nothing queued");
+    }
+
+    /// A board that already has `walk = "none"` — written before it was refused — must come up
+    /// walking and say why, not carry the fault forever. Degraded, like every other override this
+    /// board cannot honour: the release is fine, and rolling one back would fix nothing.
+    #[test]
+    fn a_config_that_disables_walking_is_repaired_at_startup() {
+        let mut policy = params::PolicyParams::default();
+        policy.set_slot(Slot::Walk, Some(PathBuf::from("none")));
+        let mut errors = SlotErrors::default();
+
+        drop_unloadable_overrides_with(&mut policy, &mut errors, |_| Ok(()));
+
+        assert!(policy.slot(Slot::Walk).is_none(), "the line is dropped");
+        assert!(
+            policy.resolved().walk.starts_with(params::POLICY_DIR),
+            "and the robot walks"
+        );
+        assert!(
+            errors
+                .get(Slot::Walk)
+                .unwrap()
+                .contains("cannot be switched off"),
+            "and health says so"
         );
     }
 

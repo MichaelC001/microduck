@@ -227,7 +227,8 @@ sudo robotctl policy load walk RemiFabre/microduck-flamingo-cycle
 sudo robotctl policy load stand none
 ```
 
-`none` switches a slot off, the same as `[policy] stand = "none"`. `sudo robotctl policy reset`
+`none` switches a slot off, the same as `[policy] stand = "none"` — every slot except `walk`,
+which is what all the others fall back to and cannot be empty. `sudo robotctl policy reset`
 puts everything back. Driving it takes the `control.py` in that repo, over a forwarded socket —
 its README has the commands, and the twist slots carry `[flag, side, 0]` rather than a velocity.
 

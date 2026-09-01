@@ -405,7 +405,8 @@ reject the majority of it. And the numbers it is checked against are published i
 two agree — a contract with whoever publishes a policy belongs where both sides can see it.
 
 **A slot can be switched off**, with `none` — the literal `[policy] <slot> = "none"` already
-used. Not an afterthought: the first community policy anyone will try does its own two-foot
+used. Every slot but `walk`, which is what the others fall back to and so cannot be empty; asking
+is refused, and a config that already says it is repaired at startup and reported degraded. Not an afterthought: the first community policy anyone will try does its own two-foot
 stand, and `will_stand` hands the robot to the standing network whenever command magnitude is
 zero, which is exactly the state that policy is in when it is standing on two feet. Without a way
 to say `stand none`, running it meant editing the file this whole command exists to stop editing.
