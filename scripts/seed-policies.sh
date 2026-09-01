@@ -48,10 +48,17 @@ POLICY_REPO="${POLICY_REPO:-pollen-robotics/microduck-policies}"
 POLICY_VERSION="${POLICY_VERSION:-v1}"
 POLICY_BASE_URL="${POLICY_BASE_URL:-https://huggingface.co/${POLICY_REPO}/resolve/${POLICY_VERSION}}"
 
-# Every file a policy slot can default to, across both drive modes. An xtask test asserts this
-# list is exactly what `robotd-params` resolves to — a name here that robotd never asks for is
-# dead weight, and one robotd asks for that is missing is a slot that will not load.
-POLICY_FILES="alpha_walking.onnx alpha_stand.onnx alpha_sitstand.onnx alpha_ground_pick.onnx ball_kick_left.onnx ball_kick_right.onnx roller.onnx roller_crouch.onnx roulade.onnx"
+# The set says what is in it. `manifest.json` lists every policy, and that list is what gets
+# downloaded — so adding a tenth policy to the set is a tag on the Hub rather than an edit here
+# and a daemon release to carry it.
+#
+# The fallback below is the nine that exist today, for a revision tagged before the manifest did.
+# It goes when every tagged set carries one.
+#
+# The grep is over a file we generate, so its shape is ours: one `"file": "name.onnx"` per policy.
+# A JSON parser is not available here — this runs from a release on a board with curl and a
+# POSIX shell — and an xtask test asserts the pattern matches what the manifest actually says.
+FALLBACK_FILES="alpha_walking.onnx alpha_stand.onnx alpha_sitstand.onnx alpha_ground_pick.onnx ball_kick_left.onnx ball_kick_right.onnx roller.onnx roller_crouch.onnx roulade.onnx"
 
 # Per-file, because `hooks/postinstall` runs inside an update under a 120-second hook timeout and
 # a hook that times out fails the update and rolls it back. Nine files at eight seconds is 72,
@@ -109,6 +116,22 @@ mkdir -p "$staging" || { echo "seed-policies: cannot create ${staging}" >&2; exi
 
 # Everything into staging first, so a partial download is never what `current` points at.
 ok=yes
+
+# The manifest, and the file list from it. Fetched into staging like everything else, so it is
+# installed beside the policies it describes and `robotd` can read what it says.
+# shellcheck disable=SC2086
+if curl $CURL_OPTS -o "${staging}/manifest.json" "${POLICY_BASE_URL}/manifest.json"; then
+    POLICY_FILES="$(sed -n 's/.*"file"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+        "${staging}/manifest.json" | tr '\n' ' ')"
+else
+    rm -f "${staging}/manifest.json"
+    POLICY_FILES=""
+fi
+if [ -z "$POLICY_FILES" ]; then
+    echo "seed-policies: no manifest in ${POLICY_VERSION}; taking the set this release knows" >&2
+    POLICY_FILES="$FALLBACK_FILES"
+fi
+
 for name in $POLICY_FILES; do
     # shellcheck disable=SC2086  # CURL_OPTS is a deliberate word list
     if ! curl $CURL_OPTS -o "${staging}/${name}" "${POLICY_BASE_URL}/${name}"; then

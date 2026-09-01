@@ -415,6 +415,42 @@ to say `stand none`, running it meant editing the file this whole command exists
 filter: a shared name is what the published policies have in common, and a tag is worth adding
 once there is something to tag.
 
+### 9.3 The set describes itself
+
+`manifest.json` at the root of the policy repo says what the set contains and what each policy
+is. It lives **only on the Hub** — there is no copy in this repository, deliberately. A copy here
+would be a second source of truth for something that versions on the Hub, and a test over it
+would pin the copy rather than the thing a robot downloads, which is worse than no test: it
+passes while a board gets something else.
+
+Two lists used to be hardcoded, and between them they meant a tenth policy in the set was a
+daemon release rather than a tag:
+
+- `scripts/seed-policies.sh` knew which files to download. It now reads them from the manifest,
+  keeping the nine it knows as a fallback for a revision tagged before the manifest existed.
+- `robotd-params` knew which policies were one-shot skills and how long each ran. It now takes
+  them from the manifest, falling back the same way.
+
+Three kinds, and only one becomes a skill:
+
+| `kind` | means | a skill? |
+| --- | --- | --- |
+| `perpetual` | runs until told otherwise — a gait, or a hold a person has to end | no |
+| `episodic` | runs for `duration_s` on an all-zero command and returns itself to a safe pose | **yes** |
+| `scripted` | the daemon generates its command over time — the ground pick's phase | no |
+
+`name` defaults to the file's stem, so only a policy whose role differs from its training run
+needs one: `ball_kick_left.onnx` answers to `kick_left`, and `roulade.onnx` says nothing.
+
+**The per-policy fields are the same ones a single-policy repo uses**, plus `file`. That is what
+makes the ask to a community publisher "add these fields" rather than "adopt our format", and it
+means one reader understands both shapes.
+
+**One guard is on the board, because it cannot be anywhere else.** A set entry may not answer to
+`ground_pick` or `sit_toggle`: those have their own arm of the cascade, and a second network
+behind either name would be fed an all-zero command it was never trained on. Nothing in this
+repository can check a file that lives on the Hub, so the check runs where the file is read.
+
 ## 10. What the official set currently is
 
 Recorded here because it lives nowhere else in this repository now that the files do not, and

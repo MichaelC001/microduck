@@ -1210,22 +1210,25 @@ mod tests {
         }
     }
 
-    /// **The download list must be exactly what `robotd` can ask for.**
+    /// **The fallback list must still be what `robotd` can ask for.**
     ///
-    /// A name the script fetches and robotd never wants is dead weight on the eMMC and in the
-    /// download. A name robotd defaults to and the script does not fetch is a slot that will not
-    /// load — reported as degraded, on every board, for a file nobody noticed was missing from a
-    /// list in a shell script.
+    /// The download list comes from the set's own `manifest.json` now, so a tenth policy is a tag
+    /// rather than an edit here. What is left in the script is the fallback for a revision tagged
+    /// before the manifest existed — and it is still a list that can go wrong in both directions:
+    /// a name nothing asks for is dead weight on the eMMC, and one a slot defaults to that is
+    /// missing is a slot that will not load, reported as degraded on every board.
+    ///
+    /// This goes with the fallback, once every tagged set carries a manifest.
     #[test]
-    fn the_download_list_is_exactly_what_robotd_defaults_to() {
+    fn the_fallback_list_is_exactly_what_robotd_defaults_to() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
         let script = std::fs::read_to_string(root.join("scripts/seed-policies.sh")).unwrap();
         let line = script
             .lines()
-            .find(|l| l.starts_with("POLICY_FILES="))
-            .expect("seed-policies.sh must declare POLICY_FILES");
+            .find(|l| l.starts_with("FALLBACK_FILES="))
+            .expect("seed-policies.sh must declare FALLBACK_FILES");
         let mut listed: Vec<String> = line
-            .trim_start_matches("POLICY_FILES=")
+            .trim_start_matches("FALLBACK_FILES=")
             .trim_matches('"')
             .split_whitespace()
             .map(str::to_owned)
@@ -1235,7 +1238,69 @@ mod tests {
         assert_eq!(
             listed,
             policies_robotd_expects(),
-            "the fetch list and robotd's own defaults have drifted"
+            "the fallback list and robotd's own defaults have drifted"
+        );
+    }
+
+    /// **The seeder's `sed` must match what the manifest actually says.**
+    ///
+    /// There is no JSON parser where that script runs — a release on a board with curl and a
+    /// POSIX shell — so the file list is extracted with one pattern over a file whose shape is
+    /// ours. That is fine exactly as long as the two agree, and silently downloads nothing the
+    /// moment they do not: a fresh board would fall back to nine names and never see a tenth.
+    #[test]
+    fn the_seeders_pattern_reads_the_manifest_it_is_given() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let script = root.join("scripts/seed-policies.sh");
+
+        // The shape `robotd_params::SetManifest` deserializes, written the way we would publish
+        // it — including a policy whose name differs from its file, and one with nothing but a
+        // file, so the pattern is not relying on neighbouring fields.
+        let manifest = serde_json::json!({
+            "schema_version": 1,
+            "policies": [
+                { "file": "alpha_walking.onnx", "kind": "perpetual" },
+                { "file": "ball_kick_left.onnx", "name": "kick_left",
+                  "kind": "episodic", "duration_s": 0.5 },
+                { "file": "roulade.onnx" }
+            ]
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("manifest.json");
+        std::fs::write(&path, serde_json::to_string_pretty(&manifest).unwrap()).unwrap();
+
+        // The same expression the script runs, so a change to one fails here rather than on a
+        // board six weeks later.
+        let text = std::fs::read_to_string(&script).unwrap();
+        let sed = text
+            .lines()
+            .find(|l| l.contains("sed -n 's/.*\"file\""))
+            .expect("the extraction line");
+        let expression = sed
+            .split_once('\'')
+            .and_then(|(_, rest)| rest.rsplit_once('\''))
+            .map(|(expr, _)| expr.to_owned())
+            .expect("a quoted sed expression");
+
+        let out = std::process::Command::new("sed")
+            .arg("-n")
+            .arg(&expression)
+            .arg(&path)
+            .output()
+            .expect("sed");
+        let files: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect();
+
+        assert_eq!(
+            files,
+            vec![
+                "alpha_walking.onnx".to_string(),
+                "ball_kick_left.onnx".to_string(),
+                "roulade.onnx".to_string()
+            ],
+            "the pattern and the manifest have drifted"
         );
     }
 

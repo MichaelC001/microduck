@@ -706,11 +706,137 @@ impl SkillDef {
     }
 }
 
-/// The skills a robot has when its config says nothing — today's three, with today's numbers.
+/// What the official policy set says about itself, installed beside the `.onnx` files.
 ///
-/// A board that updates onto this keeps its kicks and its roulade with no config written and no
-/// migration run, which is the whole reason absence resolves to something rather than nothing.
+/// The set is fetched from the Hub and versioned there, so what it contains — and how long each
+/// one-shot runs — is a property of the set rather than of this build. Without this, adding a
+/// tenth policy to the set meant a daemon release: one edit to the seeder's download list so it
+/// arrives, and another here so it is a skill. That is the same coupling this whole exercise
+/// removed for a stranger's policy, still in place for our own.
+///
+/// Absent is normal and not an error: a board seeded before the set carried one, or one where
+/// the fetch has not happened yet. The three built-ins below are the fallback.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct SetManifest {
+    pub policies: Vec<SetPolicy>,
+}
+
+/// One policy in the official set.
+///
+/// **The same field names a single-policy repo uses**, plus `file` to say which `.onnx` it
+/// describes. That is deliberate: the community convention is one repo per policy with a flat
+/// manifest, and the official set is nine policies in one repo. Sharing the vocabulary means
+/// asking a publisher to *add fields*, not to adopt a second format, and it means one reader
+/// understands both.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct SetPolicy {
+    /// The `.onnx`, as it is named in the repo and on disk. The only field a standalone manifest
+    /// has no use for, since a repo with one policy has nothing to disambiguate.
+    pub file: String,
+    /// What a client asks for, when this is a one-shot. Absent means the file's stem, so
+    /// `roulade.onnx` needs no name while `ball_kick_left.onnx` says `kick_left` — the names are
+    /// roles and the files are training runs, an indirection worth keeping.
+    pub name: Option<String>,
+    /// `"episodic"` or `"perpetual"`, and the difference is who supplies the ending.
+    ///
+    /// Only an episodic policy becomes a skill on its own. A gait is not something to ask for by
+    /// name, and a perpetual one has no length of its own — how long to hold a foot up is a
+    /// person's choice, so it takes a config entry rather than appearing.
+    pub kind: Option<String>,
+    /// Seconds it runs, for a policy that ends itself.
+    pub duration_s: Option<f64>,
+    /// Whether a request arriving while it runs starts another when this one finishes — how a
+    /// client maps "the button is held" onto a one-shot.
+    pub chain: bool,
+    /// Scales raw output into a joint offset, when this policy wants its own.
+    pub action_scale: Option<f64>,
+    /// Seconds a perpetual policy needs to get back to its idle command.
+    pub unwind_s: Option<f64>,
+    /// The command block. Only `idle` is read — the twist that means "stop doing the thing".
+    pub command: Option<SetCommand>,
+}
+
+/// The machine-readable half of a manifest's command block.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct SetCommand {
+    pub idle: Option<[f64; 3]>,
+}
+
+impl SetPolicy {
+    pub fn skill_name(&self) -> String {
+        self.name.clone().unwrap_or_else(|| {
+            std::path::Path::new(&self.file)
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| self.file.clone())
+        })
+    }
+}
+
+/// Skill names the daemon implements itself, which a policy set may not take over.
+const DAEMON_OWNED_SKILLS: [&str; 2] = ["ground_pick", "sit_toggle"];
+
+/// Read the installed set's manifest, if it has one.
+pub fn set_manifest() -> Option<SetManifest> {
+    let text = std::fs::read_to_string(PathBuf::from(POLICY_DIR).join("manifest.json")).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// The skills a robot has when its config says nothing.
+///
+/// From the installed set where it says, and from the three below where it does not.
+///
+/// A board whose set predates the manifest keeps its kicks and its roulade with no config
+/// written and no migration run, which is the whole reason absence resolves to something rather
+/// than nothing. This goes when every tagged set carries one.
 fn builtin_skills() -> Vec<SkillDef> {
+    // What the set itself declares. A policy is a skill only if it says it is episodic and how
+    // long it runs — a gait is not something to ask for by name, and a perpetual one needs a
+    // hold length that only a person can choose.
+    if let Some(manifest) = set_manifest() {
+        let from_set: Vec<SkillDef> = manifest
+            .policies
+            .iter()
+            .filter(|p| p.kind.as_deref() == Some("episodic"))
+            // **A set cannot claim a name the daemon drives itself.** The ground pick writes a
+            // scripted phase and the sit toggle is latched and driven internally by the shutdown
+            // sit and the seated-boot rise; both live in their own arm of the cascade, and a
+            // second entry answering to the same name would shadow one with a network fed an
+            // all-zero command it was never trained on. The manifest lives on the Hub and cannot
+            // be checked from here, so the guard belongs on the board.
+            //
+            // It guards the *name*, not the file. A set that marks `alpha_ground_pick.onnx`
+            // episodic without naming it still produces a skill — called `alpha_ground_pick`,
+            // running a phase-scripted network on zeros. That is a publisher's mistake rather
+            // than a trap: it shadows nothing, it is plainly visible in `robotctl policy list`,
+            // and nothing invokes it unless somebody asks for it by that name. Catching it would
+            // mean a hardcoded list of our own filenames, which is the coupling this whole
+            // manifest exists to remove.
+            .filter(|p| !DAEMON_OWNED_SKILLS.contains(&p.skill_name().as_str()))
+            .filter_map(|p| {
+                Some(SkillDef {
+                    name: p.skill_name(),
+                    path: Some(PathBuf::from(POLICY_DIR).join(&p.file)),
+                    duration: p.duration_s?,
+                    chain: p.chain,
+                    unwind: p.command.as_ref().and_then(|c| c.idle).unwrap_or_default(),
+                    unwind_s: p.unwind_s.unwrap_or(0.0),
+                    params: SkillOverrides {
+                        action_scale: p.action_scale,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+            })
+            .collect();
+        if !from_set.is_empty() {
+            return from_set;
+        }
+    }
+
     let kick = |name: &str, file: &str| SkillDef {
         name: name.to_owned(),
         // The kick files are `ball_kick_*.onnx`, which is not `<name>.onnx` — the names are the
@@ -1405,6 +1531,115 @@ mod tests {
                 "{key} must be a path slot"
             );
         }
+    }
+
+    /// **The set says what skills a robot has.** Adding a tenth policy used to mean two edits
+    /// in this repository and a daemon release to carry them; it is a tag on the Hub now.
+    #[test]
+    fn a_set_manifest_decides_which_policies_are_skills() {
+        let manifest: super::SetManifest = serde_json::from_value(serde_json::json!({
+            "policies": [
+                // A gait: perpetual, so not something to ask for by name.
+                { "file": "alpha_walking.onnx", "kind": "perpetual" },
+                // A perpetual one-shot: no length of its own, so it takes a config entry rather
+                // than appearing.
+                { "file": "flamingo.onnx", "kind": "perpetual",
+                  "unwind_s": 1.5, "command": { "idle": [0, 0, 0] } },
+                { "file": "roulade.onnx", "kind": "episodic", "duration_s": 1.0, "chain": true },
+                { "file": "ball_kick_left.onnx", "name": "kick_left",
+                  "kind": "episodic", "duration_s": 0.5 },
+                { "file": "new_trick.onnx", "kind": "episodic", "duration_s": 2.0,
+                  "action_scale": 0.8 }
+            ]
+        }))
+        .unwrap();
+
+        let skills: Vec<(&str, f64)> = manifest
+            .policies
+            .iter()
+            .filter(|p| p.kind.as_deref() == Some("episodic"))
+            .map(|p| (p.file.as_str(), p.duration_s.unwrap()))
+            .collect();
+        assert_eq!(
+            skills,
+            vec![
+                ("roulade.onnx", 1.0),
+                ("ball_kick_left.onnx", 0.5),
+                ("new_trick.onnx", 2.0)
+            ],
+            "gaits and perpetual one-shots are not skills on their own"
+        );
+    }
+
+    /// **A set cannot shadow a skill the daemon drives itself.**
+    ///
+    /// The manifest lives on the Hub, so nothing in this repository can check it before a board
+    /// downloads it — the guard has to be on the board. `ground_pick` and `sit_toggle` have their
+    /// own arm of the cascade, and a set entry answering to either name would put a second
+    /// network behind it, fed an all-zero command it was never trained on.
+    ///
+    /// The guard is on the name, and this pins what that does and does not cover: a set that
+    /// mislabels a scripted policy without renaming it produces a junk skill under its own file
+    /// stem. That shadows nothing and is visible in `robotctl policy list`; catching it would
+    /// take a hardcoded list of our filenames, which is what this manifest exists to remove.
+    #[test]
+    fn a_set_cannot_shadow_a_skill_the_daemon_drives() {
+        let manifest: super::SetManifest = serde_json::from_value(serde_json::json!({
+            "policies": [
+                // Named as the daemon's own: shadowing, and refused.
+                { "file": "alpha_sitstand.onnx", "name": "sit_toggle",
+                  "kind": "episodic", "duration_s": 2.0 },
+                // Mislabelled but not renamed: a junk skill, and it is allowed through.
+                { "file": "alpha_ground_pick.onnx", "kind": "episodic", "duration_s": 4.0 },
+                { "file": "roulade.onnx", "kind": "episodic", "duration_s": 1.0 }
+            ]
+        }))
+        .unwrap();
+
+        let claimed: Vec<String> = manifest
+            .policies
+            .iter()
+            .filter(|p| p.kind.as_deref() == Some("episodic"))
+            .map(|p| p.skill_name())
+            .filter(|n| !super::DAEMON_OWNED_SKILLS.contains(&n.as_str()))
+            .collect();
+        assert_eq!(
+            claimed,
+            vec!["alpha_ground_pick".to_string(), "roulade".to_string()],
+            "sit_toggle is refused; the mislabelled one is a visible mistake, not a trap"
+        );
+    }
+
+    /// A name is the role and a file is the training run, so `ball_kick_left.onnx` answers to
+    /// `kick_left` while `roulade.onnx` needs no name at all.
+    #[test]
+    fn a_set_policy_names_itself_after_its_file_unless_it_says_otherwise() {
+        let manifest: super::SetManifest = serde_json::from_value(serde_json::json!({
+            "policies": [
+                { "file": "roulade.onnx" },
+                { "file": "ball_kick_left.onnx", "name": "kick_left" }
+            ]
+        }))
+        .unwrap();
+        let names: Vec<String> = manifest.policies.iter().map(|p| p.skill_name()).collect();
+        assert_eq!(names, ["roulade", "kick_left"]);
+    }
+
+    /// A manifest that says nothing this build understands must not empty the robot. An older
+    /// set, or one written by a newer publisher, falls back rather than removing every skill.
+    #[test]
+    fn a_set_manifest_with_no_skills_falls_back() {
+        let manifest: super::SetManifest = serde_json::from_value(serde_json::json!({
+            "policies": [{ "file": "alpha_walking.onnx", "kind": "perpetual" }]
+        }))
+        .unwrap();
+        assert!(
+            manifest
+                .policies
+                .iter()
+                .all(|p| p.kind.as_deref() != Some("episodic")),
+            "nothing here is a skill, so builtin_skills keeps the three it knows"
+        );
     }
 
     /// **Absence resolves to the three a robot has always had.** A board updating onto this
