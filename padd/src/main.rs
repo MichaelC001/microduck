@@ -111,7 +111,10 @@ struct Args {
     /// How often to send intents. Matching the control rate exactly buys nothing — the loop
     /// reads the latest value once per tick — but staying at or above it keeps the added
     /// latency under one tick.
-    #[arg(long, default_value_t = 50)]
+    ///
+    /// refused below 1 rather than clamped: zero reaches `1.0 / 0.0` below, and
+    /// `Duration::from_secs_f64` panics on infinity instead of producing a very long period.
+    #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..))]
     hz: u32,
 
     /// Deflection below this counts as centre. Analogue sticks rarely rest at exactly zero,
@@ -659,5 +662,23 @@ fn request(
             tracing::warn!(error = %e, raw = %answer.trim(), "unparsable answer");
             Ok(None)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// the bug this catches: `--hz 0` used to reach `Duration::from_secs_f64(1.0 / 0.0)`, and
+    /// that panics on infinity rather than giving a very long period. so a typo killed the
+    /// daemon at startup with a panic instead of saying which flag was wrong.
+    #[test]
+    fn a_zero_rate_is_refused_rather_than_divided_by() {
+        assert!(Args::try_parse_from(["padd", "--hz", "0"]).is_err());
+        assert!(Args::try_parse_from(["padd", "--hz", "1"]).is_ok());
+        assert!(
+            Args::try_parse_from(["padd"]).is_ok(),
+            "the default still parses"
+        );
     }
 }
