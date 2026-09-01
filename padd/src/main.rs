@@ -108,8 +108,8 @@ struct Args {
     #[arg(long, default_value = "/run/robotd.sock")]
     socket: PathBuf,
 
-    /// How often to send intents. Matching the control rate exactly buys nothing — the loop
-    /// reads the latest value once per tick — but staying at or above it keeps the added
+    /// How often to send intents, 1–1000 Hz. Matching the control rate exactly buys nothing — the
+    /// loop reads the latest value once per tick — but staying at or above it keeps the added
     /// latency under one tick.
     // Bounded both ways, and refused rather than clamped so the flag says what it did.
     // Zero reaches `1.0 / 0.0` and `Duration::from_secs_f64` panics on infinity. The ceiling
