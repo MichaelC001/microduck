@@ -267,16 +267,44 @@ is refused saying so.
 ```
 robotctl pad bindings
 ```
+```text
+a           ground_pick
+x           roulade
+lb          kick_left
+rb          kick_right
+dpad_down   sit_toggle
+
+`robotctl pad bind <button> <skill>` changes one; padd picks it up within a second.
+```
 
 ```
 sudo robotctl pad bind x polite-bow
 ```
+```text
+a           ground_pick
+x           polite-bow
+lb          kick_left
+rb          kick_right
+dpad_down   sit_toggle
+```
+
+That writes one line, and only the button you named:
+
+```toml
+[pad]
+x = "polite-bow"
+```
+
+Put it back:
 
 ```
 sudo robotctl pad reset
 ```
 
 **Nothing restarts** — `padd` notices within a second.
+
+A binding naming a skill this robot does not have is marked in the listing rather than
+silently doing nothing when you press it.
 
 Five buttons are bindable: `a`, `x`, `lb`, `rb`, `dpad_down`. **`lb`/`rb` are the bumpers**, not
 the analog triggers, which are the mouth and the quack. An empty name switches a button off, and

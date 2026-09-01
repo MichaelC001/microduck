@@ -3437,7 +3437,7 @@ fn run_pad_bindings(
         }
         if known.is_some() {
             println!(
-                "\n`robotctl pad bind <button> <skill>` changes one; padd reads it at startup."
+                "\n`robotctl pad bind <button> <skill>` changes one; padd picks it up within a second."
             );
         } else {
             println!("\nrobotd is not answering, so the names above were not checked against it.");
