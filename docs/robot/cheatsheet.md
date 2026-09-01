@@ -164,39 +164,24 @@ than failing. `robotctl monitor` reports the achieved rate on the bottom border,
 journalctl -u mediad -b | grep streaming
 ```
 
-#### Your own policy
+### Policies and skills
 
-You do not need to cut a release, edit a file, or restart anything to try a network. Copy your
-`.onnx` to the board and load it:
+A **slot** is what the robot runs by default — the walking gait, the standing network. A
+**skill** is what it runs when asked: a kick, the roulade, a bow. Both are files on the Hub, both
+change without a daemon release, and nothing below needs a restart.
 
-```
-sudo robotctl policy load walk /home/radxa/my_walking.onnx
-```
-
-The robot returns to its home pose, loads it, and drives again. What is running:
+What this robot is running right now:
 
 ```
 robotctl policy list
 ```
 
-A `*` marks every slot config has an opinion about, and a slot you switched off says
-`switched off` rather than looking like one this robot never had.
+A `*` marks every slot config has an opinion about, with a count at the bottom. A slot you
+switched off says `switched off` rather than looking like one the robot never had.
 
-Put one slot back:
+#### A newer official set
 
-```
-sudo robotctl policy reset walk
-```
-
-Put everything back:
-
-```
-sudo robotctl policy reset
-```
-
-#### A newer official gait
-
-The set the robot walks with lives on the Hub and updates on its own line — no daemon release:
+The set the robot walks with lives on the Hub and versions on its own line:
 
 ```
 robotctl policy check
@@ -212,9 +197,72 @@ name one — `--version v1` is how to go back. The robot returns to its home pos
 slot and drives again, and **a slot you loaded yourself is left alone**, because it points
 somewhere else entirely.
 
-#### Putting a skill on a button
+#### Trying your own file
 
-What each of the pad's one-shot buttons runs:
+No release, no file to edit, no restart:
+
+```
+sudo robotctl policy load walk /home/radxa/my_walking.onnx
+```
+
+The robot goes to its home pose, loads it, and drives again. `sudo robotctl policy reset walk`
+puts that slot back; with no slot, it puts all seven back.
+
+#### Trying somebody else's
+
+Other people publish policies for this robot:
+
+```
+robotctl policy search microduck
+```
+
+```
+sudo robotctl policy load walk RemiFabre/microduck-flamingo-cycle
+```
+
+The repo name is enough — it is fetched and loaded in one step. Add `@v2` for a revision and
+`:policy.onnx` for a repo carrying more than one. `policy list` marks it `community`.
+
+**Nothing a stranger publishes is verified by anybody.** What makes it safe to try is the joint
+clamps, the fall reflex and the shape gate — not the description. Have the robot on its stand the
+first time.
+
+A policy whose manifest says it will not run here — wrong observation width, a newer daemon, a
+different robot — is refused before it downloads. One with no manifest is accepted and checked
+the usual way, at load.
+
+#### Adding a skill
+
+A policy in the walk slot replaces the gait. A policy added as a *skill* sits alongside it and
+runs when asked, which is what most published one-shots want:
+
+```
+sudo robotctl policy add polite-bow fffiloni/microduck-polite-bow-b1d864
+```
+
+```
+robotctl robot do polite-bow
+```
+
+The length comes from the repo's manifest. A policy that holds until told otherwise — a
+one-footed stand, say — has no length of its own, so give it one, and the twist it reads:
+
+```
+sudo robotctl policy add flamingo RemiFabre/microduck-flamingo-cycle --hold 5 --command 1,1,0
+```
+
+`--command` is what the network is fed while it runs. Most skills need none: they are trained on
+an all-zero command and being selected *is* the trigger. A policy that reads its twist as
+something else — flamingo's is `[flag, side, 0]` — needs it spelled out, and its README says
+what the slots mean.
+
+`sudo robotctl policy remove <name>` takes one out. A skill this robot's release ships comes back
+when you do, since removing the entry only removes the override.
+
+The robot must be driving for a skill to run — press **Start** on the pad first, or the request
+is refused saying so.
+
+#### Putting a skill on a button
 
 ```
 robotctl pad bindings
@@ -224,89 +272,64 @@ robotctl pad bindings
 sudo robotctl pad bind x polite-bow
 ```
 
-Put it all back:
-
 ```
 sudo robotctl pad reset
 ```
 
-**Nothing needs restarting** — `padd` notices the change within a second.
+**Nothing restarts** — `padd` notices within a second.
 
 Five buttons are bindable: `a`, `x`, `lb`, `rb`, `dpad_down`. **`lb`/`rb` are the bumpers**, not
-the analog triggers, which are the mouth and the quack and are not bindable. An empty name
-switches a button off, and `pad reset <button>` puts one back.
+the analog triggers, which are the mouth and the quack. An empty name switches a button off, and
+`pad reset <button>` puts one back. The defaults are the mapping the prototype had, so a robot
+with no `[pad]` section behaves exactly as it always has.
 
-The defaults are the mapping the prototype had, so a robot with no `[pad]` section behaves
-exactly as it always has. The rest of the pad is not bindable either: Start toggles the policy, Y
-and B change what the sticks mean, and held Select powers the robot off — the button that stops a
-robot is the one worth not being able to lose to a config edit.
+The rest of the pad is not bindable: Start toggles the policy, Y and B change what the sticks
+mean, and held Select powers the robot off — the button that stops a robot is the one worth not
+being able to lose to a config edit. A name is checked against what the robot actually has, so a
+typo is refused with the list rather than becoming a dead button.
 
-The name is checked against what the robot actually has, so a typo is refused with the list
-rather than becoming a dead button.
-
-#### Somebody else's gait
-
-Other people publish policies for this robot. What is out there:
+#### Putting it all back
 
 ```
-robotctl policy search microduck
-```
-
-Try one — the repo name is enough, and it is fetched and loaded in one step:
-
-```
-sudo robotctl policy load walk RemiFabre/microduck-flamingo-cycle
-```
-
-Add `@v2` for a revision, and `:policy.onnx` for a repo carrying more than one policy (none does
-yet). `robotctl policy list` marks it `community`, and `sudo robotctl policy reset walk` puts your
-own back.
-
-Some policies need a slot out of the way. `flamingo-cycle` does its own two-foot stand, so the
-standing network has to be off or the robot hands itself to that whenever the command is zero:
-
-```
-sudo robotctl policy load walk RemiFabre/microduck-flamingo-cycle
+sudo robotctl policy reset
 ```
 ```
-sudo robotctl policy load stand none
+sudo robotctl pad reset
+```
+```
+robotctl configure --list
 ```
 
-`none` switches a slot off, the same as `[policy] stand = "none"` — every slot except `walk`,
-which is what all the others fall back to and cannot be empty. `sudo robotctl policy reset`
-puts everything back. Driving it takes the `control.py` in that repo, over a forwarded socket —
-its README has the commands, and the twist slots carry `[flag, side, 0]` rather than a velocity.
+The last one prints what this robot changes from the defaults and nothing else — a robot nobody
+has touched prints one line saying so. It is the first thing to run when a robot is behaving
+oddly and you are not sure what was left set.
 
-A policy whose manifest says it will not run here — the wrong observation width, a newer daemon,
-a different robot — is refused before it downloads. One with no manifest is accepted and checked
-the usual way, at load. **Nothing a stranger publishes is verified by anybody**: what makes it
-safe to try is the joint clamps, the fall reflex and the shape gate, not the description. Have the
-robot on its stand the first time.
-
-#### The slots
+#### The slots, and four things worth knowing
 
 The slots are `walk`, `stand`, `sitstand`, `ground_pick`, `kick_left`, `kick_right` and
 `roulade`. `load` writes the choice into `/etc/robot/robotd.toml`, so it survives a reboot and
 survives updates — a release replaces the binaries and the policies it ships, not the line that
-points elsewhere. `reset` removes that line again.
-
-Three things worth knowing:
+points elsewhere.
 
 - **Resetting something already reset does nothing, and says so.** No homing, no reload, and no
   `sudo` needed when there is also nothing to write.
 - **A policy that is not `obs[1,61] -> actions[1,14]` is refused before anything changes.** The
-  file is opened and checked while the robot is still running the old one, and the command
-  prints the reason.
+  file is opened and checked while the robot is still running the old one.
 - **A load that fails anyway keeps the policy that was running.** Trying a gait cannot cost you
   the one you had.
-- **A file that has gone missing by the next boot costs its slot, not the robot.** That slot
-  falls back to the policy this release ships, `robotctl health` reports *degraded* and names
-  the file, and `robotctl policy reset <slot>` clears it. An official policy that will not load
-  is still **unhealthy** — that is a broken release, and the updater rolls it back.
+- **A file that has gone missing by the next boot costs its slot, not the robot.** The slot falls
+  back to this robot's own policy, `robotctl health` reports *degraded* and names the file, and
+  `policy reset <slot>` clears it. An official policy that will not load is still **unhealthy** —
+  that is a broken release, and the updater rolls it back.
+
+`none` switches a slot off — every slot except `walk`, which is what the others fall back to and
+cannot be empty. Some policies need that: one that does its own standing wants the standing
+network out of the way, or the robot hands itself to that whenever the command is zero.
 
 The shape a policy has to have and what else is checked at load are in
-[`../design/robotd-design.md`](../design/robotd-design.md) §2.3; where policies come from and
-what `official` means is [`../design/policy-channel-design.md`](../design/policy-channel-design.md).
+[`../design/robotd-design.md`](../design/robotd-design.md) §2.3; where policies come from, what
+`official` means, and how a skill declares itself are in
+[`../design/policy-channel-design.md`](../design/policy-channel-design.md).
 
 ### Power to the joints (`robotd`)
 
@@ -340,6 +363,9 @@ or `fall_recover` in `robotd.toml` arms the gate: there a fallen robot goes limp
 `init`/`enable`/skills until it is stood up.
 
 ### Gamepad (`configd`)
+
+What each button *does* — and how to change it — is under **Policies and skills** above
+(`robotctl pad bindings`). This section is about getting a pad connected at all.
 
 ```
 robotctl pad status

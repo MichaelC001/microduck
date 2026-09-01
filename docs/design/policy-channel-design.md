@@ -451,7 +451,108 @@ means one reader understands both shapes.
 behind either name would be fed an all-zero command it was never trained on. Nothing in this
 repository can check a file that lives on the Hub, so the check runs where the file is read.
 
-## 10. What the official set currently is
+## 10. Skills: what a robot can be asked to do
+
+A slot is what the robot runs *by default*. A **skill** is what it runs when asked — the kicks,
+the roulade, and anything else on the same shape.
+
+Adding one used to touch seven places: the `Skill` enum, `Net`, `PolicyPaths`, a `Policy` field
+and its `has_*`, a `Slot` with a config key and a registry entry, a branch in the control loop,
+and padd's button table. So a community policy shaped exactly like the roulade — zero command,
+four seconds, selecting it is the trigger — could not be added without a daemon release.
+
+It was seven places because it did not need to be one. These two arms were the same arm:
+
+```rust
+} else if let Some((left, _)) = self.kick {
+    let net = if left { Net::KickLeft } else { Net::KickRight };
+    (net, Command::default(), label)
+} else if self.roulade.is_some() {
+    (Net::Roulade, Command::default(), "roulade")
+```
+
+Kicks and roulade differed in four numbers — duration, action scale, gain ratio, and whether
+holding the button chains another — and in nothing else. So they are four numbers:
+
+```toml
+[[policy.skill]]
+name = "polite-bow"
+path = "/var/lib/robot/policies/fffiloni/microduck-polite-bow-b1d864/main/policy.onnx"
+duration = 4.0
+```
+
+`robotctl policy add polite-bow <repo>` writes that, taking the length from the repo's manifest.
+Absent means the built-in three, and an entry merges by name, so a board updates onto this with
+no config and no migration — and adding one cannot silently remove another by omission.
+`"none"` removes a built-in, the same word that switches off a policy slot.
+
+### 10.1 Who supplies the ending
+
+`kind` in a manifest is not about how long a policy runs. It is about **who ends it**.
+
+An *episodic* policy returns itself to a safe pose — `polite-bow` is standing again after four
+seconds — so the window can simply expire and the gait takes over an upright robot. A *perpetual*
+one holds until told otherwise, and expiring on it would hand the gait a robot balanced on one
+foot. So a skill may declare both halves:
+
+```toml
+command  = [1.0, 1.0, 0.0]   # the twist while it runs — flamingo reads [flag, side, 0]
+unwind   = [0.0, 1.0, 0.0]   # what it drives on the way back
+unwind_s = 3.0
+```
+
+That is the daemon supplying the ending the policy does not have, and it is the shape the sit
+toggle already had: latched, then a timed rise before handing back, because dropping the flag
+does not instantly make a robot stand. Both default to nothing, so the common case declares
+neither.
+
+Head and body are zeroed for every skill, whatever the phase — every one-shot published so far
+declares them unused, and a policy trained with `zero_command_padding` expects exactly that. Only
+the twist differs, and for most skills it is zero too.
+
+**A skill's twist is unsmoothed by construction.** The EMA is applied to the *client's* command on
+its way in, and a skill never reads that — the loop builds a fresh command block. Which is why a
+policy reading a flag rather than a velocity needs no `cmd_alpha` as a skill, and needed it set
+globally when it was squatting in the walk slot.
+
+### 10.2 What stays in the daemon
+
+`walk` and `stand` are the fallback pair, chosen by command magnitude, and there is nothing below
+them to hand back to. `sitstand` is latched and driven internally by the shutdown sit and the
+seated-boot rise, not only by a button. `ground_pick` writes a scripted phase rather than a
+constant. None of the four is a generic one-shot, and a set entry may not answer to
+`ground_pick` or `sit_toggle` — a second network behind either name would be fed an all-zero
+command it never trained on.
+
+**A running skill has the fall reflex off** for its whole duration: the limp-fall predictor is
+only consulted while the controller is not `busy()`, and any active skill makes it busy. That was
+uncontroversial when every one-shot was under a second. A skill that can be configured to hold
+for ten is a robot with no fall reflex for ten seconds, and that wants deciding rather than
+inheriting.
+
+### 10.3 The button
+
+`[pad]` says which of the five one-shot buttons runs which skill:
+
+```toml
+[pad]
+x = "polite-bow"
+```
+
+`robotctl pad bindings` shows them, `pad bind` changes one, `pad reset` puts them back. The
+defaults are the mapping the prototype had, so a robot with no `[pad]` behaves as it always has,
+and `padd` re-reads the file within a second — nothing restarts.
+
+Only those five. `Start`, the two stick-mode toggles, held `Select` and held `D-pad up` are not
+`robot.do` calls, and the button that powers a robot off is the one binding worth not being able
+to lose to a config edit.
+
+`padd` still knows nothing about what a skill *is*. It reads which button went down, looks up the
+name beside it, and sends that name; `robotd` decides whether the robot has such a thing and
+answers with the list it does have when it does not. Checking belongs where the answer is, which
+is why `robotctl pad bind` asks the robot and refuses a typo with the real list.
+
+## 11. What the official set currently is
 
 Recorded here because it lives nowhere else in this repository now that the files do not, and
 because the mapping is not recoverable from the names on the Hub. Copied from
@@ -481,14 +582,14 @@ not mean editing `robotd.toml`.
 That check turned a wrong-policy mistake into a diagnosis rather than a robot moving in ways
 nobody could explain, and it is now also what catches a truncated download (§9).
 
-## 11. Naming
+## 12. Naming
 
 The updater says `model`; `robotd` says `policy`. Standardising on **policy** — the component is
 `policies`, the namespace is `policy.*`, the commands are `robotctl policy …`. `models/` keeps
 its meaning for the things that genuinely are models and not control policies, such as
 `pet_detect.onnx` and the duck detector.
 
-## 12. Decisions recorded
+## 13. Decisions recorded
 
 | | |
 |---|---|
@@ -509,6 +610,10 @@ its meaning for the things that genuinely are models and not control policies, s
 | The pin is a floor; `policy update` moves past it | Otherwise a gait still needs a daemon release, which is the thing this channel is for (§9.1) |
 | A set records the repo it came from | One writer, one copy, nothing to configure twice or drift (§9.1) |
 | Reload is a third thing, not reset-all | They look identical from outside and conflating them discards every override (§9.1) |
+| One-shot skills are config, not code | Kicks and roulade were the same arm with different numbers; a community one is a fifth set (§10) |
+| `kind` says who ends a policy, not how long | An episodic one returns itself; a perpetual one needs the daemon to drive it back (§10.1) |
+| Skills leave walk, stand, sitstand and ground_pick alone | The fallback pair, one driven internally, one scripted — none is a generic one-shot (§10.2) |
+| Buttons are config; Start and Select are not | The button that stops a robot is the one worth not being able to lose (§10.3) |
 | The seeder never replaces an installed set | Otherwise a daemon update silently reverts a gait chosen with `policy update` (§9) |
 | Origin is the org in the path | Honest without a lookup, and a label rather than a boundary (§9.2) |
 | The manifest can refuse but never bless | It is a stranger's claim; the shape gate is the check (§9.2) |
@@ -516,7 +621,7 @@ its meaning for the things that genuinely are models and not control policies, s
 | Seeds are pruned to the current and previous | Unbounded 7 MB-per-release growth; the previous one is the hand-recovery after a rollback (§9) |
 | One `policy check`, routing internally | Two commands for one question is the confusion worth avoiding (§6) |
 
-## 13. Deferred, deliberately
+## 14. Deferred, deliberately
 
 - **Competing versions of one community policy.** A slot holds one file; the library holds many,
   but only the config says which is live. A real `(name, version)` store key is priced in
@@ -529,7 +634,13 @@ its meaning for the things that genuinely are models and not control policies, s
   tag.
 - **Signing community policies**, and any curated-org scheme that would require it.
 
-## 14. Open
+## 15. Open
+
+- **A running skill has no fall reflex** for its whole duration (§10.2). Fine for a half-second
+  kick; a skill configured to hold for ten seconds is ten seconds without one.
+- **`robotctl configure` lists the skill table and cannot edit it.** A repeating table is not a
+  key with a cursor position, so the editor points at `robotctl policy` instead. Teaching the
+  registry about repeating sections is the largest single piece of that and buys the least.
 
 - **Whether the official set ever becomes an updater component.** Delivery no longer needs one:
   §9 fetches the pinned set from the Hub directly, the way the board's other prerequisites
