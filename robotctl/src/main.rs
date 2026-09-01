@@ -786,6 +786,50 @@ enum PolicyCommand {
         json: bool,
     },
 
+    /// Add a one-shot skill — a policy the robot runs when asked, by name.
+    ///
+    /// `robotctl policy add polite-bow fffiloni/microduck-polite-bow-b1d864` fetches it, reads
+    /// how long it runs from its manifest, and writes the entry. Then `robotctl policy do
+    /// polite-bow`, or a pad button once bindings exist.
+    ///
+    /// A policy that ends itself needs nothing else. One that holds until told otherwise —
+    /// `kind: perpetual`, like the published flamingo — has no length of its own, so `--hold`
+    /// and `--unwind` say how long to hold it and how long to come back before the gait takes
+    /// over. Without those the robot would be handed back mid-pose.
+    Add {
+        /// What to call it. This is what `robotctl policy do` and a pad button will use.
+        name: String,
+        /// A file on this robot, or a Hub repo — `org/name`, optionally `@revision` and `:file`.
+        source: String,
+        /// Seconds to run it. Taken from the manifest when it declares one.
+        #[arg(long)]
+        hold: Option<f64>,
+        /// Seconds spent returning to a safe pose before handing back, and the twist to hold
+        /// while doing it — `--unwind 3.0` with `--unwind-command 0,1,0`.
+        #[arg(long)]
+        unwind: Option<f64>,
+        /// The twist fed while it runs, as three comma-separated numbers. Zeros unless given,
+        /// which is what every one-shot published so far expects.
+        #[arg(long, value_name = "X,Y,Z")]
+        command: Option<String>,
+        /// The twist fed while it unwinds. Zeros unless given.
+        #[arg(long, value_name = "X,Y,Z")]
+        unwind_command: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Remove a one-shot skill by name.
+    ///
+    /// A skill this robot's release ships — `roulade`, the kicks — comes back, since removing
+    /// the config entry only removes the override. Switching one off for good is
+    /// `policy add <name> none`.
+    Remove {
+        name: String,
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Look for policies on the Hub.
     ///
     /// Everything it prints is written by whoever published the model — treat a description as a
@@ -2658,6 +2702,9 @@ fn run_policy(
         PolicyCommand::Search { query, json } => {
             return run_policy_search(updater_socket, query, *json);
         }
+        PolicyCommand::Add { .. } | PolicyCommand::Remove { .. } => {
+            return run_policy_skill(updater_socket, config, &command);
+        }
         _ => {}
     }
 
@@ -2713,7 +2760,9 @@ fn run_policy(
         // into a slot swap it has nothing to do with.
         PolicyCommand::Check { .. }
         | PolicyCommand::Update { .. }
-        | PolicyCommand::Search { .. } => {
+        | PolicyCommand::Search { .. }
+        | PolicyCommand::Add { .. }
+        | PolicyCommand::Remove { .. } => {
             unreachable!("updaterd serves these, and they returned before this point")
         }
     };
@@ -2887,6 +2936,195 @@ fn fetch_from_hub(
         }
     }
     Ok(PathBuf::from(fetched.path))
+}
+
+/// Three comma-separated numbers, as a twist.
+fn twist_of(spec: &str) -> Result<[f64; 3], Failure> {
+    let parts: Vec<&str> = spec.split(',').map(str::trim).collect();
+    let mut twist = [0.0; 3];
+    if parts.len() != 3 {
+        return Err(Failure::new(
+            exit::USAGE,
+            format!("{spec:?} is not three comma-separated numbers"),
+        ));
+    }
+    for (slot, part) in twist.iter_mut().zip(parts) {
+        *slot = part
+            .parse()
+            .map_err(|_| Failure::new(exit::USAGE, format!("{part:?} is not a number")))?;
+    }
+    Ok(twist)
+}
+
+/// `robotctl policy add` / `remove` — the one-shot skills a robot can be asked to do.
+///
+/// The config half of `robot.do`. Writing the entry is all it takes: the daemon resolves the
+/// list at every controller build, so a skill added here is one a client can ask for after a
+/// restart, with no code anywhere naming it.
+fn run_policy_skill(
+    updater_socket: &Path,
+    config: &Path,
+    command: &PolicyCommand,
+) -> Result<(), Failure> {
+    let mut model = configure::Model::load(config).map_err(|e| Failure::new(exit::FAILED, e))?;
+
+    if let PolicyCommand::Remove { name, json } = command {
+        ensure_recordable(config)?;
+        let removed = model
+            .remove_skill(name)
+            .map_err(|e| Failure::new(exit::FAILED, e))?;
+        if *json {
+            println!("{}", compact(&serde_json::json!({ "removed": removed })));
+        } else if removed {
+            println!("{name} removed — restart robotd for it to take effect");
+        } else {
+            println!("no skill named {name:?} in {}", config.display());
+        }
+        return Ok(());
+    }
+
+    let PolicyCommand::Add {
+        name,
+        source,
+        hold,
+        unwind,
+        command: command_spec,
+        unwind_command,
+        json,
+    } = command
+    else {
+        unreachable!("only add and remove reach here");
+    };
+
+    // Before the fetch, so a change that could never be written fails before anything is
+    // downloaded — the same order `policy load` uses.
+    ensure_recordable(config)?;
+
+    // `none` switches a built-in off, the same word that switches off a policy slot.
+    let (path, from_manifest) = if robotd_params::is_none_sentinel(Path::new(source)) {
+        (Some(PathBuf::from("none")), None)
+    } else {
+        let local = PathBuf::from(source);
+        if local.exists() {
+            let path = local
+                .canonicalize()
+                .map_err(|e| Failure::new(exit::USAGE, format!("{}: {e}", local.display())))?;
+            (Some(path), None)
+        } else {
+            let fetched = fetch_skill(updater_socket, source, *json)?;
+            (Some(PathBuf::from(fetched.path.clone())), Some(fetched))
+        }
+    };
+
+    // The manifest supplies the length for a policy that ends itself. One that does not —
+    // `kind: perpetual` — has no length to supply, and handing back mid-pose is exactly what a
+    // hold and an unwind are for, so it is a refusal rather than a guess.
+    let declared = from_manifest.as_ref().and_then(|m| m.duration_s);
+    let perpetual = from_manifest
+        .as_ref()
+        .and_then(|m| m.kind.as_deref())
+        .is_some_and(|kind| kind.eq_ignore_ascii_case("perpetual"));
+    let duration = match hold.or(declared) {
+        Some(duration) if duration > 0.0 => duration,
+        Some(_) => return Err(Failure::new(exit::USAGE, "--hold must be positive".into())),
+        None if perpetual => {
+            return Err(Failure::new(
+                exit::USAGE,
+                format!(
+                    "{name} holds until it is told otherwise, so it has no length of its own — \
+                     say how long with `--hold`, and how long to come back with `--unwind`, or \
+                     the gait takes over mid-pose"
+                ),
+            ));
+        }
+        None => {
+            return Err(Failure::new(
+                exit::USAGE,
+                "its manifest does not say how long it runs; give `--hold <seconds>`".into(),
+            ));
+        }
+    };
+
+    let skill = robotd_params::SkillDef {
+        name: name.clone(),
+        path,
+        duration,
+        chain: false,
+        command: command_spec
+            .as_deref()
+            .map(twist_of)
+            .transpose()?
+            .unwrap_or_default(),
+        unwind: unwind_command
+            .as_deref()
+            .map(twist_of)
+            .transpose()?
+            .unwrap_or_default(),
+        unwind_s: unwind.unwrap_or(0.0),
+        params: robotd_params::SkillOverrides {
+            action_scale: from_manifest.as_ref().and_then(|m| m.action_scale),
+            ..Default::default()
+        },
+    };
+
+    model
+        .set_skill(&skill)
+        .map_err(|e| Failure::new(exit::FAILED, e))?;
+
+    if *json {
+        println!("{}", compact(&serde_json::json!({ "added": name })));
+        return Ok(());
+    }
+    println!("{name} added, {duration}s");
+    if skill.unwind_s > 0.0 {
+        println!(
+            "  then {}s coming back before the gait takes over",
+            skill.unwind_s
+        );
+    } else if perpetual {
+        // It was allowed through with an explicit --hold, which is the caller's call, but the
+        // consequence is worth stating rather than discovering with the robot on one foot.
+        println!("  no unwind: the gait takes over the moment it ends");
+    }
+    println!("  `sudo systemctl restart robotd`, then `robotctl policy do {name}`");
+    Ok(())
+}
+
+/// Fetch a policy for a skill entry, reporting what arrived.
+fn fetch_skill(
+    updater_socket: &Path,
+    spec: &str,
+    json: bool,
+) -> Result<proto::PolicyFetchResult, Failure> {
+    let (repo, file) = match spec.split_once(':') {
+        Some((repo, file)) => (repo, Some(file.to_owned())),
+        None => (spec, None),
+    };
+    let (repo, revision) = match repo.split_once('@') {
+        Some((repo, revision)) => (repo, Some(revision.to_owned())),
+        None => (repo, None),
+    };
+
+    let mut client = Client::connect_to("updaterd", updater_socket)?;
+    client.hello()?;
+    let result = result_of(
+        client.call(&proto::Call::PolicyFetch(proto::PolicyFetchParams {
+            repo: repo.to_owned(),
+            revision,
+            file,
+        }))?,
+    )?;
+    let fetched: proto::PolicyFetchResult = decode(&result)?;
+    if !json {
+        println!(
+            "fetched {} from {} ({})",
+            fetched.file, fetched.repo, fetched.origin
+        );
+        if let Some(description) = &fetched.description {
+            println!("  \"{description}\"");
+        }
+    }
+    Ok(fetched)
 }
 
 /// `robotctl policy search` — what is on the Hub.
@@ -4071,6 +4309,138 @@ mod tests {
 
         let changing = slots_the_request_changes(&policies_of(slots), &[Slot::Walk], Some(wanted));
         assert!(changing.is_empty());
+    }
+
+    /// **Adding the same skill twice retunes it rather than giving the robot two.**
+    #[test]
+    fn adding_a_skill_twice_replaces_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("robotd.toml");
+        std::fs::write(&config, "# kept\n[policy]\nmode = \"walk\"\n").unwrap();
+
+        let skill = |duration: f64| robotd_params::SkillDef {
+            name: "polite-bow".into(),
+            path: Some(PathBuf::from("/srv/bow.onnx")),
+            duration,
+            ..Default::default()
+        };
+        let mut model =
+            must(configure::Model::load(&config).map_err(|e| Failure::new(exit::FAILED, e)));
+        must(
+            model
+                .set_skill(&skill(4.0))
+                .map_err(|e| Failure::new(exit::FAILED, e)),
+        );
+        must(
+            model
+                .set_skill(&skill(6.0))
+                .map_err(|e| Failure::new(exit::FAILED, e)),
+        );
+
+        let written = std::fs::read_to_string(&config).unwrap();
+        assert_eq!(written.matches("[[policy.skill]]").count(), 1, "{written}");
+        assert!(written.contains("duration = 6.0"), "{written}");
+        assert!(written.contains("# kept"), "comments survive: {written}");
+    }
+
+    /// Only what differs from a plain zero-command one-shot is written — a file full of explicit
+    /// defaults is the unreadable thing this editor exists to avoid.
+    #[test]
+    fn a_plain_skill_writes_no_command_or_unwind() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("robotd.toml");
+        std::fs::write(&config, "[policy]\n").unwrap();
+
+        let mut model =
+            must(configure::Model::load(&config).map_err(|e| Failure::new(exit::FAILED, e)));
+        must(
+            model
+                .set_skill(&robotd_params::SkillDef {
+                    name: "polite-bow".into(),
+                    path: Some(PathBuf::from("/srv/bow.onnx")),
+                    duration: 4.0,
+                    ..Default::default()
+                })
+                .map_err(|e| Failure::new(exit::FAILED, e)),
+        );
+
+        let written = std::fs::read_to_string(&config).unwrap();
+        assert!(!written.contains("command"), "{written}");
+        assert!(!written.contains("unwind"), "{written}");
+        assert!(!written.contains("chain"), "{written}");
+    }
+
+    /// A policy that holds until told otherwise writes both halves, and what is written is
+    /// checked through the daemon's own loader — what this writes, robotd starts on.
+    #[test]
+    fn a_two_phase_skill_writes_both_halves() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("robotd.toml");
+        std::fs::write(&config, "[policy]\n").unwrap();
+
+        let mut model =
+            must(configure::Model::load(&config).map_err(|e| Failure::new(exit::FAILED, e)));
+        must(
+            model
+                .set_skill(&robotd_params::SkillDef {
+                    name: "flamingo".into(),
+                    path: Some(PathBuf::from("/srv/f.onnx")),
+                    duration: 5.0,
+                    command: [1.0, 1.0, 0.0],
+                    unwind: [0.0, 1.0, 0.0],
+                    unwind_s: 3.0,
+                    ..Default::default()
+                })
+                .map_err(|e| Failure::new(exit::FAILED, e)),
+        );
+
+        let parsed = robotd_params::Params::load(&config, true).expect("robotd would accept it");
+        let flamingo = parsed.policy.resolved().skills.pop().unwrap();
+        assert_eq!(flamingo.name, "flamingo");
+        assert_eq!(flamingo.command, [1.0, 1.0, 0.0]);
+        assert_eq!(flamingo.unwind_s, 3.0);
+    }
+
+    /// Removing says whether there was anything to remove, so a typo says so instead of looking
+    /// like success.
+    #[test]
+    fn removing_a_skill_says_whether_there_was_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("robotd.toml");
+        std::fs::write(&config, "[policy]\n").unwrap();
+
+        let mut model =
+            must(configure::Model::load(&config).map_err(|e| Failure::new(exit::FAILED, e)));
+        assert!(!must(
+            model
+                .remove_skill("nothing")
+                .map_err(|e| Failure::new(exit::FAILED, e))
+        ));
+
+        must(
+            model
+                .set_skill(&robotd_params::SkillDef {
+                    name: "polite-bow".into(),
+                    path: Some(PathBuf::from("/srv/bow.onnx")),
+                    duration: 4.0,
+                    ..Default::default()
+                })
+                .map_err(|e| Failure::new(exit::FAILED, e)),
+        );
+        assert!(must(
+            model
+                .remove_skill("polite-bow")
+                .map_err(|e| Failure::new(exit::FAILED, e))
+        ));
+    }
+
+    /// A twist is three numbers; anything else is a refusal rather than a partial parse, which
+    /// would silently leave a slot at zero.
+    #[test]
+    fn a_twist_needs_three_numbers() {
+        assert_eq!(must(twist_of("1, -1, 0")), [1.0, -1.0, 0.0]);
+        assert_eq!(twist_of("1,0").unwrap_err().code, exit::USAGE);
+        assert_eq!(twist_of("1,0,x").unwrap_err().code, exit::USAGE);
     }
 
     /// **A slot switched off must not read as a slot the robot does not have.**

@@ -614,6 +614,9 @@ pub struct PolicyManifest {
     pub name: Option<String>,
     pub description: Option<String>,
     pub kind: Option<String>,
+    /// Seconds the policy runs, for one that ends itself. The convention's field name.
+    pub duration_s: Option<f64>,
+    pub action_scale: Option<f64>,
     pub obs_len: Option<usize>,
     pub action_len: Option<usize>,
     pub model_api: Option<u32>,
@@ -838,6 +841,8 @@ pub async fn fetch(
         name: manifest.name,
         description: manifest.description,
         kind: manifest.kind,
+        duration_s: manifest.duration_s,
+        action_scale: manifest.action_scale,
     })
 }
 

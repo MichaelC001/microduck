@@ -152,6 +152,22 @@ anything needs one.
   `robotctl policy`; the registry learning about repeating tables is the largest single piece
   of this and is orthogonal to whether skills work.
 
+## Built
+
+`[[policy.skill]]` and `robotctl policy add` / `remove` / `do <name>`. A community one-shot is
+config: `robotctl policy add polite-bow fffiloni/microduck-polite-bow-b1d864` fetches it, takes
+the length from its manifest and writes the entry.
+
+One correction to the analysis above, from being told so. A policy whose manifest says
+`kind: perpetual` is not thereby unusable as a one-shot — pressing a button, lifting a foot for
+five seconds and putting it down is a one-shot interaction whatever the network's own lifetime
+is. What perpetual means operationally is *who supplies the ending*: `polite-bow` is standing
+again after its four seconds, so the window can simply expire, while flamingo holds until told
+otherwise and a bare expiry would hand walk a robot on one leg. So a skill declares `command`
+(the twist while it runs) and `unwind`/`unwind_s` (what it drives on the way back) — the daemon
+supplying the ending the policy does not have, which is the two-phase shape the sit toggle
+already uses on its way up.
+
 ## Open, and wanted before writing any of it
 
 - **Per-move parameter overrides.** A move may need a different `limp_fall_tilt_z` or

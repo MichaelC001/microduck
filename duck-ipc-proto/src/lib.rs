@@ -2026,7 +2026,7 @@ pub struct PolicyFetchParams {
 /// worth reading anyway, because a policy that says it is 51-D can be refused before the download
 /// rather than after the robot has been asked to run it — and a manifest that lies is caught by
 /// the shape gate at load, which is where the real check has always been.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PolicyFetchResult {
     /// Where it landed. This is what goes in `[policy] <slot>`.
@@ -2042,8 +2042,15 @@ pub struct PolicyFetchResult {
     pub name: Option<String>,
     /// One line about what it does, from the manifest. Untrusted display text.
     pub description: Option<String>,
-    /// The manifest's `kind` — `perpetual`, `episodic` and so on. Untrusted.
+    /// The manifest's `kind` — `episodic` for a policy that returns itself to a safe pose,
+    /// `perpetual` for one that holds until told otherwise. Untrusted, and what decides whether
+    /// the daemon has to supply an ending.
     pub kind: Option<String>,
+    /// How long the policy runs, from the manifest. Absent for a perpetual one, which has no
+    /// length of its own — a caller wanting it as a one-shot has to say how long to hold it.
+    pub duration_s: Option<f64>,
+    /// The manifest's `action_scale`, if it declared one.
+    pub action_scale: Option<f64>,
 }
 
 /// What to search the Hub for, for [`Call::PolicySearch`].

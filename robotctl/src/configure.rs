@@ -331,6 +331,98 @@ impl Model {
         doc.to_string()
     }
 
+    /// Add or replace one `[[policy.skill]]` entry, by name.
+    ///
+    /// Separate from [`Self::edit`] because a repeating table is not a key with a value: there
+    /// is no cursor position for it, and the editor lists it rather than editing it in place
+    /// (`registry::Kind::Table`). This is the writing half, and `robotctl policy` is what calls
+    /// it — the same document, the same atomic save, and the same validation through the
+    /// daemon's own loader, so the comments and everything else in the file survive.
+    ///
+    /// By name rather than by appending, so running the same command twice retunes a skill
+    /// instead of giving a robot two of it.
+    pub fn set_skill(&mut self, skill: &robotd_params::SkillDef) -> Result<(), String> {
+        let mut entry = toml_edit::Table::new();
+        entry["name"] = toml_edit::value(skill.name.clone());
+        if let Some(path) = &skill.path {
+            entry["path"] = toml_edit::value(path.display().to_string());
+        }
+        entry["duration"] = toml_edit::value(skill.duration);
+        if skill.chain {
+            entry["chain"] = toml_edit::value(true);
+        }
+        // Only what differs from a plain zero-command one-shot. A file full of explicit
+        // defaults is the unreadable thing this whole editor exists to avoid.
+        if skill.command != [0.0; 3] {
+            entry["command"] = toml_edit::value(array_of(skill.command));
+        }
+        if skill.unwind_s > 0.0 {
+            entry["unwind"] = toml_edit::value(array_of(skill.unwind));
+            entry["unwind_s"] = toml_edit::value(skill.unwind_s);
+        }
+
+        let mut overrides = toml_edit::Table::new();
+        for (key, value) in [
+            ("action_scale", skill.params.action_scale),
+            ("gain_ratio", skill.params.gain_ratio),
+            ("cmd_alpha", skill.params.cmd_alpha),
+            ("limp_fall_tilt_z", skill.params.limp_fall_tilt_z),
+        ] {
+            if let Some(value) = value {
+                overrides[key] = toml_edit::value(value);
+            }
+        }
+        if !overrides.is_empty() {
+            overrides.set_implicit(false);
+            entry["params"] = toml_edit::Item::Table(overrides);
+        }
+
+        let policy = self
+            .doc
+            .entry("policy")
+            .or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
+        let policy = policy
+            .as_table_mut()
+            .ok_or_else(|| "[policy] is not a table".to_owned())?;
+        let skills = policy
+            .entry("skill")
+            .or_insert(toml_edit::Item::ArrayOfTables(
+                toml_edit::ArrayOfTables::new(),
+            ));
+        let skills = skills
+            .as_array_of_tables_mut()
+            .ok_or_else(|| "[[policy.skill]] is not a table array".to_owned())?;
+
+        // By position, so the borrow ends before the push.
+        let existing = skills
+            .iter()
+            .position(|t| t.get("name").and_then(|n| n.as_str()) == Some(skill.name.as_str()));
+        match existing {
+            Some(at) => *skills.get_mut(at).expect("just found it") = entry,
+            None => skills.push(entry),
+        }
+        self.validate_and_write()
+    }
+
+    /// Remove a `[[policy.skill]]` entry by name. `false` if there was none.
+    pub fn remove_skill(&mut self, name: &str) -> Result<bool, String> {
+        let Some(skills) = self
+            .doc
+            .get_mut("policy")
+            .and_then(|p| p.as_table_mut())
+            .and_then(|p| p.get_mut("skill"))
+            .and_then(|s| s.as_array_of_tables_mut())
+        else {
+            return Ok(false);
+        };
+        let before = skills.len();
+        skills.retain(|t| t.get("name").and_then(|n| n.as_str()) != Some(name));
+        if skills.len() == before {
+            return Ok(false);
+        }
+        self.validate_and_write().map(|()| true)
+    }
+
     /// Validate the pending edits through the daemon's own gate, then write atomically.
     ///
     /// Validation goes through a real file and [`Params::load`] rather than a bare parse,
@@ -363,6 +455,39 @@ impl Model {
         self.pending.clear();
         Ok(())
     }
+
+    /// Write the document as it stands, through the same gate `save` uses.
+    ///
+    /// The skill writers change `doc` directly rather than queueing a keyed edit — a repeating
+    /// table has no key to queue — so they need `save`'s validation and atomic rename without
+    /// its pending-edit bookkeeping. Same loader, same temp-file-and-rename, same refusal to
+    /// write a file `robotd` would not start on.
+    fn validate_and_write(&mut self) -> Result<(), String> {
+        let text = self.doc.to_string();
+        let staged = self.path.with_extension("toml.new");
+        let write = |path: &Path| -> std::io::Result<()> {
+            let mut file = std::fs::File::create(path)?;
+            file.write_all(text.as_bytes())?;
+            file.sync_all()
+        };
+        write(&staged).map_err(|e| writable_hint(&staged, &e))?;
+        if let Err(e) = Params::load(&staged, true) {
+            let _ = std::fs::remove_file(&staged);
+            return Err(format!(
+                "refusing to write a config robotd would reject: {e}"
+            ));
+        }
+        std::fs::rename(&staged, &self.path).map_err(|e| writable_hint(&self.path, &e))
+    }
+}
+
+/// Three floats as a TOML array.
+fn array_of(values: [f64; 3]) -> toml_edit::Array {
+    let mut array = toml_edit::Array::new();
+    for value in values {
+        array.push(value);
+    }
+    array
 }
 
 /// A value as the UI shows it — the data alone. Strings lose their quotes, and everything
