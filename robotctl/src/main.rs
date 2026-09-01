@@ -85,6 +85,10 @@ struct Cli {
     #[arg(long, global = true, default_value = "/run/robotd.sock")]
     robot_socket: PathBuf,
 
+    /// Where the pad's button bindings live — the same file everything else is configured in.
+    #[arg(long, global = true, default_value = robotd_params::DEFAULT_PATH)]
+    pad_config: PathBuf,
+
     /// Path to the configd socket — wifi and the robot's identity.
     #[arg(long, global = true, default_value = proto::socket::CONFIG)]
     config_socket: PathBuf,
@@ -720,6 +724,30 @@ fn bar(fraction: f64) -> String {
 enum PadCommand {
     /// Which pads this robot is paired to, and whether `padd` is driving. Changes nothing.
     Status {
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// What each of the pad's one-shot buttons runs.
+    ///
+    /// Five are bindable: `a`, `x`, `lb`, `rb`, `dpad_down`. The rest are not skills — Start
+    /// toggles the policy, Y and B change what the sticks mean, held Select powers the robot
+    /// off — and the button that stops a robot is the one worth not being able to lose.
+    Bindings {
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Put a skill on a button.
+    ///
+    /// `robotctl pad bind a polite-bow`. The name is one of this robot's skills — `robotctl
+    /// policy list` names them — and an empty name switches the button off. `padd` reads the
+    /// binding at startup, so restart it, or unplug and replug the pad.
+    Bind {
+        /// `a`, `x`, `lb`, `rb` or `dpad_down`.
+        button: String,
+        /// A skill this robot has, or `""` to leave the button doing nothing.
+        skill: String,
         #[arg(long)]
         json: bool,
     },
@@ -3354,6 +3382,130 @@ fn render_policies(policies: &proto::PoliciesResult) -> String {
     out
 }
 
+/// `robotctl pad bindings` / `bind` — what each one-shot button runs.
+///
+/// The config half of the pad. Reads the same `robotd.toml` `padd` does, and writes it through
+/// the editor `configure` uses, so comments survive and nothing is written the daemon would
+/// refuse to start on.
+///
+/// The skill name is checked against what the robot actually reports rather than against a list
+/// compiled in here — the whole point of skills being config is that which ones exist is the
+/// robot's to know. A robot that cannot be reached is not a refusal: the binding is a config
+/// edit and is valid whether or not anything is running, and a warning says the name went
+/// unchecked.
+fn run_pad_bindings(
+    robot_socket: &Path,
+    config: &Path,
+    command: PadCommand,
+) -> Result<(), Failure> {
+    let bindings = configure::pad_bindings(config).map_err(|e| Failure::new(exit::FAILED, e))?;
+
+    if let PadCommand::Bindings { json } = command {
+        if json {
+            let map: std::collections::BTreeMap<&str, &str> = robotd_params::PadParams::BUTTONS
+                .iter()
+                .map(|b| (*b, bindings.skill(b).unwrap_or_default()))
+                .collect();
+            println!("{}", compact(&map));
+            return Ok(());
+        }
+        // What the robot has, so a binding naming something it does not can be marked rather
+        // than merely listed. Absent when the robot is down, which is not this command's problem.
+        let known = robot_skills(robot_socket);
+        for button in robotd_params::PadParams::BUTTONS {
+            let skill = bindings.skill(button).unwrap_or_default();
+            let note = match (&known, skill) {
+                (_, "") => "  (nothing)",
+                (Some(known), s) if !known.iter().any(|k| k == s) => {
+                    "  — this robot has no such skill"
+                }
+                _ => "",
+            };
+            println!("{button:10}  {skill}{note}");
+        }
+        if known.is_some() {
+            println!(
+                "\n`robotctl pad bind <button> <skill>` changes one; padd reads it at startup."
+            );
+        } else {
+            println!("\nrobotd is not answering, so the names above were not checked against it.");
+        }
+        return Ok(());
+    }
+
+    let PadCommand::Bind {
+        button,
+        skill,
+        json,
+    } = command
+    else {
+        unreachable!("only bindings and bind reach here");
+    };
+
+    if bindings.skill(&button).is_none() {
+        return Err(Failure::new(
+            exit::USAGE,
+            format!(
+                "no bindable button called {button:?}; expected one of {}",
+                robotd_params::PadParams::names()
+            ),
+        ));
+    }
+
+    // Checked against the robot, not against anything here. An unknown name would otherwise
+    // become a button that does nothing, discovered by pressing it.
+    if !skill.is_empty()
+        && let Some(known) = robot_skills(robot_socket)
+        && !known.contains(&skill)
+    {
+        return Err(Failure::new(
+            exit::USAGE,
+            format!(
+                "this robot has no skill called {skill:?} — it has {}",
+                if known.is_empty() {
+                    "none".to_owned()
+                } else {
+                    known.join(", ")
+                }
+            ),
+        ));
+    }
+
+    ensure_recordable(config)?;
+    configure::bind_pad(config, &button, &skill).map_err(|e| Failure::new(exit::FAILED, e))?;
+
+    if json {
+        println!(
+            "{}",
+            compact(&serde_json::json!({ "button": button, "skill": skill }))
+        );
+        return Ok(());
+    }
+    if skill.is_empty() {
+        println!("{button} does nothing now");
+    } else {
+        println!("{button} runs {skill}");
+    }
+    println!("  padd reads this at startup — `sudo systemctl restart padd`, or replug the pad");
+    Ok(())
+}
+
+/// The one-shot skills the robot says it has, or `None` if it is not answering.
+///
+/// From `robot.subscribe`'s acknowledgement, which is where a client learns what a robot can do
+/// now that the set is config rather than five compiled-in names.
+fn robot_skills(robot_socket: &Path) -> Option<Vec<String>> {
+    let mut client = Client::connect_to("robotd", robot_socket).ok()?;
+    client.hello().ok()?;
+    let result = client
+        .call(&proto::Call::RobotSubscribe(proto::SubscribeParams {
+            hz: Some(1),
+        }))
+        .ok()?;
+    let ack: proto::SubscribeResult = result.result_as().ok()?;
+    Some(ack.skills)
+}
+
 fn run_pad(socket: &Path, command: PadCommand) -> Result<(), Failure> {
     let mut client = Client::connect_to("configd", socket)?;
     client.hello()?;
@@ -3367,6 +3519,11 @@ fn run_pad(socket: &Path, command: PadCommand) -> Result<(), Failure> {
             }),
             *json,
         ),
+        // Both handled above, before the connection to `configd` this arm opens — they are
+        // config edits and a `robotd` question, and configd has nothing to do with either.
+        PadCommand::Bindings { .. } | PadCommand::Bind { .. } => {
+            unreachable!("bindings and bind returned before this point")
+        }
         PadCommand::Forget { mac, json } => (
             proto::Call::PadForget(proto::PadForgetParams { mac: mac.clone() }),
             *json,
@@ -3396,6 +3553,9 @@ fn run_pad(socket: &Path, command: PadCommand) -> Result<(), Failure> {
     match command {
         PadCommand::Status { .. } => println!("{}", render_pad_status(&result)?),
         PadCommand::Pair { .. } => return report_pair(&result),
+        PadCommand::Bindings { .. } | PadCommand::Bind { .. } => {
+            unreachable!("bindings and bind returned before this point")
+        }
         PadCommand::Forget { mac, .. } => {
             let forgotten: proto::PadForgetResult = decode(&result)?;
             if forgotten.removed {
@@ -3786,6 +3946,12 @@ fn run(cli: Cli) -> Result<(), Failure> {
             return run_system(&cli.config_socket, command);
         }
         Namespace::Pad { command } => {
+            if matches!(
+                command,
+                PadCommand::Bindings { .. } | PadCommand::Bind { .. }
+            ) {
+                return run_pad_bindings(&cli.robot_socket, &cli.pad_config, command);
+            }
             return run_pad(&cli.config_socket, command);
         }
         Namespace::Policy { command, file } => {

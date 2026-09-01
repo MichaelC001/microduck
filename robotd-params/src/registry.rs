@@ -402,6 +402,20 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Choice(crate::CONGESTION_LABELS),
         "Adapt the send rate to the link — disabled costs adaptivity and saves a core's worth",
     ),
+    // ── [pad] ────────────────────────────────────────────────────────────────
+    //
+    // Which button runs which skill. Read by `padd`, not by `robotd` — but it lives in the same
+    // file so `robotctl configure` stays the one editor a person has to know, and so a robot's
+    // whole configuration is one thing to back up and one thing to diff.
+    feature(
+        "pad.a",
+        Kind::Text,
+        "Skill on the A button — `robotctl policy list` names what this robot has",
+    ),
+    feature("pad.x", Kind::Text, "Skill on the X button"),
+    feature("pad.lb", Kind::Text, "Skill on the left bumper"),
+    feature("pad.rb", Kind::Text, "Skill on the right bumper"),
+    feature("pad.dpad_down", Kind::Text, "Skill on D-pad down"),
 ];
 
 /// The registry entry for a key, if it is one.
@@ -587,6 +601,13 @@ mod tests {
                 "audio.pet_detect",
                 "media.camera",
                 "media.quality",
+                // The five one-shot buttons. Front-page keys because "what does this button do"
+                // is a question somebody asks holding the pad, not while reading tuning docs.
+                "pad.a",
+                "pad.x",
+                "pad.lb",
+                "pad.rb",
+                "pad.dpad_down",
             ]
         );
     }

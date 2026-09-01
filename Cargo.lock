@@ -2830,6 +2830,7 @@ dependencies = [
  "evdev",
  "gilrs",
  "libc",
+ "robotd-params",
  "serde",
  "serde_json",
  "tracing",

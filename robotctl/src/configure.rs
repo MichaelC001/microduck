@@ -541,6 +541,10 @@ fn writable_hint(path: &Path, e: &std::io::Error) -> String {
 fn unit_for(section: &str) -> &'static str {
     match section {
         "media" | "detect" => "mediad",
+        // `padd` reads the bindings, and `robotd` never sees them. Offering a robotd restart for
+        // a button change would drop motor control — putting a standing robot on the floor — to
+        // apply a setting it does not read.
+        "pad" => "padd",
         _ => "robotd",
     }
 }
@@ -614,6 +618,35 @@ pub fn summary(model: &Model) -> Vec<String> {
             })
         })
         .collect()
+}
+
+/// The pad's button bindings as the daemon resolves them — config over the defaults.
+pub fn pad_bindings(path: &Path) -> Result<robotd_params::PadParams, String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+    };
+    toml::from_str::<Params>(&text)
+        .map(|params| params.pad)
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Put a skill on a button, or clear it.
+///
+/// Through the same document and the same validation every other edit uses, so comments survive
+/// and nothing lands that `robotd` would refuse to start on. A binding set to the default is
+/// *removed* rather than written out, keeping the file a list of decisions — which is also what
+/// makes `robotctl configure --list` mean something.
+pub fn bind_pad(path: &Path, button: &str, skill: &str) -> Result<(), String> {
+    let mut model = Model::load(path)?;
+    let key = format!("pad.{button}");
+    let entry = REGISTRY
+        .iter()
+        .find(|e| e.key == key)
+        .ok_or_else(|| format!("{key} is not a key robotd knows"))?;
+    model.edit(entry, skill)?;
+    model.save()
 }
 
 /// Print what this robot's config changes, and nothing else.
@@ -1534,7 +1567,64 @@ mod tests {
         let both = vec!["detect.hz".to_owned(), "audio.enabled".to_owned()];
         assert_eq!(units_to_restart(&both), vec!["robotd", "mediad"]);
 
+        // A button change restarts the daemon that reads it. Offering `robotd` here would drop
+        // motor control — a standing robot on the floor — to apply a setting it never sees.
+        let pad = vec!["pad.x".to_owned()];
+        assert_eq!(units_to_restart(&pad), vec!["padd"]);
+
         assert!(units_to_restart(&[]).is_empty());
+    }
+
+    /// **Binding a button writes one key and leaves the file alone otherwise.** It goes through
+    /// the same document every other edit uses, so a hand-written config keeps its comments.
+    #[test]
+    fn binding_a_button_writes_one_key_and_keeps_the_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("robotd.toml");
+        std::fs::write(&path, "# hand-written\n[policy]\nmode = \"walk\"\n").unwrap();
+
+        super::bind_pad(&path, "x", "polite-bow").unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("x = \"polite-bow\""), "{written}");
+        assert!(written.contains("# hand-written"), "{written}");
+        assert!(
+            !written.contains("lb ="),
+            "only the button asked for: {written}"
+        );
+
+        let bindings = super::pad_bindings(&path).unwrap();
+        assert_eq!(bindings.x, "polite-bow");
+        assert_eq!(
+            bindings.lb, "kick_left",
+            "the rest resolve to their defaults"
+        );
+    }
+
+    /// Binding a button back to its default *removes* the key rather than pinning it, so the
+    /// file stays a list of decisions — which is what makes `configure --list` mean anything.
+    #[test]
+    fn binding_the_default_removes_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("robotd.toml");
+        std::fs::write(&path, "[pad]\nx = \"polite-bow\"\n").unwrap();
+
+        super::bind_pad(&path, "x", "roulade").unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(!written.contains("polite-bow"), "{written}");
+        assert!(
+            !written.contains("x ="),
+            "the default is not pinned: {written}"
+        );
+        assert_eq!(super::pad_bindings(&path).unwrap().x, "roulade");
+    }
+
+    /// A robot with no config file at all still has bindings — the defaults — rather than an
+    /// error. `padd` may run before anything has ever been configured.
+    #[test]
+    fn a_missing_config_still_has_bindings() {
+        let dir = tempfile::tempdir().unwrap();
+        let bindings = super::pad_bindings(&dir.path().join("nothing.toml")).unwrap();
+        assert_eq!(bindings.a, "ground_pick");
     }
 
     /// Sections come out in registry order, once each — the editor's headers.
@@ -1553,7 +1643,10 @@ mod tests {
                 "chorale",
                 "theremin",
                 "audio",
-                "media"
+                "media",
+                // Last, and the editor shows sections in this order: the pad is what a robot's
+                // buttons do, which is the thing somebody browses for rather than tunes.
+                "pad"
             ]
         );
     }

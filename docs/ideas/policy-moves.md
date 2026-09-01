@@ -237,6 +237,9 @@ of them is retrained.
   inferences at startup. Lazy-loading on first trigger is not the answer, since opening a
   session is tens of milliseconds inside a 20 ms tick, so eager stays right and there is a
   practical ceiling.
-- **Binding a skill to a pad button** is the next thing after this and is deliberately not
-  part of it: it touches a working input path, and it is far easier to get right once there is
-  something real to bind.
+- ~~Binding a skill to a pad button~~ — built. `[pad]` in `robotd.toml`, five bindable buttons,
+  `robotctl pad bindings` / `bind`. `padd` gained `robotd-params` and reads the mapping at
+  startup; it still knows nothing about what a skill *is*, only that a button names one, and an
+  unknown name is answered by `robotd` with the list it does have. A `[pad]` change offers a
+  `padd` restart rather than a `robotd` one, because restarting the daemon that holds the robot
+  up to change what a button does would be a poor trade.

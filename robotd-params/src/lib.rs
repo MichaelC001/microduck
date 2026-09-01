@@ -62,6 +62,88 @@ pub struct Params {
     pub chorale: ChoraleParams,
     pub media: MediaParams,
     pub detect: DetectParams,
+    /// Which pad button runs which skill. `padd` reads this, not `robotd`.
+    pub pad: PadParams,
+}
+
+/// Which pad button runs which skill.
+///
+/// **The five one-shot buttons, and only those.** `Start` toggles the policy, `Y` and `B` switch
+/// what the sticks mean, held `Select` powers the robot off and held `D-pad up` changes drive
+/// mode — none of those is a `robot.do`, and turning them into a general button-to-action
+/// vocabulary is a larger thing than binding a skill needs. It would also put "the button that
+/// stops the robot" behind a config key, which is the one binding worth not being able to lose.
+///
+/// Empty means the mapping the prototype had and muscle memory expects. A named button is
+/// rebound; the rest stay as they were. The pad is full — every face button already does
+/// something — so binding a new skill nearly always means taking a button from an old one, which
+/// is why every one of the five is nameable rather than only the free ones.
+///
+/// A name here is not checked against anything at parse time: which skills exist is a property of
+/// the robot, and `padd` learns it from `robot.subscribe`. An unknown name is refused by `robotd`
+/// with the list it does know, which is a better error than a config file could give.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct PadParams {
+    /// A (South). The ground pick, by default.
+    pub a: String,
+    /// B (East) is body-pose mode and is not bindable; X (West) is the roulade.
+    pub x: String,
+    /// The left bumper — `LeftTrigger` in gilrs, which names the *analog* trigger
+    /// `LeftTrigger2`. Getting that backwards binds a skill to a control nobody presses.
+    pub lb: String,
+    /// The right bumper, likewise.
+    pub rb: String,
+    /// D-pad down. The sit toggle, by default.
+    pub dpad_down: String,
+}
+
+impl Default for PadParams {
+    fn default() -> Self {
+        Self {
+            a: "ground_pick".to_owned(),
+            x: "roulade".to_owned(),
+            lb: "kick_left".to_owned(),
+            rb: "kick_right".to_owned(),
+            dpad_down: "sit_toggle".to_owned(),
+        }
+    }
+}
+
+impl PadParams {
+    /// The bindable buttons, in the order a listing should print them.
+    pub const BUTTONS: [&'static str; 5] = ["a", "x", "lb", "rb", "dpad_down"];
+
+    /// What a button runs, or `None` for a name this build has no button for.
+    pub fn skill(&self, button: &str) -> Option<&str> {
+        Some(match button {
+            "a" => &self.a,
+            "x" => &self.x,
+            "lb" => &self.lb,
+            "rb" => &self.rb,
+            "dpad_down" => &self.dpad_down,
+            _ => return None,
+        })
+    }
+
+    /// Bind a button to a skill. `false` for a button this build does not have.
+    pub fn bind(&mut self, button: &str, skill: &str) -> bool {
+        let slot = match button {
+            "a" => &mut self.a,
+            "x" => &mut self.x,
+            "lb" => &mut self.lb,
+            "rb" => &mut self.rb,
+            "dpad_down" => &mut self.dpad_down,
+            _ => return false,
+        };
+        *slot = skill.to_owned();
+        true
+    }
+
+    /// Every button name, for the "expected one of" half of a refusal.
+    pub fn names() -> String {
+        Self::BUTTONS.join(", ")
+    }
 }
 
 /// The one video mode a robot streams in, as a name rather than four numbers.
@@ -1640,6 +1722,51 @@ mod tests {
                 .all(|p| p.kind.as_deref() != Some("episodic")),
             "nothing here is a skill, so builtin_skills keeps the three it knows"
         );
+    }
+
+    /// **A robot with no `[pad]` behaves exactly as it always has.** The mapping is the
+    /// prototype's and muscle memory depends on it, so the defaults are not a fresh choice.
+    #[test]
+    fn the_default_bindings_are_the_prototypes() {
+        let pad = super::PadParams::default();
+        assert_eq!(pad.a, "ground_pick");
+        assert_eq!(pad.x, "roulade");
+        assert_eq!(pad.lb, "kick_left");
+        assert_eq!(pad.rb, "kick_right");
+        assert_eq!(pad.dpad_down, "sit_toggle");
+    }
+
+    /// Binding one button leaves the rest alone — the file is a list of decisions, and rebinding
+    /// X must not silently take the kicks off the bumpers.
+    #[test]
+    fn binding_one_button_leaves_the_others() {
+        let params: super::Params =
+            toml::from_str("[pad]\nx = \"polite-bow\"\n").expect("a pad section");
+        assert_eq!(params.pad.x, "polite-bow");
+        assert_eq!(params.pad.lb, "kick_left", "untouched");
+        assert_eq!(params.pad.a, "ground_pick", "untouched");
+    }
+
+    /// An empty binding is a button switched off on purpose, which is different from a button
+    /// bound to something that does not exist — `padd` sends nothing rather than a bad name.
+    #[test]
+    fn an_empty_binding_is_a_button_switched_off() {
+        let params: super::Params = toml::from_str("[pad]\ndpad_down = \"\"\n").unwrap();
+        assert_eq!(params.pad.skill("dpad_down"), Some(""));
+        assert_eq!(params.pad.skill("nonsense"), None, "not a button at all");
+    }
+
+    /// Every bindable button must be reachable through the accessors, or `robotctl pad bind`
+    /// would refuse a button the config file happily accepts.
+    #[test]
+    fn every_listed_button_can_be_read_and_bound() {
+        let mut pad = super::PadParams::default();
+        for button in super::PadParams::BUTTONS {
+            assert!(pad.skill(button).is_some(), "{button} is not readable");
+            assert!(pad.bind(button, "polite-bow"), "{button} is not bindable");
+            assert_eq!(pad.skill(button), Some("polite-bow"));
+        }
+        assert!(!pad.bind("triangle", "x"), "and nothing else is");
     }
 
     /// **Absence resolves to the three a robot has always had.** A board updating onto this

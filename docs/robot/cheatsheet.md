@@ -212,6 +212,34 @@ name one — `--version v1` is how to go back. The robot returns to its home pos
 slot and drives again, and **a slot you loaded yourself is left alone**, because it points
 somewhere else entirely.
 
+#### Putting a skill on a button
+
+What each of the pad's one-shot buttons runs:
+
+```
+robotctl pad bindings
+```
+
+```
+sudo robotctl pad bind x polite-bow
+```
+
+Five are bindable — `a`, `x`, `lb`, `rb`, `dpad_down` — and the defaults are the mapping the
+prototype had, so a robot with no `[pad]` section behaves exactly as it always has. An empty
+name switches a button off. The rest of the pad is not bindable: Start toggles the policy, Y and
+B change what the sticks mean, and held Select powers the robot off — the button that stops a
+robot is the one worth not being able to lose to a config edit.
+
+The name is checked against what the robot actually has, so a typo is refused with the list
+rather than becoming a dead button. `padd` reads the binding at startup:
+
+```
+sudo systemctl restart padd
+```
+
+That is safe with the robot standing — `padd` holds no motor control, and `robotctl configure`
+offers exactly that restart rather than `robotd` for a `[pad]` change.
+
 #### Somebody else's gait
 
 Other people publish policies for this robot. What is out there:
