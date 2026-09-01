@@ -3042,13 +3042,32 @@ fn render_policies(policies: &proto::PoliciesResult) -> String {
         .max()
         .unwrap_or(4)
         .max(4);
-    let _ = writeln!(out, "\n{:width$}  {:8}  POLICY", "SLOT", "ORIGIN");
+    let _ = writeln!(out, "\n   {:width$}  {:9}  POLICY", "SLOT", "ORIGIN");
     for slot in &policies.slots {
-        let origin = slot.origin.as_deref().unwrap_or("-");
-        // An empty slot is a capability this robot does not have, not a fault. Roller mode has
-        // no standing network, and saying so beats a blank the reader has to interpret.
-        let what = slot.path.as_deref().unwrap_or("(none)");
-        let _ = writeln!(out, "{:width$}  {origin:8}  {what}", slot.slot);
+        // **A slot switched off and a slot the robot does not have look identical without this.**
+        // Both report no path — roller mode legitimately has no standing network — and the
+        // difference is that one of them is a decision somebody made. `overridden` is what
+        // carries it, and not printing it made a robot with six slots deliberately off read as a
+        // robot that simply had them empty. That cost an evening.
+        let (origin, what) = match (slot.path.as_deref(), slot.overridden) {
+            (Some(path), _) => (slot.origin.as_deref().unwrap_or("-"), path),
+            (None, true) => ("off", "switched off"),
+            (None, false) => ("-", "(none)"),
+        };
+        // A bullet on every row config has an opinion about, so "what have I changed" is
+        // answerable at a glance rather than by remembering.
+        let mark = if slot.overridden { "*" } else { " " };
+        let _ = writeln!(out, " {mark} {:width$}  {origin:9}  {what}", slot.slot);
+    }
+
+    let changed = policies.slots.iter().filter(|s| s.overridden).count();
+    if changed > 0 {
+        let plural = if changed == 1 { "slot" } else { "slots" };
+        let _ = writeln!(
+            out,
+            "\n* {changed} {plural} set by config rather than this robot's own — \
+             `sudo robotctl policy reset` returns them all."
+        );
     }
 
     let mut notes = policies
@@ -4073,6 +4092,79 @@ mod tests {
 
         let changing = slots_the_request_changes(&policies_of(slots), &[Slot::Walk], Some(wanted));
         assert!(changing.is_empty());
+    }
+
+    /// **A slot switched off must not read as a slot the robot does not have.**
+    ///
+    /// This is the bug that cost an evening: six slots were deliberately off to run a community
+    /// policy, and the listing showed them exactly as roller mode's absent standing network —
+    /// `-  (none)`. The robot was walking without a standing net and nothing on screen said so,
+    /// or said which slots a person had changed.
+    #[test]
+    fn a_switched_off_slot_reads_differently_from_an_absent_one() {
+        let mut off = slot_state(Slot::Stand, None, true);
+        off.origin = None;
+        let absent = slot_state(Slot::Roulade, None, false);
+        let rendered = render_policies(&policies_of(vec![off, absent]));
+
+        let stand = rendered
+            .lines()
+            .find(|l| l.contains("stand"))
+            .expect("a stand row");
+        assert!(stand.contains("switched off"), "{stand}");
+
+        let roulade = rendered
+            .lines()
+            .find(|l| l.contains("roulade"))
+            .expect("a roulade row");
+        assert!(roulade.contains("(none)"), "{roulade}");
+        assert!(
+            !roulade.contains("switched off"),
+            "a slot nobody touched is not off: {roulade}"
+        );
+    }
+
+    /// Every row config has an opinion about is marked, and the count says how to undo the lot.
+    /// "What have I changed" was previously answerable only by remembering.
+    #[test]
+    fn the_listing_marks_and_counts_what_config_changed() {
+        let rendered = render_policies(&policies_of(vec![
+            slot_state(Slot::Walk, Some("/home/pierre/mine.onnx"), true),
+            slot_state(
+                Slot::Stand,
+                Some("/opt/robot/policies/current/s.onnx"),
+                false,
+            ),
+        ]));
+
+        // By the path, not the slot name — `mode: walk` is a line containing "walk" too.
+        let row = |needle: &str| {
+            rendered
+                .lines()
+                .find(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("no row for {needle} in:\n{rendered}"))
+                .to_owned()
+        };
+        let walk = row("/home/pierre/mine.onnx");
+        assert!(walk.trim_start().starts_with('*'), "{walk}");
+        let stand = row("/opt/robot/policies/current/s.onnx");
+        assert!(!stand.trim_start().starts_with('*'), "{stand}");
+
+        assert!(rendered.contains("1 slot set by config"), "{rendered}");
+        assert!(rendered.contains("policy reset"), "{rendered}");
+    }
+
+    /// A robot running entirely its own policies says nothing about config at all — the footer is
+    /// for a robot somebody has changed, and on a stock one it would be noise.
+    #[test]
+    fn an_untouched_robot_gets_no_config_footer() {
+        let rendered = render_policies(&policies_of(
+            Slot::ALL
+                .into_iter()
+                .map(|slot| slot_state(slot, Some("/opt/robot/policies/current/x.onnx"), false))
+                .collect(),
+        ));
+        assert!(!rendered.contains("set by config"), "{rendered}");
     }
 
     /// A slot running its default because an override went missing has to say so where somebody

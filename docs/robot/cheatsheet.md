@@ -169,6 +169,9 @@ The robot returns to its home pose, loads it, and drives again. What is running:
 robotctl policy list
 ```
 
+A `*` marks every slot config has an opinion about, and a slot you switched off says
+`switched off` rather than looking like one this robot never had.
+
 Put one slot back:
 
 ```
