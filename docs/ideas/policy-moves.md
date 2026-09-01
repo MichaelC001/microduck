@@ -181,6 +181,47 @@ every one-shot was under a second — a kick is over before a fall could develop
 deciding rather than inheriting once a skill can be configured to hold for ten. It also means a
 per-skill fall-gate override would be decoration, which is why there is not one.
 
+## What a manifest has to say for a policy to be a skill
+
+Most of it is already the published convention. This is what the daemon *acts on*, and what a
+publisher has to get right for `robotctl policy add <name> <repo>` to work with no flags.
+
+| field | needed for | what happens without it |
+| --- | --- | --- |
+| `obs_len`, `action_len`, `model_api`, `robot.model` | every policy | already read; a mismatch is refused before the download |
+| `kind` | every skill | `"episodic"` or `"perpetual"` — the difference is who supplies the ending |
+| `duration_s` | an episodic skill | `policy add` refuses and asks for `--hold` |
+| `command.idle` | a perpetual skill | it unwinds to zeros, which for most policies is right and for some is not |
+| `unwind_s` | a perpetual skill | it hands back the instant the hold ends, mid-pose |
+| `action_scale` | optional | the gait's own scale is used |
+
+**`kind` is about who ends it, not about how long it runs.** `polite-bow` is episodic: four
+seconds later it is standing again, so the window can simply expire. Flamingo is perpetual: it
+holds until told otherwise, and something has to tell it. Both are one-shots to a person pressing
+a button.
+
+**A perpetual policy cannot declare its own `duration_s`**, because there is not one — how long
+to hold a foot up is the caller's choice. It declares how to *stop*, which is the part it knows.
+
+### The three published today
+
+- **`fffiloni/microduck-polite-bow-b1d864`** has no `manifest.json` at all. Its
+  `preview_metrics.json` carries `duration_s: 4.0` and `observation_dim`/`action_dim`, so the
+  information exists in a file nothing reads. It needs the manifest.
+- **`RemiFabre/microduck-flamingo-cycle`** has everything but one field, and that one exists
+  under a different roof: `eval.transition_time_s: 1.5` is the unwind, sitting in the block that
+  records how it was evaluated rather than in the contract the daemon reads. Promoting it to a
+  top-level `unwind_s` is the whole change; `command.idle` is already right.
+- **`HannesVonEssen/microduck-running`** is a gait rather than a skill and needs nothing.
+
+### The one still in code
+
+`roulade` is 1.0 s and the kicks are 0.5 s because `builtin_skills()` says so. That is the same
+coupling this exercise removed for *which file* a slot runs, still present for *how long* — a
+retrained roulade of a different length needs a daemon release, or a config line overriding it by
+name. Tolerable while the three are ours and change rarely, and worth revisiting the moment one
+of them is retrained.
+
 ## Open, and wanted before writing any of it
 
 - **Per-move parameter overrides.** A move may need a different `limp_fall_tilt_z` or

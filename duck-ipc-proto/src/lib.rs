@@ -2051,6 +2051,10 @@ pub struct PolicyFetchResult {
     pub duration_s: Option<f64>,
     /// The manifest's `action_scale`, if it declared one.
     pub action_scale: Option<f64>,
+    /// Seconds a perpetual policy needs to get back to its idle command, from the manifest.
+    pub unwind_s: Option<f64>,
+    /// The manifest's `command.idle` — the twist that means "stop", and what a skill unwinds to.
+    pub idle: Option<[f64; 3]>,
 }
 
 /// What to search the Hub for, for [`Call::PolicySearch`].

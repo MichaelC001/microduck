@@ -3034,8 +3034,8 @@ fn run_policy_skill(
                 exit::USAGE,
                 format!(
                     "{name} holds until it is told otherwise, so it has no length of its own — \
-                     say how long with `--hold`, and how long to come back with `--unwind`, or \
-                     the gait takes over mid-pose"
+                     say how long with `--hold`. How to come back it does declare, if its \
+                     manifest carries `command.idle` and `unwind_s`"
                 ),
             ));
         }
@@ -3057,12 +3057,20 @@ fn run_policy_skill(
             .map(twist_of)
             .transpose()?
             .unwrap_or_default(),
-        unwind: unwind_command
-            .as_deref()
-            .map(twist_of)
-            .transpose()?
-            .unwrap_or_default(),
-        unwind_s: unwind.unwrap_or(0.0),
+        // The manifest knows how to stop: `command.idle` is the twist that means "stop doing
+        // the thing", and `unwind_s` is how long the policy needs to get there. A flag on the
+        // command line wins, because a person watching the robot is a better judge than a
+        // number measured in simulation.
+        unwind: match unwind_command.as_deref() {
+            Some(spec) => twist_of(spec)?,
+            None => from_manifest
+                .as_ref()
+                .and_then(|m| m.idle)
+                .unwrap_or_default(),
+        },
+        unwind_s: unwind
+            .or_else(|| from_manifest.as_ref().and_then(|m| m.unwind_s))
+            .unwrap_or(0.0),
         params: robotd_params::SkillOverrides {
             action_scale: from_manifest.as_ref().and_then(|m| m.action_scale),
             ..Default::default()

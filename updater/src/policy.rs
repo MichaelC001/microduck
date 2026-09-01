@@ -617,10 +617,28 @@ pub struct PolicyManifest {
     /// Seconds the policy runs, for one that ends itself. The convention's field name.
     pub duration_s: Option<f64>,
     pub action_scale: Option<f64>,
+    /// Seconds the policy needs to get back to `command.idle` from wherever it holds.
+    ///
+    /// Only a perpetual policy has one — an episodic policy is already back by the time its
+    /// `duration_s` is up. It is what the daemon drives the idle command for before handing over
+    /// to the gait, so that a robot holding a foot in the air is not simply let go of.
+    pub unwind_s: Option<f64>,
+    pub command: Option<ManifestCommand>,
     pub obs_len: Option<usize>,
     pub action_len: Option<usize>,
     pub model_api: Option<u32>,
     pub robot: Option<ManifestRobot>,
+}
+
+/// The command block, as the published convention describes it.
+///
+/// `twist`, `head` and `body` are prose for a person — "flag: 0 = stand on two feet" — and are
+/// not read. `idle` is the one machine-readable part and the one that matters: it is the command
+/// that means "stop doing the thing", which is what a skill unwinds to.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct ManifestCommand {
+    pub idle: Option<[f64; 3]>,
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
@@ -843,6 +861,8 @@ pub async fn fetch(
         kind: manifest.kind,
         duration_s: manifest.duration_s,
         action_scale: manifest.action_scale,
+        unwind_s: manifest.unwind_s,
+        idle: manifest.command.and_then(|c| c.idle),
     })
 }
 
