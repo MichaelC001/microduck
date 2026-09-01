@@ -224,21 +224,25 @@ robotctl pad bindings
 sudo robotctl pad bind x polite-bow
 ```
 
-Five are bindable — `a`, `x`, `lb`, `rb`, `dpad_down` — and the defaults are the mapping the
-prototype had, so a robot with no `[pad]` section behaves exactly as it always has. An empty
-name switches a button off. The rest of the pad is not bindable: Start toggles the policy, Y and
-B change what the sticks mean, and held Select powers the robot off — the button that stops a
+Put it all back:
+
+```
+sudo robotctl pad reset
+```
+
+**Nothing needs restarting** — `padd` notices the change within a second.
+
+Five buttons are bindable: `a`, `x`, `lb`, `rb`, `dpad_down`. **`lb`/`rb` are the bumpers**, not
+the analog triggers, which are the mouth and the quack and are not bindable. An empty name
+switches a button off, and `pad reset <button>` puts one back.
+
+The defaults are the mapping the prototype had, so a robot with no `[pad]` section behaves
+exactly as it always has. The rest of the pad is not bindable either: Start toggles the policy, Y
+and B change what the sticks mean, and held Select powers the robot off — the button that stops a
 robot is the one worth not being able to lose to a config edit.
 
 The name is checked against what the robot actually has, so a typo is refused with the list
-rather than becoming a dead button. `padd` reads the binding at startup:
-
-```
-sudo systemctl restart padd
-```
-
-That is safe with the robot standing — `padd` holds no motor control, and `robotctl configure`
-offers exactly that restart rather than `robotd` for a `[pad]` change.
+rather than becoming a dead button.
 
 #### Somebody else's gait
 

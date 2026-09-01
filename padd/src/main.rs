@@ -80,7 +80,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
@@ -200,6 +200,43 @@ enum Mode {
     BodyPose,
 }
 
+/// How often to look for a rewritten config. See the loop.
+const BINDINGS_POLL: Duration = Duration::from_secs(1);
+
+/// The button bindings, or the mapping the prototype had.
+///
+/// A file that will not parse is never a reason to leave somebody without a pad: the defaults
+/// are a working robot, and the reason is logged. That matters more here than elsewhere because
+/// this is re-read while running — a half-saved file caught mid-write must not take the buttons
+/// away, and the next read a second later gets the finished one.
+fn read_bindings(path: &Path) -> robotd_params::PadParams {
+    match robotd_params::Params::load(path, false) {
+        Ok(params) => {
+            let pad = params.pad;
+            tracing::info!(
+                a = %pad.a, x = %pad.x, lb = %pad.lb, rb = %pad.rb,
+                dpad_down = %pad.dpad_down,
+                "button bindings"
+            );
+            pad
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                path = %path.display(),
+                "cannot read the button bindings; using the default mapping"
+            );
+            robotd_params::PadParams::default()
+        }
+    }
+}
+
+/// When the config was last written, for spotting a change. `None` for a file that is not there,
+/// which is a real state and compares equal to itself.
+fn config_mtime(path: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).ok()?.modified().ok()
+}
+
 fn main() -> std::process::ExitCode {
     let args = Args::parse();
     tracing_subscriber::fmt()
@@ -270,22 +307,12 @@ fn main() -> std::process::ExitCode {
     // The button bindings, read once like every other daemon reads its config. A file that will
     // not parse is not a reason to leave somebody without a pad: the mapping the prototype had is
     // the fallback, and the reason is logged.
-    let bindings = match robotd_params::Params::load(&args.config, false) {
-        Ok(params) => params.pad,
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                path = %args.config.display(),
-                "cannot read the button bindings; using the default mapping"
-            );
-            robotd_params::PadParams::default()
-        }
-    };
-    tracing::info!(
-        a = %bindings.a, x = %bindings.x, lb = %bindings.lb,
-        rb = %bindings.rb, dpad_down = %bindings.dpad_down,
-        "button bindings"
-    );
+    let mut bindings = read_bindings(&args.config);
+    // When the file was last written, so a change is picked up without a restart. `padd` holds
+    // no motor control and no session state — the whole of it is this table — so re-reading is a
+    // swap between two ticks rather than anything to sequence.
+    let mut bindings_at = config_mtime(&args.config);
+    let mut bindings_checked = Instant::now();
 
     let mut mode = Mode::Drive;
     // Whether a pad was there last tick, so appearing and disappearing are each logged once.
@@ -301,6 +328,19 @@ fn main() -> std::process::ExitCode {
 
     loop {
         let tick = Instant::now();
+
+        // Once a second, not every tick: a `stat` at 50 Hz to catch a file somebody edits by
+        // hand a few times a week is work for nothing, and a second is faster than typing the
+        // next command.
+        if tick.duration_since(bindings_checked) >= BINDINGS_POLL {
+            bindings_checked = tick;
+            let now = config_mtime(&args.config);
+            if now != bindings_at {
+                bindings_at = now;
+                bindings = read_bindings(&args.config);
+                tracing::warn!("button bindings reloaded");
+            }
+        }
 
         // Drain the queue so axis polling below sees present state, and catch button
         // *edges* — a held Start must toggle once, not fifty times a second.

@@ -1618,6 +1618,33 @@ mod tests {
         assert_eq!(super::pad_bindings(&path).unwrap().x, "roulade");
     }
 
+    /// **Resetting a button clears it back to the default and leaves the file clean.** The undo
+    /// for a session of trying skills has to actually undo, or `configure --list` keeps
+    /// reporting a robot as modified after it has been put back.
+    #[test]
+    fn resetting_bindings_leaves_nothing_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("robotd.toml");
+        std::fs::write(&path, "# hand-written\n[policy]\nmode = \"walk\"\n").unwrap();
+
+        super::bind_pad(&path, "x", "polite-bow").unwrap();
+        super::bind_pad(&path, "rb", "flamingo").unwrap();
+
+        let defaults = robotd_params::PadParams::default();
+        for button in robotd_params::PadParams::BUTTONS {
+            super::bind_pad(&path, button, defaults.skill(button).unwrap()).unwrap();
+        }
+
+        let model = super::Model::load(&path).unwrap();
+        assert!(
+            !model.rows().iter().any(|row| row.differs()),
+            "a reset robot reports as unmodified"
+        );
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(!written.contains("polite-bow"), "{written}");
+        assert!(written.contains("# hand-written"), "{written}");
+    }
+
     /// A robot with no config file at all still has bindings — the defaults — rather than an
     /// error. `padd` may run before anything has ever been configured.
     #[test]

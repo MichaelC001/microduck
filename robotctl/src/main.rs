@@ -741,13 +741,25 @@ enum PadCommand {
     /// Put a skill on a button.
     ///
     /// `robotctl pad bind a polite-bow`. The name is one of this robot's skills — `robotctl
-    /// policy list` names them — and an empty name switches the button off. `padd` reads the
-    /// binding at startup, so restart it, or unplug and replug the pad.
+    /// policy list` names them — and an empty name switches the button off. `padd` notices
+    /// within a second; nothing needs restarting.
     Bind {
-        /// `a`, `x`, `lb`, `rb` or `dpad_down`.
+        /// `a`, `x`, `lb` or `rb` — the *bumpers*, since the analog triggers are the mouth and
+        /// the quack — or `dpad_down`.
         button: String,
         /// A skill this robot has, or `""` to leave the button doing nothing.
         skill: String,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Put a button back to what it does on a robot nobody has configured. Omit the button
+    /// for all five.
+    ///
+    /// The undo for a session of trying skills, and the same shape as `robotctl policy reset`.
+    Reset {
+        /// Which button. Omit to reset all five.
+        button: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -3433,13 +3445,63 @@ fn run_pad_bindings(
         return Ok(());
     }
 
+    if let PadCommand::Reset { button, json } = command {
+        let buttons: Vec<&str> = match &button {
+            Some(name) if bindings.skill(name).is_none() => {
+                return Err(Failure::new(
+                    exit::USAGE,
+                    format!(
+                        "no bindable button called {name:?}; expected one of {}",
+                        robotd_params::PadParams::names()
+                    ),
+                ));
+            }
+            Some(name) => vec![name.as_str()],
+            None => robotd_params::PadParams::BUTTONS.to_vec(),
+        };
+
+        let defaults = robotd_params::PadParams::default();
+        // Only the ones that are not already the default, so "reset" on an untouched robot says
+        // so rather than reporting five changes it did not make.
+        let changing: Vec<&str> = buttons
+            .iter()
+            .copied()
+            .filter(|b| bindings.skill(b) != defaults.skill(b))
+            .collect();
+
+        if changing.is_empty() {
+            if json {
+                println!("{}", compact(&serde_json::json!({ "reset": [] })));
+            } else {
+                println!("already the default");
+            }
+            return Ok(());
+        }
+
+        ensure_recordable(config)?;
+        for name in &changing {
+            let default = defaults.skill(name).unwrap_or_default();
+            configure::bind_pad(config, name, default)
+                .map_err(|e| Failure::new(exit::FAILED, e))?;
+        }
+        if json {
+            println!("{}", compact(&serde_json::json!({ "reset": changing })));
+            return Ok(());
+        }
+        for name in &changing {
+            println!("{name} runs {}", defaults.skill(name).unwrap_or_default());
+        }
+        println!("  padd picks this up within a second");
+        return Ok(());
+    }
+
     let PadCommand::Bind {
         button,
         skill,
         json,
     } = command
     else {
-        unreachable!("only bindings and bind reach here");
+        unreachable!("only bindings, bind and reset reach here");
     };
 
     if bindings.skill(&button).is_none() {
@@ -3486,7 +3548,7 @@ fn run_pad_bindings(
     } else {
         println!("{button} runs {skill}");
     }
-    println!("  padd reads this at startup — `sudo systemctl restart padd`, or replug the pad");
+    println!("  padd picks this up within a second");
     Ok(())
 }
 
@@ -3521,8 +3583,8 @@ fn run_pad(socket: &Path, command: PadCommand) -> Result<(), Failure> {
         ),
         // Both handled above, before the connection to `configd` this arm opens — they are
         // config edits and a `robotd` question, and configd has nothing to do with either.
-        PadCommand::Bindings { .. } | PadCommand::Bind { .. } => {
-            unreachable!("bindings and bind returned before this point")
+        PadCommand::Bindings { .. } | PadCommand::Bind { .. } | PadCommand::Reset { .. } => {
+            unreachable!("bindings, bind and reset returned before this point")
         }
         PadCommand::Forget { mac, json } => (
             proto::Call::PadForget(proto::PadForgetParams { mac: mac.clone() }),
@@ -3553,8 +3615,8 @@ fn run_pad(socket: &Path, command: PadCommand) -> Result<(), Failure> {
     match command {
         PadCommand::Status { .. } => println!("{}", render_pad_status(&result)?),
         PadCommand::Pair { .. } => return report_pair(&result),
-        PadCommand::Bindings { .. } | PadCommand::Bind { .. } => {
-            unreachable!("bindings and bind returned before this point")
+        PadCommand::Bindings { .. } | PadCommand::Bind { .. } | PadCommand::Reset { .. } => {
+            unreachable!("bindings, bind and reset returned before this point")
         }
         PadCommand::Forget { mac, .. } => {
             let forgotten: proto::PadForgetResult = decode(&result)?;
@@ -3948,7 +4010,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
         Namespace::Pad { command } => {
             if matches!(
                 command,
-                PadCommand::Bindings { .. } | PadCommand::Bind { .. }
+                PadCommand::Bindings { .. } | PadCommand::Bind { .. } | PadCommand::Reset { .. }
             ) {
                 return run_pad_bindings(&cli.robot_socket, &cli.pad_config, command);
             }
