@@ -665,6 +665,20 @@ pub struct SkillDef {
 /// `smoothing = "off"`: one set of names for a person to learn, and `robotctl configure` already
 /// documents every one of them.
 ///
+/// **No fall-gate override here either, and for a sharper reason: a running skill already has
+/// the fall reflex switched off.** The limp-fall predictor is only consulted while the
+/// controller is not `busy()`, and any active skill makes it busy — so a move that leans past
+/// the gate cannot trip it, and a field to raise the gate would have been decoration. What that
+/// *does* mean is that the reflex is off for the whole of a skill, which was uncontroversial for
+/// a half-second kick and is worth a second look for anything long.
+///
+/// **No `cmd_alpha` here, and its absence is the point.** Smoothing is applied to the *client's*
+/// command on its way in, and a skill never reads that: the loop builds a fresh command block
+/// from `command` or `unwind` and feeds it straight to the network. So a skill's twist is
+/// unsmoothed by construction — which is exactly what a policy reading a flag rather than a
+/// velocity needs, and the reason driving one through `robot.move` into the walk slot needed
+/// `cmd_alpha = 1.0` set globally and remembered afterwards.
+///
 /// **A named set rather than "any key".** A skill that could widen a joint limit or lengthen the
 /// deadman would be reaching past the layer that makes a stranger's policy safe to try at all —
 /// which is the entire argument for allowing one on the robot. Everything here is tuning or a
@@ -679,18 +693,6 @@ pub struct SkillOverrides {
     /// Multiplier on the running gain, so a move can be softer or stiffer than the gait.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gain_ratio: Option<f64>,
-
-    /// `[control] cmd_alpha` while this runs. The one that matters for a policy reading a *flag*
-    /// rather than a velocity: smoothing turns a 0→1 step into a ramp through fractional values
-    /// no network was trained on.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cmd_alpha: Option<f64>,
-
-    /// `[safety] limp_fall_tilt_z` while this runs. A move that leans further than the gait does
-    /// otherwise reads as a fall in progress — the published flamingo policy holds at ~24°
-    /// against a gate set at ~26°.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub limp_fall_tilt_z: Option<f64>,
 }
 
 impl SkillDef {

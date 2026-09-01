@@ -179,6 +179,11 @@ pub struct Controller {
     previous: Option<[f64; NUM_JOINTS]>,
     /// Ground-pick phase, 0..[`GROUND_PICK_END_PHASE`]. `None` when inactive.
     ground_pick: Option<f64>,
+    /// **A running skill switches the fall reflex off**, because `busy()` is what gates the
+    /// limp-fall predictor and any active skill makes it true. That was uncontroversial when
+    /// every one-shot was under a second; a skill configured to hold for ten is a robot with no
+    /// fall reflex for ten seconds, which wants deciding rather than inheriting.
+    ///
     /// The one-shot skill driving right now: which one, and how long it has left.
     ///
     /// One field where there were three, because a kick and a roulade were the same thing

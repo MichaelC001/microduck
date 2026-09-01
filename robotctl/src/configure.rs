@@ -365,8 +365,6 @@ impl Model {
         for (key, value) in [
             ("action_scale", skill.params.action_scale),
             ("gain_ratio", skill.params.gain_ratio),
-            ("cmd_alpha", skill.params.cmd_alpha),
-            ("limp_fall_tilt_z", skill.params.limp_fall_tilt_z),
         ] {
             if let Some(value) = value {
                 overrides[key] = toml_edit::value(value);

@@ -168,6 +168,12 @@ otherwise and a bare expiry would hand walk a robot on one leg. So a skill decla
 supplying the ending the policy does not have, which is the two-phase shape the sit toggle
 already uses on its way up.
 
+**A running skill has no fall reflex.** The limp-fall predictor is only consulted while the
+controller is not `busy()`, and any active skill makes it busy. That was uncontroversial when
+every one-shot was under a second — a kick is over before a fall could develop — and it is worth
+deciding rather than inheriting once a skill can be configured to hold for ten. It also means a
+per-skill fall-gate override would be decoration, which is why there is not one.
+
 ## Open, and wanted before writing any of it
 
 - **Per-move parameter overrides.** A move may need a different `limp_fall_tilt_z` or
