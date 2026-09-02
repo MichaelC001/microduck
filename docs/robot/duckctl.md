@@ -384,6 +384,36 @@ reach the network on the robot's behalf and write to the eMMC, and are refused o
 — so `load` takes a path to a file already on the robot, never `org/repo`. Fetching one is
 `robotctl policy add` or `robotctl policy load` on the robot.
 
+## Which button runs which skill
+
+```bash
+duckctl pad bindings
+```
+
+```bash
+duckctl pad bind x polite-bow
+```
+
+```bash
+duckctl pad reset x
+```
+
+**Nothing restarts and nothing else is needed** — `padd` re-reads the file within a second. The
+name is checked against this robot's skills first, so a typo comes back as a refusal naming the
+real ones rather than becoming a button that does nothing when pressed.
+
+The listing marks two things a client cannot work out for itself: `overridden`, so somebody's
+changes are visible without knowing the defaults, and `error`, for a button bound to a skill this
+robot no longer has — the realistic way to get one of those is removing a skill, not mistyping.
+
+`""` switches a button off, which is a different wish from `pad reset` putting it back to what the
+robot ships with. Five buttons are bindable: `a`, `x`, `lb`, `rb`, `dpad_down` — and `lb`/`rb` are
+the **bumpers**, since the analog triggers are the mouth and the quack.
+
+Pairing a pad is a different namespace and a different daemon — `pad.pair` and `pad.forget` are
+`configd`'s, reached with `call`. These two are `robotd`'s, because checking a skill name needs
+the list of skills.
+
 ## Anything else — `call`
 
 ```bash

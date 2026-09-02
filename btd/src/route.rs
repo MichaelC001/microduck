@@ -271,6 +271,19 @@ fn permits(call: &proto::Call) -> bool {
         // path, arrived at here by accident rather than by decision. §15 has it as open.
         RobotLoadPolicy(_) => true,
 
+        // Which button runs which skill, and changing one. **This is the transport those exist
+        // for**: `robotctl pad bind` is for whoever is holding the robot, and a phone that can
+        // already ask for a skill is the obvious place to decide which button asks for it.
+        //
+        // `pad.bind` writes the config file, so unlike `robot.loadPolicy` above it *does*
+        // persist — `padd` re-reads `[pad]` every second and would otherwise revert it. So this
+        // is the durable one of the pair, which is another reason it belongs on the transport
+        // that is PIN-bonded rather than only on the one that is not.
+        //
+        // A name is checked against the skills this robot has before anything is written, so the
+        // failure mode is a refusal naming them rather than a button that does nothing.
+        PadBindings | PadBind(_) => true,
+
         // What each slot is running, and which skills this robot has. Read-only, and the read a
         // client makes before it can offer either of the two above: there is no compiled-in list
         // of skills to assume any more, so this is how a phone knows there is a bow to ask for.
@@ -558,6 +571,12 @@ mod tests {
                 path: Some("/opt/robot/policies/current/alpha_walking.onnx".to_owned()),
             }),
             proto::Call::RobotReloadPolicies,
+            // The pair `robotctl pad bind` had no wire surface for at all.
+            proto::Call::PadBindings,
+            proto::Call::PadBind(proto::PadBindParams {
+                button: "x".to_owned(),
+                skill: Some("polite-bow".to_owned()),
+            }),
         ];
         for call in expected {
             assert_eq!(

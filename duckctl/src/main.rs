@@ -850,6 +850,9 @@ enum Command {
     /// What each policy slot is running, and what to run instead.
     #[command(subcommand)]
     Policy(Policy),
+    /// Which pad button runs which skill.
+    #[command(subcommand)]
+    Pad(Pad),
     /// Reboot it.
     Reboot,
     /// Send any method, for whatever is not wrapped above.
@@ -857,6 +860,36 @@ enum Command {
         method: String,
         /// Parameters as JSON. Defaults to `{}`.
         params: Option<String>,
+    },
+}
+
+/// The binding half of `robotctl pad`, named the same way.
+///
+/// Pairing a gamepad is not here: `pad.pair` and `pad.forget` are `configd`'s and reached with
+/// `call`. These two are `robotd`'s, because checking a skill name needs the list of skills, and
+/// that is the daemon with it.
+#[derive(Subcommand)]
+enum Pad {
+    /// What each of the five one-shot buttons runs.
+    ///
+    /// `overridden` marks what somebody changed; `error` marks a button bound to a skill this
+    /// robot does not have, which is a button that will do nothing when pressed.
+    Bindings,
+    /// Put a skill on a button.
+    ///
+    /// Takes effect within a second — `padd` re-reads the file, and nothing restarts. The name is
+    /// checked against this robot's skills first, so a typo is refused with the real list rather
+    /// than becoming a dead button.
+    Bind {
+        /// `a`, `x`, `lb`, `rb` or `dpad_down` — the bumpers, not the analog triggers.
+        button: String,
+        /// A skill this robot has, or `""` to leave the button doing nothing.
+        skill: String,
+    },
+    /// Put a button back to what this robot ships with.
+    Reset {
+        /// Which button.
+        button: String,
     },
 }
 
@@ -1653,6 +1686,24 @@ fn request_line(command: &Command) -> Result<(String, Duration), Box<dyn std::er
             proto::method::ROBOT_LOAD_POLICY,
             serde_json::json!({ "slot": slot }),
             SLOW_REPLY_TIMEOUT,
+        ),
+        Command::Pad(Pad::Bindings) => (
+            proto::method::PAD_BINDINGS,
+            serde_json::json!({}),
+            REPLY_TIMEOUT,
+        ),
+        Command::Pad(Pad::Bind { button, skill }) => (
+            proto::method::PAD_BIND,
+            serde_json::json!({ "button": button, "skill": skill }),
+            REPLY_TIMEOUT,
+        ),
+        // No `skill` at all is the reset, the same shape `policy reset` uses against
+        // `robot.loadPolicy`: an empty string would mean "switched off", which is a different
+        // wish and has to stay spellable.
+        Command::Pad(Pad::Reset { button }) => (
+            proto::method::PAD_BIND,
+            serde_json::json!({ "button": button }),
+            REPLY_TIMEOUT,
         ),
         Command::Policy(Policy::Reload) => (
             proto::method::ROBOT_RELOAD_POLICIES,

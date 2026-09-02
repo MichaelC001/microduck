@@ -162,6 +162,24 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// [`code::METHOD_NOT_FOUND`] naming it, which is the designed skew behaviour rather than a
 /// handshake refusal.
 ///
+/// # v20 — `pad.bindings`, `pad.bind`
+///
+/// Which button runs which skill stops being a thing only somebody at a keyboard on the robot can
+/// change. `robotctl pad bind` edited the config file directly, so unlike every other command it
+/// had no wire surface at all and routing could not help.
+///
+/// **Two methods in `pad.*` that `configd` does not serve.** The rest of that namespace is about
+/// the radio and is `configd`'s; a binding is about what a button does to the robot, and checking
+/// a name needs the skill list, which only `robotd` has. Routing is per method throughout, so
+/// this costs nothing — `policy.*` and `robot.loadPolicy` already split one concept across two
+/// daemons the same way. An older `updaterd` or `configd` reached by mistake answers
+/// [`code::METHOD_NOT_FOUND`] naming it.
+///
+/// Additive as methods. `pad.bind` is the first call on either radio transport that **writes the
+/// config file**, and it has to be: `padd` re-reads `[pad]` every second, so a binding held in
+/// memory would be reverted before the caller let go of the phone. That also means it needs no
+/// reload and no restart.
+///
 /// # v19 — `robot.policies` carries the skills
 ///
 /// One field, and it is what makes any of this usable from something that is not `robotctl`:
@@ -199,7 +217,7 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// An older `robotd` answers either with [`code::METHOD_NOT_FOUND`] naming the method, which is
 /// the designed skew behaviour and not a handshake refusal. See
 /// `docs/design/policy-channel-design.md` §8.
-pub const API_VERSION: u32 = 19;
+pub const API_VERSION: u32 = 20;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -565,6 +583,8 @@ pub mod method {
     pub const PAD_PAIR: &str = "pad.pair";
     /// Forget a pad, so it stops reconnecting.
     pub const PAD_FORGET: &str = "pad.forget";
+    pub const PAD_BINDINGS: &str = "pad.bindings";
+    pub const PAD_BIND: &str = "pad.bind";
 
     /// Subscribe to the raw input stream of the pad `padd` is driving from.
     ///
@@ -785,6 +805,8 @@ pub enum Call {
     PadStatus,
     PadPair(PadPairParams),
     PadForget(PadForgetParams),
+    PadBindings,
+    PadBind(PadBindParams),
     /// Subscribe to the raw pad input stream. Answered by `padd`, not `configd`.
     PadInput,
     /// Subscribe to the ToF depth stream. Answered by `tofd`.
@@ -901,6 +923,8 @@ impl Call {
             Call::PadStatus => method::PAD_STATUS,
             Call::PadPair(_) => method::PAD_PAIR,
             Call::PadForget(_) => method::PAD_FORGET,
+            Call::PadBindings => method::PAD_BINDINGS,
+            Call::PadBind(_) => method::PAD_BIND,
             Call::PadInput => method::PAD_INPUT,
             Call::TofStream => method::TOF_STREAM,
         }
@@ -1037,6 +1061,18 @@ impl Call {
             | Call::SystemSetPairingPin(_)
             | Call::PadStatus
             | Call::PadForget(_) => (Config, Prompt),
+
+            // **The one place `pad.*` splits across two daemons.** Pairing is about the radio,
+            // which `configd` owns. A binding is about what a button does to the robot, and
+            // answering it needs two things only `robotd` has: the list of skills this robot
+            // actually has, so a name can be refused rather than becoming a dead button, and the
+            // config path it is already parsing. Its true sibling is `robot.loadPolicy`, not
+            // `pad.pair`.
+            //
+            // Routing is per method throughout this table — `policy.*` goes to `updaterd` while
+            // `robot.loadPolicy` goes to `robotd`, for the same concept — so this costs nothing
+            // mechanically. It is only worth a comment because the name suggests otherwise.
+            Call::PadBindings | Call::PadBind(_) => (Robot, Prompt),
             // Re-sweeps the radio rather than returning the last scan.
             Call::NetScan => (Config, Slow),
             // `configd` polls NetworkManager for up to 45 seconds before calling a join failed,
@@ -1122,6 +1158,7 @@ impl Call {
             Call::SystemAuthenticate(p) => encode(p),
             Call::PadPair(p) => encode(p),
             Call::PadForget(p) => encode(p),
+            Call::PadBind(p) => encode(p),
             Call::Status
             | Call::Subscribe
             | Call::RobotSafeToRestart
@@ -1143,6 +1180,7 @@ impl Call {
             | Call::SystemReboot
             | Call::SystemPairingPin
             | Call::PadStatus
+            | Call::PadBindings
             | Call::PadInput
             | Call::TofStream
             | Call::ChoraleSubscribe => Value::Object(serde_json::Map::new()),
@@ -1226,6 +1264,8 @@ impl Call {
                 Call::PadPair(decode(params.or(Some(&empty)))?)
             }
             method::PAD_FORGET => Call::PadForget(decode(params)?),
+            method::PAD_BINDINGS => Call::PadBindings,
+            method::PAD_BIND => Call::PadBind(decode(params)?),
             method::PAD_INPUT => Call::PadInput,
             method::TOF_STREAM => Call::TofStream,
             other => {
@@ -1387,6 +1427,11 @@ pub mod test_support {
             }),
             Call::PadForget(PadForgetParams {
                 mac: "78:86:2E:BB:13:28".into(),
+            }),
+            Call::PadBindings,
+            Call::PadBind(PadBindParams {
+                button: "x".into(),
+                skill: Some("polite-bow".into()),
             }),
             Call::PadInput,
             Call::TofStream,
@@ -3315,6 +3360,48 @@ pub enum PadPairResult {
     },
 }
 
+/// Parameters for [`Call::PadBind`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PadBindParams {
+    /// `"a"`, `"x"`, `"lb"`, `"rb"` or `"dpad_down"`. A string for the reason a slot is one: a
+    /// button this build does not have should be refused with the list of ones it does.
+    pub button: String,
+    /// Three states in one field, the same shape [`LoadPolicyParams`] uses for a path.
+    ///
+    /// - a name — run that skill;
+    /// - `""` — the button does nothing, switched off on purpose;
+    /// - absent — put it back to what this robot ships with.
+    ///
+    /// "Off" and "back to the default" are genuinely different wishes and a client needs both, so
+    /// neither can be spelled the way the other is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill: Option<String>,
+}
+
+/// Answer to [`Call::PadBindings`].
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct PadBindingsResult {
+    /// One entry per bindable button, in the order a listing should show them.
+    pub bindings: Vec<PadBinding>,
+}
+
+/// What one pad button runs.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct PadBinding {
+    pub button: String,
+    /// Empty means switched off, which is not the same as a button this robot cannot bind — those
+    /// are simply absent from the list.
+    pub skill: String,
+    /// Whether this differs from what the robot ships with, so a client can show what somebody
+    /// changed without knowing the defaults itself.
+    pub overridden: bool,
+    /// Set when the bound name is not a skill this robot has: a button that will do nothing when
+    /// pressed. Nothing else reports this, and pressing it is otherwise the only way to find out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// Answer to [`Call::PadForget`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PadForgetResult {
@@ -4215,7 +4302,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            53,
+            55,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }

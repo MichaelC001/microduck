@@ -601,6 +601,18 @@ Only those five. `Start`, the two stick-mode toggles, held `Select` and held `D-
 `robot.do` calls, and the button that powers a robot off is the one binding worth not being able
 to lose to a config edit.
 
+**Over the wire, `pad.bindings` and `pad.bind` are `robotd`'s**, not `configd`'s, which owns the
+rest of `pad.*`. Pairing is about the radio; a binding is about what a button does to the robot,
+and answering it needs the list of skills this robot has so a name can be refused rather than
+becoming a dead button. Routing is per method throughout — `policy.*` goes to `updaterd` while
+`robot.loadPolicy` goes to `robotd` for the same concept — so the split costs nothing mechanically
+and is only worth naming because the namespace suggests otherwise.
+
+A binding is checked against `do_names`, which is **not** `policy.skills`: `ground_pick` and
+`sit_toggle` have their own arm of the cascade rather than being config entries, so they are
+absent from that list while being perfectly good things to ask for. Validating against `skills`
+alone rejected two of the five buttons the pad ships bound to, which a test caught.
+
 `padd` still knows nothing about what a skill *is*. It reads which button went down, looks up the
 name beside it, and sends that name; `robotd` decides whether the robot has such a thing and
 answers with the list it does have when it does not. Checking belongs where the answer is, which
@@ -752,10 +764,15 @@ is a 50 Hz stream answering a question asked once, and BLE deliberately does not
   on the robot's behalf and writes to the eMMC, where loading points at a file already there.
   Over WebRTC, §4 of `remote-webrtc.md` means any LAN peer would inherit it.
 
-- **The pad bindings have no wire surface at all.** `robotctl pad bind` edits the config file
-  directly, so unlike everything else there is nothing for a phone to call and routing will not
-  help. Exposing them means new methods plus a decision about which daemon owns them: `configd`
-  owns config, `padd` is the reader, and `robotd` is the authority on which skills exist.
+- ~~The pad bindings have no wire surface at all~~ — `pad.bindings` and `pad.bind` are served
+  over both transports. `robotd` answers them, not `configd`, which owns the rest of `pad.*`:
+  checking a name against the skills this robot has is worth more than a tidy namespace, and
+  routing is per method throughout anyway. §10.3 has the detail.
+
+  `pad.bind` is the first call on either radio transport that **writes the config file**, and it
+  has to be — `padd` re-reads `[pad]` every second, so a binding held in memory would be reverted
+  before the caller let go of the phone. Which makes it, not `robot.loadPolicy`, the durable
+  remote change: worth remembering when §4 of `remote-webrtc.md` is revisited.
 
 - **A running skill has no fall reflex** for its whole duration (§10.2). Fine for a half-second
   kick; a skill configured to hold for ten seconds is ten seconds without one.

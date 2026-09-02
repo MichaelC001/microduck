@@ -120,6 +120,17 @@ fn permits(call: &proto::Call) -> bool {
         // `policy load`. A gait chosen here is gone at the next restart.
         RobotLoadPolicy(_) => true,
 
+        // Which button runs which skill, and changing one. A peer that can already ask for a
+        // skill has an obvious use for deciding which button asks for it, and the page showing
+        // the robot is a reasonable place to do that from.
+        //
+        // §4 applies as it does to everything else here, and with more weight than for
+        // `robot.loadPolicy`: this one writes the config file, because `padd` re-reads `[pad]`
+        // every second and a binding held in memory would be reverted. So a LAN peer changes
+        // something that outlives the session. Named rather than hidden; the answer is
+        // authorisation on this transport, not a smaller surface.
+        PadBindings | PadBind(_) => true,
+
         // Reading what each slot runs — and which skills this robot has, which is how a client
         // knows there is a bow to ask `robot.do` for. The same kind of question as the update
         // reads below, and a remote client watching a gait misbehave has an obvious use for it.
@@ -355,6 +366,11 @@ mod tests {
                 path: Some("/opt/robot/policies/current/alpha_walking.onnx".to_owned()),
             }),
             proto::Call::RobotReloadPolicies,
+            proto::Call::PadBindings,
+            proto::Call::PadBind(proto::PadBindParams {
+                button: "x".to_owned(),
+                skill: Some("polite-bow".to_owned()),
+            }),
         ] {
             assert!(
                 matches!(route_for(&call), Route::To(..)),

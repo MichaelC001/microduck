@@ -736,11 +736,16 @@ impl Server {
             // working.
             | Call::PadStatus
             | Call::PadPair(_)
-            | Call::PadForget(_) => Response::err(
+            | Call::PadForget(_)
+            // The two exceptions in that namespace go to `robotd` rather than `configd` — a
+            // binding needs the skill list to check a name against — but from here the answer is
+            // the same either way: not this daemon.
+            | Call::PadBindings
+            | Call::PadBind(_) => Response::err(
                 Some(id),
                 proto::Error::new(
                     proto::code::METHOD_NOT_FOUND,
-                    "net.*, system.* and pad.* are served by configd, not updaterd",
+                    "net.*, system.* and pad.* are served by configd and robotd, not updaterd",
                 ),
             ),
 
