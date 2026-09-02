@@ -21,11 +21,11 @@
 //!   process owns, and a client comes back to [`Account::status`]. A login that reported success
 //!   by holding the connection open would work from a laptop and fail from the device it is for:
 //!   a phone that opens a browser backgrounds itself, and iOS tears the GATT link down.
-//! - **The client displays the code and must not open a browser by itself.** HF sends no
-//!   `verification_uri_complete`, and its device page asks the user to type the code — the mini's
-//!   app found that auto-switching to Safari hid the code before anyone could read it. We
-//!   synthesise the `?user_code=` variant the way `huggingface_hub` does, for a client that wants
-//!   a "copy and open" button, and lead with the code.
+//! - **The client displays the code, and the code has to be typed.** HF sends no
+//!   `verification_uri_complete` and its device page prefills nothing, so no URL carries the code
+//!   — which makes showing it the client's whole job. Whether a client also *opens* the page
+//!   depends on what it is: `remote-access-design.md` §2.1 has three answers, for a robot, a
+//!   terminal and a phone.
 //! - **A token expires in 30 days and its refresh token rotates.** So [`maintain`] renews well
 //!   before expiry, and the store is written atomically — see [`Store::save`] for the one window
 //!   that cannot be closed.
@@ -321,16 +321,23 @@ pub async fn request_device_code(
         ))
     })?;
 
-    // HF sends neither `interval` nor `verification_uri_complete`, so both are synthesised here
-    // — the same normalisation `huggingface_hub` does, in the same place, so nothing downstream
-    // has to know which fields a server bothered with.
-    let verification_uri_complete = raw.verification_uri_complete.unwrap_or_else(|| {
-        format!(
-            "{}?user_code={}",
-            raw.verification_uri,
-            urlencode(&raw.user_code)
-        )
-    });
+    // HF sends neither `interval` nor `verification_uri_complete`, so both are defaulted here —
+    // the same normalisation `huggingface_hub` does, in the same place, so nothing downstream has
+    // to know which fields a server bothered with.
+    //
+    // **The fallback is the plain URI, and the code still has to be typed.** An earlier version
+    // of this appended `?user_code=`, on the strength of a claim in `reachy_mini`'s setup notes
+    // that `huggingface_hub` synthesises that form. It does not — it falls back to
+    // `verification_uri` unchanged — and Hugging Face's device page ignores the parameter: it
+    // survives the login redirect and prefills nothing, which was confirmed in a browser. A URL
+    // carrying a query the other end drops is worse than no query, because it reads like a
+    // promise the page then breaks.
+    //
+    // The field stays because it is the protocol's, and a server that starts sending a real one
+    // is then used without a change here.
+    let verification_uri_complete = raw
+        .verification_uri_complete
+        .unwrap_or_else(|| raw.verification_uri.clone());
     Ok(DeviceCode {
         device_code: raw.device_code,
         user_code: raw.user_code,
@@ -739,21 +746,6 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
-/// Percent-encode the few characters a user code could contain that a query string cares about.
-///
-/// HF's codes are `ABCD-1234`, so this is defensive rather than load-bearing — and small enough
-/// that it is not worth a dependency for.
-fn urlencode(s: &str) -> String {
-    s.bytes()
-        .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                (b as char).to_string()
-            }
-            other => format!("%{other:02X}"),
-        })
-        .collect()
-}
-
 /// Write via a temp file and rename, with the temp file created `0600` from the start.
 ///
 /// `fsutil::write_atomic` is the same dance without the mode, and this cannot use it: a token
@@ -947,9 +939,9 @@ mod tests {
             "RFC 8628's fallback, because HF sends no interval"
         );
         assert_eq!(
-            code.verification_uri_complete, "https://hf.co/oauth/device?user_code=A6MY-0314",
-            "the `?user_code=` variant huggingface_hub synthesises, for a client that offers a \
-             single copy-and-open button"
+            code.verification_uri_complete, "https://hf.co/oauth/device",
+            "the plain URI when the server sends none — HF's device page ignores a `?user_code=` \
+             query, so inventing one would promise a prefill that does not happen"
         );
     }
 
@@ -1035,13 +1027,6 @@ mod tests {
             })
             .unwrap();
         assert!(!account.refresh_if_due().await.unwrap());
-    }
-
-    /// Percent-encoding, which only matters if HF ever changes what a user code looks like.
-    #[test]
-    fn a_user_code_is_safe_in_a_query_string() {
-        assert_eq!(urlencode("A6MY-0314"), "A6MY-0314");
-        assert_eq!(urlencode("a b&c"), "a%20b%26c");
     }
 
     /// A one-route stand-in for huggingface.co.

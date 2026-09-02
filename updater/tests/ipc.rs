@@ -1178,7 +1178,7 @@ impl FakeHub {
             .route(
                 "/oauth/device",
                 // Hugging Face sends no `verification_uri_complete`, so this does not either —
-                // synthesising it is part of what these tests cover. It *does* send an
+                // what falls out of that is part of what these tests cover. It *does* send an
                 // `interval` HF omits, and only to keep the suite quick: the robot sleeps one
                 // interval before its first poll, so the real five seconds would make every
                 // login test five seconds long. That HF's omission falls back to five is pinned
@@ -1279,8 +1279,9 @@ async fn a_device_code_login_completes_without_the_client_waiting() {
     assert_eq!(result["user_code"], "A6MY-0314");
     assert_eq!(result["verification_uri"], "https://hf.co/oauth/device");
     assert_eq!(
-        result["verification_uri_complete"], "https://hf.co/oauth/device?user_code=A6MY-0314",
-        "synthesised, because Hugging Face sends none"
+        result["verification_uri_complete"], "https://hf.co/oauth/device",
+        "the plain URI, because Hugging Face sends no complete one and its device page ignores a \
+         `?user_code=` query — so no URL carries the code and a client has to show it"
     );
     assert_eq!(
         result["interval"], 1,

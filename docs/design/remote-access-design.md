@@ -100,9 +100,13 @@ which were learned the expensive way:
     an error replacing it.
   - A phone app keeps the mini's rule as written, for the mini's reason.
 
-  What makes opening worth anything is `verification_uri_complete`: HF sends none, so the robot
-  synthesises the `?user_code=` form, and Hugging Face preserves that parameter across its own
-  login redirect — so the code is filled in even for a browser that was not signed in yet.
+  **What opening buys is the navigation, not the typing.** An earlier version of this section
+  claimed the robot could hand over a URL with the code in it, on the strength of a note in the
+  mini's setup docs saying `huggingface_hub` synthesises a `?user_code=` form. It does not — it
+  falls back to `verification_uri` unchanged — and HF's device page ignores the parameter, which a
+  browser confirmed after this shipped. `verification_uri_complete` is therefore the plain page
+  today, and stays in the reply only because a server that starts sending a real one is then used
+  without a wire change.
 - **The client going away mid-flow is expected, not an error.** Opening the HF page backgrounds a
   phone app, and iOS then tears the GATT link down. By that point the transport has done its job:
   the daemon is polling and the client comes back to `status`. This is why `login` answers with a
@@ -137,11 +141,11 @@ GET  https://huggingface.co/oauth/userinfo   Authorization: Bearer <access token
 No `scope` is sent, because the first-party client does not take one (§2.4). Five things this
 answers, each of which is a decision nobody has to make now:
 
-- **No `verification_uri_complete`.** There is no URL carrying the code, so the code has to be
-  *read by a person* — which makes displaying it the **client's** job, not the daemon's. The
-  `?user_code=` variant is synthesised on the robot the way `huggingface_hub` does it, for a
-  client that wants one copy-and-open button, and §2.1's first invariant says lead with the code
-  anyway.
+- **No `verification_uri_complete`, and no way to synthesise one.** There is no URL that carries
+  the code — HF's device page ignores `?user_code=` — so the code has to be *read by a person*,
+  which makes displaying it the **client's** job rather than the daemon's. The field is passed
+  through as the plain `verification_uri` so that a server which later sends a real one needs no
+  change here.
 - **No `interval`.** RFC 8628's five seconds applies, and `slow_down` adds five more.
 - **`expires_in: 300`** on the *code*. Five minutes: long enough not to hurry, short enough that a
   client should show what is left, which is why `account.status` counts it down rather than

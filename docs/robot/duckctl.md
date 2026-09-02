@@ -339,9 +339,10 @@ a reply, so it ends with Ctrl-C.
 duckctl account login
 ```
 
-Prints a code and opens <https://hf.co/oauth/device> with it already filled in. **The robot does
-the waiting**, so this tool disconnects as soon as it has printed the code — approve it in the
-browser it opened, or from any other device, then:
+Prints a code and opens <https://hf.co/oauth/device>, where you type it — Hugging Face's device
+page does not accept a code in the URL, so opening saves the navigation and not the typing. **The
+robot does the waiting**, so this tool disconnects as soon as it has printed the code — approve it
+in the browser it opened, or from any other device, then:
 
 ```
 duckctl account status
