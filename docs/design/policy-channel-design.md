@@ -713,10 +713,18 @@ standing up, because the peer is looking at the thing the gait is about to move.
 
 The asymmetry worth remembering is the other way round from the intuition. **BLE is
 authenticated; WebRTC is not** — §4 of `remote-webrtc.md` means any LAN peer inherits whatever is
-opened. And `robot.loadPolicy` *persists*: unlike `robot.move`, the choice is written to
-`robotd.toml` and is still there after a reboot. So the call with the longest-lived effect is the
-one whose exposure differs most between the two transports. That is a reason to sharpen §4, not a
-reason to withhold the call from the transport that can show somebody the result.
+opened, where BLE carries the same call from a PIN-bonded caller within ten metres. That is a
+reason to sharpen §4, not a reason to withhold the call from the transport that can show somebody
+the result.
+
+**What limits the damage either way is that `robot.loadPolicy` does not persist.** §3 above
+describes the persistence model as a property of `policy load` — the *command* — and that is
+exactly right: `robotctl` writes `robotd.toml` and then calls the method. The method itself
+mutates `robotd`'s in-memory params and reloads. So a gait chosen from a phone is gone at the
+next restart or `robot.reloadPolicies`, which is the ephemeral "try it until reboot" mode §3
+considered and **rejected** — arrived at here by accident rather than by decision. §15 has it as
+open, because remote and local answering differently to the same words is a trap however the
+question is settled.
 
 **`robot.policies` carries the skill list**, and that is the piece that makes the rest usable. A
 client cannot offer a bow without knowing the robot has one, and which skills exist is config now
@@ -724,6 +732,19 @@ client cannot offer a bow without knowing the robot has one, and which skills ex
 is a 50 Hz stream answering a question asked once, and BLE deliberately does not route it.
 
 ## 15. Open
+
+- **`robot.loadPolicy` does not persist, and `policy load` does.** Same words, different
+  durability: the command writes `robotd.toml` and the method does not, so a gait chosen from a
+  phone is gone at the next restart. §3 rejected an ephemeral mode deliberately and this is one
+  arrived at by accident. Either the method should write the file — which makes the wire the
+  single path and removes `robotctl`'s duplicate half — or remote should say plainly that it is
+  a trial. The first is more work and more consistent; the second is a defensible thing for a
+  phone to do, but only if it is said.
+
+  It also decides where the **pad bindings** can live, below: `padd` re-reads `[pad]` every
+  second, so a `pad.bind` that did not write the file would be reverted within a second. There
+  is no live-only option there, which means whichever daemon serves it needs the lossless writer
+  that today only `robotctl` has.
 
 - **Installing from the Hub is still local-only.** `policy.check`, `policy.install`,
   `policy.fetch` and `policy.search` are refused on both transports. Not for blast radius —

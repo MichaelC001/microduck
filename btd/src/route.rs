@@ -263,9 +263,12 @@ fn permits(call: &proto::Call) -> bool {
         // controller that was running, so the failure mode is "nothing happened", not "gaitless
         // robot on the floor".
         //
-        // It is a *persistent* change, unlike everything else opened here — the choice is written
-        // to `robotd.toml` and survives a reboot — which is precisely why it wants the
-        // authenticated transport rather than the open one.
+        // **This method does not persist**, and that is worth knowing before relying on it.
+        // `robotd` mutates its own in-memory params and reloads; writing `robotd.toml` is
+        // `robotctl`'s half of `policy load`, not the daemon's. So a gait chosen from a phone is
+        // gone at the next restart or `robot.reloadPolicies` — which is the ephemeral "try it
+        // until reboot" mode `policy-channel-design.md` §3 considered and rejected for the local
+        // path, arrived at here by accident rather than by decision. §15 has it as open.
         RobotLoadPolicy(_) => true,
 
         // What each slot is running, and which skills this robot has. Read-only, and the read a

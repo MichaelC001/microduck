@@ -110,13 +110,14 @@ fn permits(call: &proto::Call) -> bool {
         // thing the gait is about to move. A load that fails keeps the running controller, so the
         // failure mode is "nothing happened".
         //
-        // The honest caveat is §4, and it is sharper here than for anything else opened on this
-        // transport: there is no authorisation, so any LAN peer inherits this, and unlike
-        // `robot.move` the effect *persists* — the choice is written to `robotd.toml` and is
-        // still there after a reboot. BLE, which is PIN-bonded, carries the same call with a
-        // caller who is at least known and within ten metres. That difference is worth
-        // remembering when §4 is revisited; it is not a reason to withhold the call from the
-        // transport that can actually show somebody the result.
+        // The honest caveat is §4: there is no authorisation on this transport, so any LAN peer
+        // inherits this, where BLE carries the same call with a caller who is PIN-bonded and
+        // within ten metres. Worth remembering when §4 is revisited; not a reason to withhold
+        // the call from the transport that can actually show somebody the result.
+        //
+        // What limits the damage either way is that the method does not persist: `robotd` changes
+        // its in-memory params and reloads, and writing the file is `robotctl`'s half of
+        // `policy load`. A gait chosen here is gone at the next restart.
         RobotLoadPolicy(_) => true,
 
         // Reading what each slot runs — and which skills this robot has, which is how a client
