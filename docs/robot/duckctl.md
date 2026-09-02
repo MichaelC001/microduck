@@ -122,8 +122,9 @@ is a robot with a console.
 
 What is on it: the camera with the link's bitrate, frame rate, loss and round trip beside it; two
 pads and the keys `W`/`A`/`S`/`D` and `Q`/`E` to drive, at a gamepad's 0.3 m/s and 1.5 rad/s; a drag
-on the picture to look at a point; enable, init, relax, stop and shutdown; the skills and the voice
-bank as menus; and the state stream at 2 Hz beside `robot.health`, which is where a hot servo, a flat
+on the picture to look at a point; enable, init, relax, stop and shutdown; the voice bank as a
+menu and **the skills as a menu the robot fills** — which skills a robot has is config, so the
+page asks `robot.policies` rather than offering a list it guessed; and the state stream at 2 Hz beside `robot.health`, which is where a hot servo, a flat
 pack or a loop running slow gets named.
 
 `stop` zeroes the intents the page is sending. **It is not an emergency stop** — nothing in this
