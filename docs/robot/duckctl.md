@@ -332,6 +332,57 @@ duckctl --name <robot-name> update watch
 It prints where the update in flight has got to and then everything that follows. It never receives
 a reply, so it ends with Ctrl-C.
 
+## Policies and skills
+
+What each slot runs, and which skills this robot has:
+
+```bash
+duckctl policy list
+```
+
+The `skills` array is the answer to "what can this robot be asked for". They are config, so it
+differs between robots and there is no list to assume — read it before offering a button.
+
+Run one:
+
+```bash
+duckctl do roulade
+```
+
+**The robot has to be driving.** Press Start on the pad first, or it answers saying so. It needs
+no pad *input* though: the deadman zeroes the twist by itself, so a robot nobody is steering
+stands still and does the thing.
+
+Change what it walks with, live:
+
+```bash
+duckctl policy load walk /opt/robot/policies/current/alpha_walking.onnx
+```
+
+Put that slot back:
+
+```bash
+duckctl policy reset walk
+```
+
+One slot at a time, because the wire call takes one — resetting all seven is
+`robotctl policy reset` on the robot. The path is on the *robot*, and must be absolute.
+
+Re-read every slot from the config file, for when something else changed it:
+
+```bash
+duckctl policy reload
+```
+
+The robot goes to its home pose with torque on, loads, and drives again — a few seconds, and the
+timeout allows for it. A file that is not `obs[1,61] -> actions[1,14]` is refused before anything
+changes, and a load that fails anyway keeps the policy that was running.
+
+**Installing from the Hub is not here.** `policy.check`, `policy.install` and `policy.search`
+reach the network on the robot's behalf and write to the eMMC, and are refused on this transport
+— so `load` takes a path to a file already on the robot, never `org/repo`. Fetching one is
+`robotctl policy add` or `robotctl policy load` on the robot.
+
 ## Anything else — `call`
 
 ```bash
@@ -380,10 +431,15 @@ watching, and `update status` afterwards says how it went.
 
 ## What is refused
 
-Motor control (`robot.move`, `robot.head`, `robot.enable`, `robot.stop`, `robot.init`,
-`robot.relax`), high-rate telemetry (`robot.subscribe`), the two update commands a person has to
-mean (`update.pin`, `update.resetToGolden`) and the pairing PIN (`system.pairingPin`,
-`system.setPairingPin`) are refused by `btd` itself and never reach a daemon. They come back as
+Teleop (`robot.move`, `robot.head`, `robot.enable`, `robot.stop`, `robot.init`, `robot.relax`),
+high-rate telemetry (`robot.subscribe`), reaching the Hub (`policy.check`, `policy.install`,
+`policy.search`), the two update commands a person has to mean (`update.pin`,
+`update.resetToGolden`) and the pairing PIN (`system.pairingPin`, `system.setPairingPin`) are
+refused by `btd` itself and never reach a daemon.
+
+`robot.do` is **not** in that list, though it moves the robot: teleop is a stream of fifty small
+updates a second, which is what a 20-byte notification budget cannot carry, and a skill is one
+request. They come back as
 error code 14, "not available over Bluetooth".
 
 That is a security boundary rather than a missing feature, and each refusal has its reason next

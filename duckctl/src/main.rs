@@ -835,6 +835,21 @@ enum Command {
         #[arg(value_name = "NEW_NAME")]
         name: String,
     },
+    /// Run a one-shot skill — a kick, the roulade, a bow.
+    ///
+    /// `robotctl robot do` on the robot. The robot has to be driving: press Start on the pad
+    /// first, or it answers saying so. It needs no pad *input* though — the deadman zeroes the
+    /// twist by itself, so a robot nobody is steering stands still and does the thing.
+    ///
+    /// `duckctl policy list` names the skills this robot has. They are config, so the list
+    /// differs between robots and an unknown name is refused with the real one.
+    Do {
+        #[arg(value_name = "SKILL")]
+        skill: String,
+    },
+    /// What each policy slot is running, and what to run instead.
+    #[command(subcommand)]
+    Policy(Policy),
     /// Reboot it.
     Reboot,
     /// Send any method, for whatever is not wrapped above.
@@ -843,6 +858,44 @@ enum Command {
         /// Parameters as JSON. Defaults to `{}`.
         params: Option<String>,
     },
+}
+
+/// The policy commands, named as `robotctl policy` names them.
+///
+/// Same words in the same order as on the robot, for the reason [`Update`] gives. What is missing
+/// against `robotctl` is the Hub: `policy.check`, `policy.install` and `policy.search` are not
+/// served over this transport — they reach the network on the robot's behalf and write to the
+/// eMMC — so `load` here takes a path to a file already on the robot, never `org/repo`.
+#[derive(Subcommand)]
+enum Policy {
+    /// What each slot is running, from where, and which skills this robot has.
+    List,
+    /// Put a policy in a slot, live.
+    ///
+    /// The robot returns to its home pose with torque on, loads it, and drives again. A file that
+    /// is not `obs[1,61] -> actions[1,14]` is refused before anything changes, and a load that
+    /// fails anyway keeps the policy that was running.
+    Load {
+        /// `walk`, `stand`, `sitstand`, `ground_pick`, `kick_left`, `kick_right` or `roulade`.
+        slot: String,
+        /// Absolute path on the robot. Relative is refused: the daemon's working directory is
+        /// not the caller's, and a path meaning one file to each would be worse than a refusal.
+        path: String,
+    },
+    /// Put one slot back to what this robot ships with.
+    ///
+    /// One slot, because the wire call takes one. Resetting every slot at once is
+    /// `robotctl policy reset` on the robot.
+    Reset {
+        /// Which slot to clear.
+        slot: String,
+    },
+    /// Re-read every slot from the config file.
+    ///
+    /// For when something else changed what the robot should be running — a policy set installed
+    /// underneath unchanged paths, or a hand-edited `robotd.toml`. `load` would correctly
+    /// conclude there was nothing to do.
+    Reload,
 }
 
 /// The update commands, named as `robotctl update` names them.
@@ -1552,6 +1605,8 @@ fn warn_about_skew(theirs: u8) {
 }
 
 fn request_line(command: &Command) -> Result<(String, Duration), Box<dyn std::error::Error>> {
+    use duck_ipc_proto as proto;
+
     let (method, params, timeout) = match command {
         // `scan` returns from `run` as soon as the discovery loop ends, so it never reaches a
         // request: there is no method to send, and connecting is the thing it exists not to do.
@@ -1575,6 +1630,35 @@ fn request_line(command: &Command) -> Result<(String, Duration), Box<dyn std::er
             REPLY_TIMEOUT,
         ),
         Command::Reboot => ("system.reboot", serde_json::json!({}), REPLY_TIMEOUT),
+        Command::Do { skill } => (
+            proto::method::ROBOT_DO,
+            serde_json::json!({ "skill": skill }),
+            REPLY_TIMEOUT,
+        ),
+        Command::Policy(Policy::List) => (
+            proto::method::ROBOT_POLICIES,
+            serde_json::json!({}),
+            REPLY_TIMEOUT,
+        ),
+        // Both of these home the robot and rebuild the controller before answering, which is
+        // seconds rather than milliseconds — the same budget `wifi scan` needed for the same
+        // reason, that the robot is genuinely working rather than ignoring us.
+        Command::Policy(Policy::Load { slot, path }) => (
+            proto::method::ROBOT_LOAD_POLICY,
+            serde_json::json!({ "slot": slot, "path": path }),
+            SLOW_REPLY_TIMEOUT,
+        ),
+        // No `path` is the reset — the same call, saying "run whatever this robot ships with".
+        Command::Policy(Policy::Reset { slot }) => (
+            proto::method::ROBOT_LOAD_POLICY,
+            serde_json::json!({ "slot": slot }),
+            SLOW_REPLY_TIMEOUT,
+        ),
+        Command::Policy(Policy::Reload) => (
+            proto::method::ROBOT_RELOAD_POLICIES,
+            serde_json::json!({}),
+            SLOW_REPLY_TIMEOUT,
+        ),
         Command::Wifi(Wifi::Status) => ("net.status", serde_json::json!({}), REPLY_TIMEOUT),
         // A scan asks NetworkManager to re-scan, which takes seconds on a quiet radio.
         Command::Wifi(Wifi::Scan) => ("net.scan", serde_json::json!({}), SLOW_REPLY_TIMEOUT),
@@ -2238,6 +2322,77 @@ mod tests {
         assert!(answers_to("duck [1]", "duck [1]"));
         assert!(!answers_to("[duck-c51b]", "duck-c51b"));
         assert!(!answers_to("duck-c51b [", "duck-c51b"));
+    }
+
+    /// **`policy reset` is `loadPolicy` with no path**, and that is the whole of the difference.
+    ///
+    /// Two subcommands over one method, because the wire call says "run this in that slot" and
+    /// omitting the file means "run whatever this robot ships with". A `reset` that sent
+    /// `"path":null` would be the same request, but the omission is what the daemon's
+    /// `Option<String>` is written against, and pinning it here is cheaper than finding out on
+    /// a robot.
+    #[test]
+    fn resetting_a_slot_is_loading_it_with_no_path() {
+        let wire = |args: &[&str]| {
+            let mut argv = vec!["duckctl", "policy"];
+            argv.extend_from_slice(args);
+            let cli = Cli::try_parse_from(argv).expect("parses");
+            request_line(&cli.command).expect("a request").0
+        };
+
+        let load = wire(&[
+            "load",
+            "walk",
+            "/opt/robot/policies/current/alpha_walking.onnx",
+        ]);
+        assert!(load.contains(r#""method":"robot.loadPolicy""#), "{load}");
+        assert!(load.contains(r#""slot":"walk""#), "{load}");
+        assert!(
+            load.contains(r#""path":"/opt/robot/policies/current/alpha_walking.onnx""#),
+            "{load}"
+        );
+
+        let reset = wire(&["reset", "walk"]);
+        assert!(reset.contains(r#""method":"robot.loadPolicy""#), "{reset}");
+        assert!(reset.contains(r#""slot":"walk""#), "{reset}");
+        assert!(!reset.contains("path"), "no path at all: {reset}");
+    }
+
+    /// The method names, against the daemon's own constants rather than strings typed twice.
+    #[test]
+    fn the_policy_commands_name_the_methods_the_daemon_serves() {
+        let wire = |args: &[&str]| {
+            let cli = Cli::try_parse_from([&["duckctl"], args].concat()).expect("parses");
+            request_line(&cli.command).expect("a request").0
+        };
+
+        assert!(wire(&["policy", "list"]).contains(duck_ipc_proto::method::ROBOT_POLICIES));
+        assert!(
+            wire(&["policy", "reload"]).contains(duck_ipc_proto::method::ROBOT_RELOAD_POLICIES)
+        );
+
+        let run = wire(&["do", "polite-bow"]);
+        assert!(run.contains(duck_ipc_proto::method::ROBOT_DO), "{run}");
+        assert!(run.contains(r#""skill":"polite-bow""#), "{run}");
+    }
+
+    /// **A load homes the robot before it answers**, so it gets the budget a slow call gets.
+    /// On the reply timeout it would look like a robot that had stopped talking, mid-swap.
+    #[test]
+    fn swapping_a_policy_waits_as_long_as_a_slow_call() {
+        let budget = |args: &[&str]| {
+            let cli = Cli::try_parse_from([&["duckctl"], args].concat()).expect("parses");
+            request_line(&cli.command).expect("a request").1
+        };
+
+        assert_eq!(
+            budget(&["policy", "load", "walk", "/tmp/x.onnx"]),
+            SLOW_REPLY_TIMEOUT
+        );
+        assert_eq!(budget(&["policy", "reset", "walk"]), SLOW_REPLY_TIMEOUT);
+        assert_eq!(budget(&["policy", "reload"]), SLOW_REPLY_TIMEOUT);
+        // Reading changes nothing and answers at once.
+        assert_eq!(budget(&["policy", "list"]), REPLY_TIMEOUT);
     }
 
     /// Every shape `update apply` can ask for, on the wire.
