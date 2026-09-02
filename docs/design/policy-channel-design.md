@@ -451,6 +451,7 @@ daemon release rather than a tag:
 - `robotd-params` knew which policies were one-shot skills and how long each ran. It now takes
   them from the manifest, falling back the same way.
 
+The field-by-field contract is `docs/policy-manifest.md` (schema 2); this section is the reasoning.
 Three kinds, and `kind` says who ends the policy:
 
 | `kind` | means | a skill? |
@@ -485,7 +486,7 @@ versions on the Hub, and a test over the copy would pass while a board downloade
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "model_api": 1,
   "obs_len": 61,
   "action_len": 14,

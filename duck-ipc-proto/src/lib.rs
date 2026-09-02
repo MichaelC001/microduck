@@ -2167,6 +2167,15 @@ pub struct PolicyFetchResult {
     pub unwind_s: Option<f64>,
     /// The manifest's `command.idle` — the twist that means "stop", and what a skill unwinds to.
     pub idle: Option<[f64; 3]>,
+    /// The manifest's `command.encoding`: absent or `"constant"` for the skill family, `"phase"`
+    /// for a ground pick, `"posture_flag"` for a sit↔stand. What decides whether the policy can
+    /// be a generic one-shot at all — a phase policy fed a constant is a robot moving plausibly
+    /// and wrongly.
+    pub encoding: Option<String>,
+    /// Whether holding the button chains another run, from the manifest.
+    pub chain: bool,
+    /// The manifest's `schema_version`, so a client can say which convention it read.
+    pub schema_version: Option<u32>,
 }
 
 /// What to search the Hub for, for [`Call::PolicySearch`].

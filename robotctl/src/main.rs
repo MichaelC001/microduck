@@ -3072,6 +3072,16 @@ fn run_policy_skill(
         }
     };
 
+    // A skill feeds its network a constant. A policy whose manifest says the daemon must drive
+    // it — a phase for a ground pick, a flag for a sit↔stand — cannot be one, and would run on a
+    // command it was never trained on while looking plausible. Those go in the slot the daemon
+    // drives, which is a different command.
+    if let Some(why) = from_manifest
+        .as_ref()
+        .and_then(|m| skill_encoding_refusal(name, m.encoding.as_deref()))
+    {
+        return Err(Failure::new(exit::USAGE, why));
+    }
     // The manifest supplies the length for a policy that ends itself. One that does not —
     // `kind: perpetual` — has no length to supply, and handing back mid-pose is exactly what a
     // hold and an unwind are for, so it is a refusal rather than a guess.
@@ -3105,7 +3115,9 @@ fn run_policy_skill(
         name: name.clone(),
         path,
         duration,
-        chain: false,
+        // Whether a held button chains another run is the policy's to say — the roulade does,
+        // a kick does not — and the manifest is where it says it.
+        chain: from_manifest.as_ref().is_some_and(|m| m.chain),
         command: command_spec
             .as_deref()
             .map(twist_of)
@@ -3153,6 +3165,33 @@ fn run_policy_skill(
     report_reload(robot_socket);
     println!("  `robotctl robot do {name}` runs it, once the policy is driving");
     Ok(())
+}
+
+/// Why a policy with this `command.encoding` cannot be a one-shot skill, or `None` when it can.
+///
+/// A skill's network is fed a constant twist for its window. The manifest's `encoding` says
+/// whether that is what the policy expects: absent or `constant` is; `phase` is a ground pick and
+/// `posture_flag` a sit↔stand, both driven by the daemon through commands it generates. Loading
+/// either as a skill would run it on a command it was never trained on — a robot moving plausibly
+/// and wrongly, which is the failure hardest to see — so it is a refusal naming the command that
+/// does load it.
+fn skill_encoding_refusal(name: &str, encoding: Option<&str>) -> Option<String> {
+    match encoding.map(|e| e.to_ascii_lowercase()).as_deref() {
+        None | Some("constant") => None,
+        Some("phase") => Some(format!(
+            "{name} is driven by a phase the daemon generates, so it cannot be a one-shot skill — \
+             it is a ground pick: `robotctl policy load ground_pick <source>` puts it in that slot"
+        )),
+        Some("posture_flag") => Some(format!(
+            "{name} is driven by a posture flag the daemon flips, so it cannot be a one-shot \
+             skill — it is a sit↔stand: `robotctl policy load sitstand <source>` puts it in that \
+             slot"
+        )),
+        Some(other) => Some(format!(
+            "{name}'s manifest says its command encoding is {other:?}, which this daemon does not \
+             know how to drive — a skill needs a constant command"
+        )),
+    }
 }
 
 /// Tell `robotd` to re-read its skills, and say whether it did.
@@ -4626,6 +4665,17 @@ mod tests {
 
     /// Only what differs from a plain zero-command one-shot is written — a file full of explicit
     /// defaults is the unreadable thing this editor exists to avoid.
+    #[test]
+    fn a_skill_must_take_a_constant_command() {
+        assert_eq!(skill_encoding_refusal("bow", None), None);
+        assert_eq!(skill_encoding_refusal("bow", Some("constant")), None);
+        let pick = skill_encoding_refusal("pick", Some("phase")).expect("refused");
+        assert!(pick.contains("policy load ground_pick"), "{pick}");
+        let sit = skill_encoding_refusal("sit", Some("posture_flag")).expect("refused");
+        assert!(sit.contains("policy load sitstand"), "{sit}");
+        assert!(skill_encoding_refusal("x", Some("telepathy")).is_some());
+    }
+
     #[test]
     fn a_plain_skill_writes_no_command_or_unwind() {
         let dir = tempfile::tempdir().unwrap();

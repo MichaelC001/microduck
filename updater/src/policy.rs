@@ -476,6 +476,41 @@ mod tests {
         assert_eq!(m.incompatibility(here()), None);
     }
 
+    /// **The unified convention, schema 2.** The official set's fields and the community's are one
+    /// vocabulary now (`docs/policy-manifest.md`); a single-policy repo may carry any of them, and
+    /// this reads the ones a client acts on — the encoding above all, since it is what says whether
+    /// the policy can be a one-shot.
+    #[test]
+    fn a_schema_2_manifest_carries_the_encoding_and_chain() {
+        let m = manifest(serde_json::json!({
+            "schema_version": 2, "model_api": 1, "name": "ground_pick", "kind": "episodic",
+            "duration_s": 2.8, "chain": false, "mode": "walk",
+            "command": { "encoding": "phase", "slots": "twist.vx,twist.vy",
+                         "period_s": 4.0, "end_phase": 0.7 },
+            "obs_len": 61, "action_len": 14, "robot": { "model": "microduck" }
+        }));
+        assert_eq!(m.schema_version, Some(2));
+        let command = m.command.as_ref().unwrap();
+        assert_eq!(command.encoding.as_deref(), Some("phase"));
+        assert_eq!(command.period_s, Some(4.0));
+        assert_eq!(command.end_phase, Some(0.7));
+        assert_eq!(
+            m.incompatibility(here()),
+            None,
+            "the encoding is not a shape problem"
+        );
+
+        let roll = manifest(serde_json::json!({
+            "schema_version": 2, "kind": "episodic", "duration_s": 1.0, "chain": true
+        }));
+        assert!(roll.chain);
+        assert_eq!(
+            PolicyManifest::default().chain,
+            false,
+            "absent means a single run"
+        );
+    }
+
     /// The whole point of reading the manifest: a 51-D policy is refused before 800 KB is
     /// downloaded and before the robot is asked to run it. `robotd` would refuse it at load
     /// anyway — this is the same answer, arriving where somebody can act on it.
@@ -691,8 +726,12 @@ pub fn origin_of_repo(repo: &str) -> &'static str {
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(default)]
 pub struct PolicyManifest {
+    /// Which revision of the convention wrote this. 1 is the official set's first shape, 2 the
+    /// unified one `docs/policy-manifest.md` describes — a superset, so nothing is gated on it.
+    pub schema_version: Option<u32>,
     pub name: Option<String>,
     pub description: Option<String>,
+    /// `episodic`, `perpetual` or `scripted`: who supplies the ending.
     pub kind: Option<String>,
     /// Seconds the policy runs, for one that ends itself. The convention's field name.
     pub duration_s: Option<f64>,
@@ -703,6 +742,12 @@ pub struct PolicyManifest {
     /// `duration_s` is up. It is what the daemon drives the idle command for before handing over
     /// to the gait, so that a robot holding a foot in the air is not simply let go of.
     pub unwind_s: Option<f64>,
+    /// Whether holding the button chains another run.
+    pub chain: bool,
+    /// Seconds a scripted policy takes to settle after its flag flips.
+    pub ramp_s: Option<f64>,
+    /// `walk` or `roller`, for a policy that belongs to one drive mode.
+    pub mode: Option<String>,
     pub command: Option<ManifestCommand>,
     pub obs_len: Option<usize>,
     pub action_len: Option<usize>,
@@ -718,7 +763,14 @@ pub struct PolicyManifest {
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(default)]
 pub struct ManifestCommand {
+    /// How the daemon is meant to drive the twist: absent or `"constant"` (a skill), `"phase"`
+    /// (a ground pick), `"posture_flag"` (a sit↔stand). Read so a client can refuse to make a
+    /// one-shot of something the daemon has to drive itself.
+    pub encoding: Option<String>,
     pub idle: Option<[f64; 3]>,
+    /// Phase encoding: seconds per cycle, and where in it the move hands back.
+    pub period_s: Option<f64>,
+    pub end_phase: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
@@ -942,7 +994,10 @@ pub async fn fetch(
         duration_s: manifest.duration_s,
         action_scale: manifest.action_scale,
         unwind_s: manifest.unwind_s,
-        idle: manifest.command.and_then(|c| c.idle),
+        idle: manifest.command.as_ref().and_then(|c| c.idle),
+        encoding: manifest.command.as_ref().and_then(|c| c.encoding.clone()),
+        chain: manifest.chain,
+        schema_version: manifest.schema_version,
     })
 }
 
