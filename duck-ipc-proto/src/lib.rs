@@ -162,6 +162,26 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// [`code::METHOD_NOT_FOUND`] naming it, which is the designed skew behaviour rather than a
 /// handshake refusal.
 ///
+/// # v21 — `robot.skills`, `robot.setSkill`, `robot.removeSkill`
+///
+/// The last thing in the policy path a terminal on the robot could reach and nothing else could.
+/// `[[policy.skill]]` is a repeating table, so `robotctl policy add` wrote it directly — there
+/// was no method to route, and a remote client could fetch a policy and fill a *slot* with it but
+/// never make it answer to `robot.do` by name.
+///
+/// `robotd` writes the file and reloads itself, so one call is the whole operation. The
+/// alternative was a client writing and then remembering `robot.reloadPolicies`, and one that
+/// forgot would leave a robot whose config and behaviour disagree until the next restart.
+///
+/// [`SkillParams`] is the same shape read and written, and every optional field means "the
+/// default for this" — so a client may list, change one field and send it back. An entry that
+/// already exists supplies whatever the call leaves out.
+///
+/// [`SkillsResult`] also carries `built_in`: the names `robot.do` answers to that are not table
+/// entries, because the daemon drives them itself. A client listing what a robot can do needs
+/// both, and `policies.skills` alone omitted two of the five the pad ships bound to — the same
+/// trap `do_names` exists to close on the robot side.
+///
 /// # v20 — `pad.bindings`, `pad.bind`
 ///
 /// Which button runs which skill stops being a thing only somebody at a keyboard on the robot can
@@ -217,7 +237,7 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// An older `robotd` answers either with [`code::METHOD_NOT_FOUND`] naming the method, which is
 /// the designed skew behaviour and not a handshake refusal. See
 /// `docs/design/policy-channel-design.md` §8.
-pub const API_VERSION: u32 = 20;
+pub const API_VERSION: u32 = 21;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -585,6 +605,9 @@ pub mod method {
     pub const PAD_FORGET: &str = "pad.forget";
     pub const PAD_BINDINGS: &str = "pad.bindings";
     pub const PAD_BIND: &str = "pad.bind";
+    pub const ROBOT_SKILLS: &str = "robot.skills";
+    pub const ROBOT_SET_SKILL: &str = "robot.setSkill";
+    pub const ROBOT_REMOVE_SKILL: &str = "robot.removeSkill";
 
     /// Subscribe to the raw input stream of the pad `padd` is driving from.
     ///
@@ -807,6 +830,9 @@ pub enum Call {
     PadForget(PadForgetParams),
     PadBindings,
     PadBind(PadBindParams),
+    RobotSkills,
+    RobotSetSkill(SkillParams),
+    RobotRemoveSkill(SkillNameParams),
     /// Subscribe to the raw pad input stream. Answered by `padd`, not `configd`.
     PadInput,
     /// Subscribe to the ToF depth stream. Answered by `tofd`.
@@ -925,6 +951,9 @@ impl Call {
             Call::PadForget(_) => method::PAD_FORGET,
             Call::PadBindings => method::PAD_BINDINGS,
             Call::PadBind(_) => method::PAD_BIND,
+            Call::RobotSkills => method::ROBOT_SKILLS,
+            Call::RobotSetSkill(_) => method::ROBOT_SET_SKILL,
+            Call::RobotRemoveSkill(_) => method::ROBOT_REMOVE_SKILL,
             Call::PadInput => method::PAD_INPUT,
             Call::TofStream => method::TOF_STREAM,
         }
@@ -1073,6 +1102,10 @@ impl Call {
             // `robot.loadPolicy` goes to `robotd`, for the same concept — so this costs nothing
             // mechanically. It is only worth a comment because the name suggests otherwise.
             Call::PadBindings | Call::PadBind(_) => (Robot, Prompt),
+
+            // The skill table. `robotd` writes it and reloads itself afterwards, so one call is
+            // enough — and it is the daemon that has to accept the result either way.
+            Call::RobotSkills | Call::RobotSetSkill(_) | Call::RobotRemoveSkill(_) => (Robot, Slow),
             // Re-sweeps the radio rather than returning the last scan.
             Call::NetScan => (Config, Slow),
             // `configd` polls NetworkManager for up to 45 seconds before calling a join failed,
@@ -1159,6 +1192,8 @@ impl Call {
             Call::PadPair(p) => encode(p),
             Call::PadForget(p) => encode(p),
             Call::PadBind(p) => encode(p),
+            Call::RobotSetSkill(p) => encode(p),
+            Call::RobotRemoveSkill(p) => encode(p),
             Call::Status
             | Call::Subscribe
             | Call::RobotSafeToRestart
@@ -1181,6 +1216,7 @@ impl Call {
             | Call::SystemPairingPin
             | Call::PadStatus
             | Call::PadBindings
+            | Call::RobotSkills
             | Call::PadInput
             | Call::TofStream
             | Call::ChoraleSubscribe => Value::Object(serde_json::Map::new()),
@@ -1266,6 +1302,9 @@ impl Call {
             method::PAD_FORGET => Call::PadForget(decode(params)?),
             method::PAD_BINDINGS => Call::PadBindings,
             method::PAD_BIND => Call::PadBind(decode(params)?),
+            method::ROBOT_SKILLS => Call::RobotSkills,
+            method::ROBOT_SET_SKILL => Call::RobotSetSkill(decode(params)?),
+            method::ROBOT_REMOVE_SKILL => Call::RobotRemoveSkill(decode(params)?),
             method::PAD_INPUT => Call::PadInput,
             method::TOF_STREAM => Call::TofStream,
             other => {
@@ -1427,6 +1466,11 @@ pub mod test_support {
             }),
             Call::PadForget(PadForgetParams {
                 mac: "78:86:2E:BB:13:28".into(),
+            }),
+            Call::RobotSkills,
+            Call::RobotSetSkill(SkillParams::default()),
+            Call::RobotRemoveSkill(SkillNameParams {
+                name: "polite-bow".into(),
             }),
             Call::PadBindings,
             Call::PadBind(PadBindParams {
@@ -3360,6 +3404,69 @@ pub enum PadPairResult {
     },
 }
 
+/// One entry in the skill table, as a client sees it and as it is written back.
+///
+/// **The same shape read and written**, so a client can list, change one field and send it back
+/// without knowing which fields it is allowed to omit. Every optional one means "the default for
+/// this", which is what an absent key in `[[policy.skill]]` means too.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct SkillParams {
+    /// What `robot.do` answers to. The key of the table: setting an existing name replaces it.
+    pub name: String,
+    /// The `.onnx`. Absent means the file this robot's own set ships under `<name>.onnx`, which
+    /// is what makes overriding a built-in's *timing* possible without naming its file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Seconds it runs. Required for a skill this robot does not already have — a policy that
+    /// holds until told otherwise has no length of its own and something must choose one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration: Option<f64>,
+    /// The twist fed to the network while it runs. Absent is all zeros, which is what a policy
+    /// trained on `zero_command_padding` expects and what most one-shots want.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<[f64; 3]>,
+    /// The twist driven on the way back, for a policy that does not end itself. A manifest's
+    /// `command.idle` is where this comes from when there is one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unwind: Option<[f64; 3]>,
+    /// Seconds spent driving `unwind` before handing back to the gait.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unwind_s: Option<f64>,
+    /// Whether a request arriving while it runs starts another when this one finishes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chain: Option<bool>,
+    /// Scales raw output into a joint offset, when this skill wants its own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action_scale: Option<f64>,
+    /// Servo gain relative to the gait's, when this skill wants its own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gain_ratio: Option<f64>,
+    /// Read-only: whether config has an opinion about this skill, or it is one the release ships.
+    /// Ignored on the way in — a client cannot make a built-in an override by saying so.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub overridden: bool,
+}
+
+/// Parameters for [`Call::RobotRemoveSkill`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillNameParams {
+    pub name: String,
+}
+
+/// Answer to [`Call::RobotSkills`].
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct SkillsResult {
+    /// Every skill this robot has, in the order `robot.do` tries them.
+    pub skills: Vec<SkillParams>,
+    /// Names `robot.do` answers to that are **not** in the table above, because the daemon drives
+    /// them itself — `ground_pick` writes a scripted phase, `sit_toggle` is latched. A client
+    /// listing what a robot can do needs both, and neither can be edited here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub built_in: Vec<String>,
+}
+
 /// Parameters for [`Call::PadBind`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -4302,7 +4409,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            55,
+            58,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }

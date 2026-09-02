@@ -403,13 +403,47 @@ Download somebody else's, without running it:
 duckctl policy fetch RemiFabre/microduck-flamingo-cycle
 ```
 
-The reply names the path it landed at; `policy load <slot> <path>` runs it. **This is not
-`robotctl policy add`**, which also writes a skill entry so `robot do` can run it by name — that
-takes `[[policy.skill]]`, and there is no wire method for it. So a *skill* still has to be added
-on the robot; a *slot* can be filled from here.
+The reply names the path it landed at. `load` takes a path and never `org/repo`: fetching and
+loading are two calls here where `robotctl` spells both with one string.
 
-`load` therefore takes a path, never `org/repo`: fetching and loading are two calls on this
-transport where `robotctl` spells both with one string.
+### Giving it a name
+
+`fetch` downloads a file; this makes it something `robot do` answers to:
+
+```bash
+duckctl policy skill polite-bow --path /var/lib/robot/policies/fffiloni/microduck-polite-bow-b1d864/main/policy.onnx --duration 4
+```
+
+```bash
+duckctl do polite-bow
+```
+
+One call — the robot writes its config and reloads, so nothing restarts. `--duration` is required
+the first time and kept afterwards, so changing one field means sending one field:
+
+```bash
+duckctl policy skill polite-bow --command 1,0,0
+```
+
+`--command` is the twist fed to the network while it runs, zeros unless the policy reads its twist
+as something else — flamingo's is `[flag, side, 0]`. `--unwind` and `--unwind-s` are how a policy
+that holds until told otherwise is brought back.
+
+What this robot can be asked to do, and the timings behind each:
+
+```bash
+duckctl policy skills
+```
+
+`built_in` in that answer names `ground_pick` and `sit_toggle`, which `robot do` also accepts but
+which are driven by the robot itself and are not table entries.
+
+```bash
+duckctl policy unskill polite-bow
+```
+
+A skill this robot's release ships comes back when you do that, because removing the entry only
+removes the override.
 
 Nothing a stranger publishes is verified by anybody. What makes it safe to try is the manifest
 gate before the download, the shape gate at load, the joint clamps and the fall reflex — not the

@@ -613,6 +613,12 @@ A binding is checked against `do_names`, which is **not** `policy.skills`: `grou
 absent from that list while being perfectly good things to ask for. Validating against `skills`
 alone rejected two of the five buttons the pad ships bound to, which a test caught.
 
+**The skill table is reachable over both transports too**, which is what closes the path: fetch a
+stranger's policy, give it a name and a length, ask for it by that name, put it on a button — none
+of it needing a terminal on the robot. `robot.setSkill` writes the config and reloads inside the
+one call, and `robot.skills` reports `built_in` separately because `ground_pick` and `sit_toggle`
+are not table entries and a client reading only the table would conclude they do not exist.
+
 `padd` still knows nothing about what a skill *is*. It reads which button went down, looks up the
 name beside it, and sends that name; `robotd` decides whether the robot has such a thing and
 answers with the list it does have when it does not. Checking belongs where the answer is, which
@@ -769,10 +775,12 @@ is a 50 Hz stream answering a question asked once, and BLE deliberately does not
   `btd`'s, not the phone's, exactly as they already are for `update.apply`. The transport is the
   gate there, not the credential.
 
-  What is still local-only is adding a **skill**: `robotctl policy add` writes
-  `[[policy.skill]]`, and there is no wire method for a repeating table. A remote client can
-  fetch a policy and fill a *slot* with it; making it answer to `robot.do` by name needs the
-  robot.
+  Adding a **skill** is reachable too, as of `robot.skills` / `robot.setSkill` /
+  `robot.removeSkill`. That was the last thing here only a terminal on the robot could do:
+  `[[policy.skill]]` is a repeating table, so `robotctl policy add` wrote it directly and there
+  was no method to route. `robotd` writes the file and reloads itself, so one call is the whole
+  operation — a client that had to remember `robot.reloadPolicies` and forgot would leave a robot
+  whose config and behaviour disagree until the next restart.
 
 - ~~The pad bindings have no wire surface at all~~ — `pad.bindings` and `pad.bind` are served
   over both transports. `robotd` answers them, not `configd`, which owns the rest of `pad.*`:

@@ -131,6 +131,11 @@ fn permits(call: &proto::Call) -> bool {
         // authorisation on this transport, not a smaller surface.
         PadBindings | PadBind(_) => true,
 
+        // The skill table. With `policy.fetch` above, this is what makes the whole path reachable
+        // from a browser: pull a stranger's policy onto the board, give it a name and a length,
+        // and ask for it by that name.
+        RobotSkills | RobotSetSkill(_) | RobotRemoveSkill(_) => true,
+
         // Reading what each slot runs — and which skills this robot has, which is how a client
         // knows there is a bow to ask `robot.do` for. The same kind of question as the update
         // reads below, and a remote client watching a gait misbehave has an obvious use for it.
@@ -372,6 +377,11 @@ mod tests {
             proto::Call::PadBind(proto::PadBindParams {
                 button: "x".to_owned(),
                 skill: Some("polite-bow".to_owned()),
+            }),
+            proto::Call::RobotSkills,
+            proto::Call::RobotSetSkill(proto::SkillParams::default()),
+            proto::Call::RobotRemoveSkill(proto::SkillNameParams {
+                name: "polite-bow".to_owned(),
             }),
         ] {
             assert!(

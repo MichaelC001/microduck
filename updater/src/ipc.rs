@@ -741,7 +741,10 @@ impl Server {
             // binding needs the skill list to check a name against — but from here the answer is
             // the same either way: not this daemon.
             | Call::PadBindings
-            | Call::PadBind(_) => Response::err(
+            | Call::PadBind(_)
+            | Call::RobotSkills
+            | Call::RobotSetSkill(_)
+            | Call::RobotRemoveSkill(_) => Response::err(
                 Some(id),
                 proto::Error::new(
                     proto::code::METHOD_NOT_FOUND,

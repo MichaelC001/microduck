@@ -3130,6 +3130,193 @@ fn already_loaded(
 ///
 /// It is not a guarantee — the file can still be replaced between here and the home pose — which
 /// is why the loop keeps the controller it has when the real load fails.
+/// Every skill this robot has, as the table a client edits and sends back.
+///
+/// Read from the config file rather than from the running snapshot, because the two answer
+/// different questions: the snapshot says what is *loaded*, and this says what is *configured* —
+/// which is what an editor needs, including an entry whose file has gone missing.
+///
+/// `built_in` carries the two names `robot.do` answers to that are not table entries at all:
+/// `ground_pick` writes a scripted phase and `sit_toggle` is latched. A client offering "what can
+/// this robot do" needs both lists, and would otherwise conclude those two do not exist.
+fn skills_report(state: &RobotState) -> proto::SkillsResult {
+    let configured = params::Params::load(&state.config_path, false)
+        .map(|p| p.policy.clone())
+        .unwrap_or_default();
+    let overridden: std::collections::HashSet<String> =
+        configured.skills.iter().map(|s| s.name.clone()).collect();
+
+    let names = state.policies.load();
+    proto::SkillsResult {
+        skills: configured
+            .resolved_skills()
+            .iter()
+            .map(|skill| proto::SkillParams {
+                name: skill.name.clone(),
+                path: skill.path.as_ref().map(|p| p.display().to_string()),
+                duration: Some(skill.duration),
+                command: Some(skill.command),
+                unwind: Some(skill.unwind),
+                unwind_s: Some(skill.unwind_s),
+                chain: Some(skill.chain),
+                action_scale: skill.params.action_scale,
+                gain_ratio: skill.params.gain_ratio,
+                overridden: overridden.contains(&skill.name),
+            })
+            .collect(),
+        built_in: ["ground_pick", "sit_toggle"]
+            .into_iter()
+            .filter(|name| {
+                names.skills.iter().all(|s| s != name)
+                    && match *name {
+                        "ground_pick" => names.ground_pick.is_some(),
+                        _ => names.sitstand.is_some(),
+                    }
+            })
+            .map(str::to_owned)
+            .collect(),
+    }
+}
+
+/// Add a skill, or change one.
+///
+/// **Written to the config file and reloaded here**, so one call is the whole operation. The
+/// alternative was a client writing and then remembering to call `robot.reloadPolicies`, and a
+/// client that forgot would leave a robot whose file and behaviour disagree until the next
+/// restart — the exact state `robotctl policy load` exists to reconcile.
+///
+/// The reload is what checks the policy: it opens the file and refuses the shape, reporting the
+/// slot as degraded rather than taking the robot down. So this validates what it cheaply can —
+/// a name, a length, a path that exists — and leaves the network to the loader.
+fn set_skill_request(
+    p: &proto::SkillParams,
+    state: &RobotState,
+    intents: &Intents,
+) -> proto::IntentResult {
+    if p.name.trim().is_empty() {
+        return proto::IntentResult::refused(
+            "a skill needs a name; it is what `robot.do` asks for",
+        );
+    }
+    // The two the daemon drives itself. A table entry answering to either would shadow it with a
+    // network fed an all-zero command it was never trained on.
+    if matches!(p.name.as_str(), "ground_pick" | "sit_toggle") {
+        return proto::IntentResult::refused(format!(
+            "{} is driven by the robot itself and cannot be a table entry",
+            p.name
+        ));
+    }
+
+    let mut model = match params::edit::Model::load(&state.config_path) {
+        Ok(model) => model,
+        Err(e) => return proto::IntentResult::refused(e),
+    };
+
+    // An existing entry supplies whatever this call leaves out, so a client may send one field.
+    let existing = params::Params::load(&state.config_path, false)
+        .ok()
+        .and_then(|params| {
+            params
+                .policy
+                .resolved_skills()
+                .into_iter()
+                .find(|s| s.name == p.name)
+        });
+
+    let duration = match p.duration.or(existing.as_ref().map(|s| s.duration)) {
+        Some(duration) if duration > 0.0 => duration,
+        Some(_) => {
+            return proto::IntentResult::refused("a skill's duration must be more than zero");
+        }
+        None => {
+            return proto::IntentResult::refused(format!(
+                "{:?} is new here, so it needs a duration — how long it runs, in seconds",
+                p.name
+            ));
+        }
+    };
+
+    let path = match &p.path {
+        Some(path) => Some(std::path::PathBuf::from(path)),
+        None => existing.as_ref().and_then(|s| s.path.clone()),
+    };
+    // A path that is not there is a slot that will report degraded at every restart. Cheap to
+    // catch now, and the caller can still be wrong about the *contents* — that is the loader's.
+    if let Some(path) = &path
+        && !params::is_none_sentinel(path)
+        && !path.exists()
+    {
+        return proto::IntentResult::refused(format!("no such file: {}", path.display()));
+    }
+
+    let skill = params::SkillDef {
+        name: p.name.clone(),
+        path,
+        duration,
+        command: p
+            .command
+            .or(existing.as_ref().map(|s| s.command))
+            .unwrap_or_default(),
+        unwind: p
+            .unwind
+            .or(existing.as_ref().map(|s| s.unwind))
+            .unwrap_or_default(),
+        unwind_s: p
+            .unwind_s
+            .or(existing.as_ref().map(|s| s.unwind_s))
+            .unwrap_or(0.0),
+        chain: p
+            .chain
+            .or(existing.as_ref().map(|s| s.chain))
+            .unwrap_or(false),
+        params: params::SkillOverrides {
+            action_scale: p
+                .action_scale
+                .or(existing.as_ref().and_then(|s| s.params.action_scale)),
+            gain_ratio: p
+                .gain_ratio
+                .or(existing.as_ref().and_then(|s| s.params.gain_ratio)),
+        },
+    };
+
+    if let Err(e) = model.set_skill(&skill) {
+        return proto::IntentResult::refused(e);
+    }
+    if let Err(e) = model.save() {
+        return proto::IntentResult::refused(e);
+    }
+    intents.request_policy_change(intents::PolicyChange::Reload);
+    proto::IntentResult::accepted()
+}
+
+/// Take a skill out of the table.
+///
+/// A skill this robot's release ships comes back when the override is removed, which is why this
+/// says which happened rather than only that it worked.
+fn remove_skill_request(
+    p: &proto::SkillNameParams,
+    state: &RobotState,
+    intents: &Intents,
+) -> proto::IntentResult {
+    let mut model = match params::edit::Model::load(&state.config_path) {
+        Ok(model) => model,
+        Err(e) => return proto::IntentResult::refused(e),
+    };
+    match model.remove_skill(&p.name) {
+        Ok(false) => {
+            proto::IntentResult::already(format!("no configured skill called {:?}", p.name))
+        }
+        Err(e) => proto::IntentResult::refused(e),
+        Ok(true) => {
+            if let Err(e) = model.save() {
+                return proto::IntentResult::refused(e);
+            }
+            intents.request_policy_change(intents::PolicyChange::Reload);
+            proto::IntentResult::accepted()
+        }
+    }
+}
+
 /// What each bindable pad button runs, with the two things a client cannot work out alone.
 ///
 /// `overridden` saves it knowing the defaults, and `error` names a binding that will do nothing
@@ -3546,6 +3733,16 @@ fn dispatch(
 
         proto::Call::PadBind(p) => proto::Response::ok(Some(id), &bind_pad_request(p, state)),
 
+        proto::Call::RobotSkills => proto::Response::ok(Some(id), &skills_report(state)),
+
+        proto::Call::RobotSetSkill(p) => {
+            proto::Response::ok(Some(id), &set_skill_request(p, state, intents))
+        }
+
+        proto::Call::RobotRemoveSkill(p) => {
+            proto::Response::ok(Some(id), &remove_skill_request(p, state, intents))
+        }
+
         proto::Call::RobotLoadPolicy(p) => {
             proto::Response::ok(Some(id), &load_policy_request(p, state, intents))
         }
@@ -3795,6 +3992,143 @@ mod tests {
         let params = Params::load(&path, true).expect("valid config");
         let state = Arc::new(RobotState::new(&params, &path, false, false));
         (dir, state)
+    }
+
+    /// **A new skill needs a duration and an existing one does not**, so a client may send one
+    /// field. Without the fallback, changing a skill's command would silently reset its length.
+    #[test]
+    fn setting_a_skill_keeps_what_the_call_left_out() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let onnx = dir.path().join("bow.onnx");
+        std::fs::write(&onnx, b"not really an onnx").expect("write");
+        let (_cfg, state) = state_over("");
+        let intents = Intents::default();
+
+        // New, with no duration: refused, and it says why rather than guessing one.
+        let bare = set_skill_request(
+            &proto::SkillParams {
+                name: "polite-bow".to_owned(),
+                path: Some(onnx.display().to_string()),
+                ..Default::default()
+            },
+            &state,
+            &intents,
+        );
+        assert!(!bare.accepted);
+        assert!(
+            bare.reason.unwrap_or_default().contains("duration"),
+            "the missing field is named"
+        );
+
+        let added = set_skill_request(
+            &proto::SkillParams {
+                name: "polite-bow".to_owned(),
+                path: Some(onnx.display().to_string()),
+                duration: Some(4.0),
+                ..Default::default()
+            },
+            &state,
+            &intents,
+        );
+        assert!(added.accepted, "{added:?}");
+
+        // Now change only the command. The duration and the path must survive.
+        let changed = set_skill_request(
+            &proto::SkillParams {
+                name: "polite-bow".to_owned(),
+                command: Some([1.0, 0.0, 0.0]),
+                ..Default::default()
+            },
+            &state,
+            &intents,
+        );
+        assert!(changed.accepted, "{changed:?}");
+
+        let written = params::Params::load(&state.config_path, false).expect("valid");
+        let skill = written
+            .policy
+            .resolved_skills()
+            .into_iter()
+            .find(|s| s.name == "polite-bow")
+            .expect("still there");
+        assert_eq!(skill.duration, 4.0, "kept");
+        assert_eq!(skill.command, [1.0, 0.0, 0.0], "changed");
+        assert_eq!(skill.path.as_deref(), Some(onnx.as_path()), "kept");
+    }
+
+    /// **A path that is not there is refused now rather than reported degraded later.**
+    /// The alternative is a robot that says it is unwell at every restart over a typo.
+    #[test]
+    fn a_skill_pointing_at_nothing_is_refused() {
+        let (_cfg, state) = state_over("");
+        let result = set_skill_request(
+            &proto::SkillParams {
+                name: "polite-bow".to_owned(),
+                path: Some("/var/lib/robot/policies/nope.onnx".to_owned()),
+                duration: Some(4.0),
+                ..Default::default()
+            },
+            &state,
+            &Intents::default(),
+        );
+        assert!(!result.accepted);
+        assert!(result.reason.unwrap_or_default().contains("no such file"));
+    }
+
+    /// The two the daemon drives itself may not become table entries: an entry answering to
+    /// either would shadow it with a network fed an all-zero command it never trained on.
+    #[test]
+    fn a_skill_cannot_take_a_name_the_daemon_drives() {
+        let (_cfg, state) = state_over("");
+        for name in ["ground_pick", "sit_toggle"] {
+            let result = set_skill_request(
+                &proto::SkillParams {
+                    name: name.to_owned(),
+                    duration: Some(4.0),
+                    ..Default::default()
+                },
+                &state,
+                &Intents::default(),
+            );
+            assert!(!result.accepted, "{name} was accepted");
+        }
+    }
+
+    /// **`robot.skills` lists the built-ins separately**, because they are not table entries and
+    /// a client that only read the table would conclude they do not exist.
+    #[test]
+    fn the_skills_report_names_the_daemon_driven_ones_apart() {
+        let (_cfg, state) = state_over("");
+        let report = skills_report(&state);
+
+        assert!(
+            report.skills.iter().any(|s| s.name == "roulade"),
+            "the table has the configurable ones"
+        );
+        assert!(
+            report.skills.iter().all(|s| !s.overridden),
+            "nothing is overridden on a bare config"
+        );
+        assert!(
+            !report.skills.iter().any(|s| s.name == "ground_pick"),
+            "the scripted one is not a table entry"
+        );
+    }
+
+    /// Removing something that was never configured is not a failure — asking twice must not
+    /// look like one — and a skill the release ships comes back rather than vanishing.
+    #[test]
+    fn removing_a_skill_that_is_not_configured_says_so() {
+        let (_cfg, state) = state_over("");
+        let result = remove_skill_request(
+            &proto::SkillNameParams {
+                name: "polite-bow".to_owned(),
+            },
+            &state,
+            &Intents::default(),
+        );
+        assert!(result.accepted, "not an error");
+        assert!(result.reason.unwrap_or_default().contains("no configured"));
     }
 
     /// **A binding naming a skill this robot does not have is reported, not silently kept.**

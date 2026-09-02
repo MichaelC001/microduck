@@ -963,6 +963,37 @@ enum Policy {
         #[arg(long)]
         file: Option<String>,
     },
+    /// What this robot can be asked to do, and the timings behind each one.
+    ///
+    /// `built_in` names the two `robot.do` also answers to that are not table entries —
+    /// `ground_pick` and `sit_toggle` are driven by the robot itself.
+    Skills,
+    /// Give a fetched policy a name, so `robot do` can run it.
+    ///
+    /// The other half of `policy fetch`: that downloads a file, this makes it a skill.
+    /// One call — the robot writes its config and reloads, so nothing restarts.
+    Skill {
+        /// What `robot do` will answer to. An existing name replaces that entry.
+        name: String,
+        /// Seconds it runs. Required the first time; kept if omitted afterwards.
+        #[arg(long)]
+        duration: Option<f64>,
+        /// The `.onnx` on the robot — the path `policy fetch` reported.
+        #[arg(long)]
+        path: Option<String>,
+        /// The twist fed to the network while it runs, as `vx,vy,vyaw`. Zeros unless a policy
+        /// reads its twist as something else — flamingo's is `[flag, side, 0]`.
+        #[arg(long)]
+        command: Option<String>,
+        /// The twist driven on the way back, for a policy that does not end itself.
+        #[arg(long)]
+        unwind: Option<String>,
+        /// Seconds spent coming back.
+        #[arg(long)]
+        unwind_s: Option<f64>,
+    },
+    /// Take a skill out. One this robot's release ships comes back.
+    Unskill { name: String },
     /// Re-read every slot from the config file.
     ///
     /// For when something else changed what the robot should be running — a policy set installed
@@ -1677,6 +1708,27 @@ fn warn_about_skew(theirs: u8) {
     );
 }
 
+/// `vx,vy,vyaw` as three numbers.
+///
+/// Parsed here rather than sent as a string, so a typo is a message from this tool naming the
+/// shape rather than a `PARSE_ERROR` from the robot with nothing in it to act on.
+fn triple(spec: &str) -> Result<[f64; 3], String> {
+    let parts: Vec<&str> = spec.split(',').collect();
+    if parts.len() != 3 {
+        return Err(format!(
+            "expected three numbers as vx,vy,vyaw — got {spec:?}"
+        ));
+    }
+    let mut out = [0.0; 3];
+    for (slot, part) in out.iter_mut().zip(parts) {
+        *slot = part
+            .trim()
+            .parse()
+            .map_err(|_| format!("{part:?} is not a number, in {spec:?}"))?;
+    }
+    Ok(out)
+}
+
 fn request_line(command: &Command) -> Result<(String, Duration), Box<dyn std::error::Error>> {
     use duck_ipc_proto as proto;
 
@@ -1780,6 +1832,43 @@ fn request_line(command: &Command) -> Result<(String, Duration), Box<dyn std::er
             }
             (proto::method::POLICY_FETCH, params, UPDATE_IDLE_TIMEOUT)
         }
+        Command::Policy(Policy::Skills) => (
+            proto::method::ROBOT_SKILLS,
+            serde_json::json!({}),
+            REPLY_TIMEOUT,
+        ),
+        // Writes config and reloads seven networks before answering, like `policy load`.
+        Command::Policy(Policy::Skill {
+            name,
+            duration,
+            path,
+            command,
+            unwind,
+            unwind_s,
+        }) => {
+            let mut params = serde_json::json!({ "name": name });
+            if let Some(duration) = duration {
+                params["duration"] = serde_json::json!(duration);
+            }
+            if let Some(path) = path {
+                params["path"] = serde_json::Value::String(path.clone());
+            }
+            if let Some(command) = command {
+                params["command"] = serde_json::json!(triple(command)?);
+            }
+            if let Some(unwind) = unwind {
+                params["unwind"] = serde_json::json!(triple(unwind)?);
+            }
+            if let Some(unwind_s) = unwind_s {
+                params["unwind_s"] = serde_json::json!(unwind_s);
+            }
+            (proto::method::ROBOT_SET_SKILL, params, SLOW_REPLY_TIMEOUT)
+        }
+        Command::Policy(Policy::Unskill { name }) => (
+            proto::method::ROBOT_REMOVE_SKILL,
+            serde_json::json!({ "name": name }),
+            SLOW_REPLY_TIMEOUT,
+        ),
         Command::Policy(Policy::Reload) => (
             proto::method::ROBOT_RELOAD_POLICIES,
             serde_json::json!({}),

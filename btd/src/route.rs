@@ -284,6 +284,16 @@ fn permits(call: &proto::Call) -> bool {
         // failure mode is a refusal naming them rather than a button that does nothing.
         PadBindings | PadBind(_) => true,
 
+        // The skill table: what this robot can be asked to do, and adding to it. The last thing
+        // in the policy path that only a terminal on the robot could reach — `[[policy.skill]]`
+        // is a repeating table, so `robotctl policy add` wrote it directly and there was nothing
+        // to route.
+        //
+        // `robotd` writes the file and reloads itself, so one call is the whole operation. A
+        // client that had to remember a second one and forgot would leave a robot whose config
+        // and behaviour disagree until the next restart.
+        RobotSkills | RobotSetSkill(_) | RobotRemoveSkill(_) => true,
+
         // What each slot is running, and which skills this robot has. Read-only, and the read a
         // client makes before it can offer either of the two above: there is no compiled-in list
         // of skills to assume any more, so this is how a phone knows there is a bow to ask for.
@@ -594,6 +604,12 @@ mod tests {
             proto::Call::PadBind(proto::PadBindParams {
                 button: "x".to_owned(),
                 skill: Some("polite-bow".to_owned()),
+            }),
+            // The skill table — the last thing here only a terminal on the robot could reach.
+            proto::Call::RobotSkills,
+            proto::Call::RobotSetSkill(proto::SkillParams::default()),
+            proto::Call::RobotRemoveSkill(proto::SkillNameParams {
+                name: "polite-bow".to_owned(),
             }),
         ];
         for call in expected {
