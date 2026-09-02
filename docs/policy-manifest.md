@@ -19,7 +19,7 @@ contract.
 | `kind` | means | becomes |
 | --- | --- | --- |
 | `episodic` | runs for `duration_s` and returns itself to a safe pose | a skill, if its command is constant |
-| `perpetual` | holds until told otherwise — a gait, or a pose a person has to end | a slot's gait, or a skill with `--hold` and an unwind |
+| `perpetual` | runs until told otherwise — a gait, or a pose a person has to end | a slot's gait (`policy load`); or, with `unwind_s`, a skill with `--hold` |
 | `scripted` | episodic but interruptible: the daemon can change its command mid-flight | recorded; the daemon's own arm reads its timing |
 
 **`command.encoding` says what the daemon feeds it.**
@@ -56,6 +56,7 @@ a policy only on a claim that is present and wrong.
 | `unwind_s` | float | skills, sitstand | seconds driving `command.idle` before handing back; for the sit↔stand, the rise |
 | `ramp_s` | float | sitstand | seconds the seat takes to settle; the shutdown sit waits twice this |
 | `mode` | str | set | `walk` (default) or `roller`; which mode's ground pick a phase entry is |
+| `slot` | str | display | for a perpetual gait: the slot it is for (`walk`, `stand`, …), so `policy load <slot> <repo>` is the install line |
 | `entry_pose` | str | display | the pose the policy expects to start from, e.g. `standing` |
 | `command.encoding` | str | skills | see above |
 | `command.idle` | [3] | skills | the twist that means "stop doing the thing" |
