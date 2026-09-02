@@ -2768,12 +2768,28 @@ fn run_policy(
     let (slots, path, json) = match &command {
         PolicyCommand::List { json } => {
             let result = result_of(client.call(&proto::Call::RobotPolicies)?)?;
+            // **The skill table is the other half of "what is this robot running".** Two calls
+            // because they are two questions — a slot is what runs by default, a skill is what
+            // runs when asked — and for a long time this command answered only the first, so a
+            // skill somebody had just added was invisible in the command they would look in.
+            //
+            // A robot too old to know the method is not a failure here: the slots are still the
+            // answer to most of the question, and refusing to print them would be worse.
+            let skills: Option<proto::SkillsResult> = client
+                .call(&proto::Call::RobotSkills)
+                .ok()
+                .and_then(|r| result_of(r).ok())
+                .and_then(|r| decode(&r).ok());
+
             if *json {
-                println!("{}", compact(&result));
+                println!(
+                    "{}",
+                    compact(&serde_json::json!({ "policies": result, "skills": skills }))
+                );
                 return Ok(());
             }
             let policies: proto::PoliciesResult = decode(&result)?;
-            print!("{}", render_policies(&policies));
+            print!("{}", render_policies(&policies, skills.as_ref()));
             return Ok(());
         }
         PolicyCommand::Load { slot, source, json } => {
@@ -3365,7 +3381,10 @@ fn run_policy_update(
 }
 
 /// One line per slot: what is in it, where that came from, and whether it is this robot's own.
-fn render_policies(policies: &proto::PoliciesResult) -> String {
+fn render_policies(
+    policies: &proto::PoliciesResult,
+    skills: Option<&proto::SkillsResult>,
+) -> String {
     use std::fmt::Write as _;
 
     let mut out = String::new();
@@ -3392,7 +3411,12 @@ fn render_policies(policies: &proto::PoliciesResult) -> String {
         // difference is that one of them is a decision somebody made. `overridden` is what
         // carries it, and not printing it made a robot with six slots deliberately off read as a
         // robot that simply had them empty. That cost an evening.
-        let (origin, what) = match (slot.path.as_deref(), slot.overridden) {
+        // The directory comes off, because the ORIGIN column already says which one it was and
+        // seven identical prefixes are seven lines of noise around the part that differs. The
+        // skill table below does the same, and two tables in one output formatting paths
+        // differently would be worse than both being verbose.
+        let shortened = slot.path.as_deref().map(shorten_policy_path);
+        let (origin, what) = match (shortened.as_deref(), slot.overridden) {
             (Some(path), _) => (slot.origin.as_deref().unwrap_or("-"), path),
             (None, true) => ("off", "switched off"),
             (None, false) => ("-", "(none)"),
@@ -3433,7 +3457,89 @@ fn render_policies(policies: &proto::PoliciesResult) -> String {
             "`robotctl policy reset <slot>` clears the override that will not load."
         );
     }
+
+    if let Some(skills) = skills {
+        let _ = write!(out, "{}", render_skills(skills));
+    }
     out
+}
+
+/// The skill table: what this robot answers to, and how long each one runs.
+///
+/// Separate from the slots above because they are different things — a slot is what runs by
+/// default and a skill is what runs when asked — but in the same output, because "what is this
+/// robot running" is one question to whoever typed it.
+fn render_skills(skills: &proto::SkillsResult) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+
+    if skills.skills.is_empty() && skills.built_in.is_empty() {
+        let _ = writeln!(
+            out,
+            "\nno skills — `robotctl robot do` has nothing to ask for"
+        );
+        return out;
+    }
+
+    let width = skills
+        .skills
+        .iter()
+        .map(|s| s.name.len())
+        .chain(skills.built_in.iter().map(String::len))
+        .max()
+        .unwrap_or(4)
+        .max(5);
+
+    let _ = writeln!(out, "\n   {:width$}  {:>8}  POLICY", "SKILL", "RUNS FOR");
+    for skill in &skills.skills {
+        let mark = if skill.overridden { "*" } else { " " };
+        // `0.5 s` rather than `0.500 s`: these are hand-chosen numbers, and three decimals
+        // suggests a precision nobody tuned to.
+        let runs = skill
+            .duration
+            .map(|d| format!("{d} s"))
+            .unwrap_or_else(|| "—".to_owned());
+        // The file rather than the whole path where it is one of ours: seven identical
+        // directory prefixes are seven lines of noise around the part that differs.
+        let what = skill
+            .path
+            .as_deref()
+            .map(shorten_policy_path)
+            .unwrap_or_else(|| format!("{}.onnx (this robot\'s own)", skill.name));
+        let _ = writeln!(out, " {mark} {:width$}  {runs:>8}  {what}", skill.name);
+    }
+    for name in &skills.built_in {
+        let _ = writeln!(
+            out,
+            "   {:width$}  {:>8}  driven by the robot itself",
+            name, "—"
+        );
+    }
+
+    let configured = skills.skills.iter().filter(|s| s.overridden).count();
+    if configured > 0 {
+        let _ = writeln!(
+            out,
+            "\n* {configured} from config. `robotctl policy remove <skill>` puts one back."
+        );
+    }
+    out
+}
+
+/// A policy path with the directory it lives in left off.
+///
+/// Both of the two that matter: the official set, where every entry shares one prefix, and the
+/// community library, where `fffiloni/microduck-polite-bow-b1d864/main/policy.onnx` is the whole
+/// of what a reader wants and the twenty-three characters before it are not. The ORIGIN column
+/// says which directory it was, so nothing is lost — and a path somewhere else entirely is left
+/// alone, because then the directory *is* the interesting part.
+fn shorten_policy_path(path: &str) -> String {
+    for root in [robotd_params::POLICY_DIR, robotd_params::POLICY_LIBRARY] {
+        if let Some(rest) = path.strip_prefix(&format!("{root}/")) {
+            return rest.to_owned();
+        }
+    }
+    path.to_owned()
 }
 
 /// `robotctl pad bindings` / `bind` — what each one-shot button runs.
@@ -4348,6 +4454,113 @@ mod tests {
         }
     }
 
+    /// **A skill somebody just added has to be visible in the command they will look in.**
+    ///
+    /// `policy list` answered only the slot half for a long while, so a skill added a minute
+    /// earlier appeared nowhere — and the natural conclusion is that adding it failed.
+    #[test]
+    fn the_listing_shows_the_skills_as_well_as_the_slots() {
+        let skills = proto::SkillsResult {
+            skills: vec![
+                proto::SkillParams {
+                    name: "roulade".to_owned(),
+                    path: Some(format!("{}/roulade.onnx", robotd_params::POLICY_DIR)),
+                    duration: Some(1.0),
+                    chain: Some(true),
+                    ..Default::default()
+                },
+                proto::SkillParams {
+                    name: "polite-bow".to_owned(),
+                    path: Some(
+                        "/var/lib/robot/policies/fffiloni/microduck-polite-bow/main/policy.onnx"
+                            .to_owned(),
+                    ),
+                    duration: Some(4.0),
+                    overridden: true,
+                    ..Default::default()
+                },
+            ],
+            built_in: vec!["ground_pick".to_owned()],
+        };
+        let rendered = render_policies(&policies_of(Vec::new()), Some(&skills));
+
+        assert!(rendered.contains("polite-bow"), "{rendered}");
+        assert!(
+            rendered.contains("4 s"),
+            "the length is what it is for: {rendered}"
+        );
+        // Config's opinions are marked and counted, as they are for slots.
+        assert!(rendered.contains("* 1 from config"), "{rendered}");
+        // An official policy prints its file, not seven copies of one directory — and a
+        // community one prints the repo it came from rather than the library root.
+        assert!(rendered.contains("roulade.onnx"), "{rendered}");
+        assert!(
+            !rendered.contains(robotd_params::POLICY_DIR),
+            "the shared prefix is dropped: {rendered}"
+        );
+        assert!(
+            rendered.contains("fffiloni/microduck-polite-bow/main/policy.onnx"),
+            "the repo is the interesting part: {rendered}"
+        );
+        assert!(
+            !rendered.contains(robotd_params::POLICY_LIBRARY),
+            "and the library root is not: {rendered}"
+        );
+        // The two the daemon drives are named, or a reader concludes they do not exist.
+        assert!(rendered.contains("ground_pick"), "{rendered}");
+        assert!(
+            rendered.contains("driven by the robot itself"),
+            "{rendered}"
+        );
+    }
+
+    /// A robot too old to answer `robot.skills` still gets its slots printed. Refusing the whole
+    /// listing over a missing half would be the worse of the two outcomes.
+    #[test]
+    fn a_robot_that_cannot_report_skills_still_lists_its_slots() {
+        let rendered = render_policies(
+            &policies_of(vec![slot_state(Slot::Walk, Some("/x.onnx"), true)]),
+            None,
+        );
+        assert!(rendered.contains("walk"), "{rendered}");
+        assert!(!rendered.contains("SKILL"), "no empty table: {rendered}");
+    }
+
+    /// Eyeball the listing.
+    #[test]
+    #[ignore]
+    fn dump_the_listing() {
+        let skills = proto::SkillsResult {
+            skills: vec![
+                proto::SkillParams {
+                    name: "kick_left".to_owned(),
+                    path: Some(format!("{}/ball_kick_left.onnx", robotd_params::POLICY_DIR)),
+                    duration: Some(0.5),
+                    ..Default::default()
+                },
+                proto::SkillParams {
+                    name: "roulade".to_owned(),
+                    path: Some(format!("{}/roulade.onnx", robotd_params::POLICY_DIR)),
+                    duration: Some(1.0),
+                    chain: Some(true),
+                    ..Default::default()
+                },
+                proto::SkillParams {
+                    name: "polite-bow".to_owned(),
+                    path: Some(
+                        "/var/lib/robot/policies/fffiloni/microduck-polite-bow-b1d864/main/policy.onnx"
+                            .to_owned(),
+                    ),
+                    duration: Some(4.0),
+                    overridden: true,
+                    ..Default::default()
+                },
+            ],
+            built_in: vec!["ground_pick".to_owned(), "sit_toggle".to_owned()],
+        };
+        print!("{}", render_skills(&skills));
+    }
+
     /// A misspelled slot must name the real ones. `ground_pick` against `groundPick` is a
     /// one-line fix if the message says so and a puzzle if it does not.
     #[test]
@@ -4785,7 +4998,7 @@ mod tests {
         let mut off = slot_state(Slot::Stand, None, true);
         off.origin = None;
         let absent = slot_state(Slot::Roulade, None, false);
-        let rendered = render_policies(&policies_of(vec![off, absent]));
+        let rendered = render_policies(&policies_of(vec![off, absent]), None);
 
         let stand = rendered
             .lines()
@@ -4808,14 +5021,17 @@ mod tests {
     /// "What have I changed" was previously answerable only by remembering.
     #[test]
     fn the_listing_marks_and_counts_what_config_changed() {
-        let rendered = render_policies(&policies_of(vec![
-            slot_state(Slot::Walk, Some("/home/pierre/mine.onnx"), true),
-            slot_state(
-                Slot::Stand,
-                Some("/opt/robot/policies/current/s.onnx"),
-                false,
-            ),
-        ]));
+        let rendered = render_policies(
+            &policies_of(vec![
+                slot_state(Slot::Walk, Some("/home/pierre/mine.onnx"), true),
+                slot_state(
+                    Slot::Stand,
+                    Some("/opt/robot/policies/current/s.onnx"),
+                    false,
+                ),
+            ]),
+            None,
+        );
 
         // By the path, not the slot name — `mode: walk` is a line containing "walk" too.
         let row = |needle: &str| {
@@ -4827,7 +5043,8 @@ mod tests {
         };
         let walk = row("/home/pierre/mine.onnx");
         assert!(walk.trim_start().starts_with('*'), "{walk}");
-        let stand = row("/opt/robot/policies/current/s.onnx");
+        // The official directory comes off in the listing; the ORIGIN column carries it.
+        let stand = row("s.onnx");
         assert!(!stand.trim_start().starts_with('*'), "{stand}");
 
         assert!(rendered.contains("1 slot set by config"), "{rendered}");
@@ -4838,12 +5055,15 @@ mod tests {
     /// for a robot somebody has changed, and on a stock one it would be noise.
     #[test]
     fn an_untouched_robot_gets_no_config_footer() {
-        let rendered = render_policies(&policies_of(
-            Slot::ALL
-                .into_iter()
-                .map(|slot| slot_state(slot, Some("/opt/robot/policies/current/x.onnx"), false))
-                .collect(),
-        ));
+        let rendered = render_policies(
+            &policies_of(
+                Slot::ALL
+                    .into_iter()
+                    .map(|slot| slot_state(slot, Some("/opt/robot/policies/current/x.onnx"), false))
+                    .collect(),
+            ),
+            None,
+        );
         assert!(!rendered.contains("set by config"), "{rendered}");
     }
 
@@ -4853,7 +5073,7 @@ mod tests {
     fn the_listing_explains_a_slot_that_fell_back() {
         let mut slots = vec![slot_state(Slot::Walk, Some("/opt/alpha.onnx"), false)];
         slots[0].error = Some("/srv/gone.onnx: No such file".into());
-        let rendered = render_policies(&policies_of(slots));
+        let rendered = render_policies(&policies_of(slots), None);
 
         assert!(rendered.contains("running the default"), "{rendered}");
         assert!(rendered.contains("/srv/gone.onnx"), "{rendered}");
@@ -4867,7 +5087,7 @@ mod tests {
         let mut policies =
             policies_of(vec![slot_state(Slot::Walk, Some("/opt/alpha.onnx"), false)]);
         policies.enabled = false;
-        let rendered = render_policies(&policies);
+        let rendered = render_policies(&policies, None);
         assert!(rendered.contains("OFF"), "{rendered}");
     }
 
