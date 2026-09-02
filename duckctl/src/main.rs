@@ -923,6 +923,46 @@ enum Policy {
         /// Which slot to clear.
         slot: String,
     },
+    /// What else is published for this robot.
+    ///
+    /// Reaches the Hub, changes nothing. `microduck` is the useful query until there is a tag.
+    Search {
+        /// What to look for on the Hub.
+        #[arg(default_value = "microduck")]
+        query: String,
+    },
+    /// Is there a newer official policy set? Changes nothing.
+    Check,
+    /// Install an official policy set from the Hub.
+    ///
+    /// Takes the newest unless a revision is named. The robot returns to its home pose, re-reads
+    /// every slot and drives again — and a slot pointing at a file you loaded yourself is left
+    /// alone, because it points somewhere else entirely.
+    Update {
+        /// A tag like `v2`, or a branch. Omit for the newest.
+        #[arg(long)]
+        version: Option<String>,
+    },
+    /// Download somebody else's policy onto the robot, without loading it.
+    ///
+    /// **Not `robotctl policy add`**, which also writes a skill entry so `robot do` can run it —
+    /// that needs `[[policy.skill]]`, and there is no wire method for it. This is the download
+    /// half only; `policy load <slot> <path>` afterwards runs it in a slot, and the reply names
+    /// the path to give it.
+    ///
+    /// Nothing a stranger publishes is verified by anybody: what makes it safe to try is the
+    /// shape gate, the joint clamps and the fall reflex. Have the robot on its stand the first
+    /// time.
+    Fetch {
+        /// `org/repo` on the Hub.
+        repo: String,
+        /// A revision in that repo. Omit for the default branch.
+        #[arg(long)]
+        revision: Option<String>,
+        /// Which file, for a repo carrying more than one policy.
+        #[arg(long)]
+        file: Option<String>,
+    },
     /// Re-read every slot from the config file.
     ///
     /// For when something else changed what the robot should be running — a policy set installed
@@ -1705,6 +1745,41 @@ fn request_line(command: &Command) -> Result<(String, Duration), Box<dyn std::er
             serde_json::json!({ "button": button }),
             REPLY_TIMEOUT,
         ),
+        // All four reach the Hub, so they get the budget a slow call gets: a mirror having a
+        // bad day is not a robot that has stopped talking.
+        Command::Policy(Policy::Search { query }) => (
+            proto::method::POLICY_SEARCH,
+            serde_json::json!({ "query": query }),
+            SLOW_REPLY_TIMEOUT,
+        ),
+        Command::Policy(Policy::Check) => (
+            proto::method::POLICY_CHECK,
+            serde_json::json!({}),
+            SLOW_REPLY_TIMEOUT,
+        ),
+        // Downloads about 7 MB and swaps the set, then homes the robot and reloads. The update
+        // budget rather than the slow-call one, for the same reason `update apply` takes it.
+        Command::Policy(Policy::Update { version }) => {
+            let mut params = serde_json::json!({});
+            if let Some(version) = version {
+                params["version"] = serde_json::Value::String(version.clone());
+            }
+            (proto::method::POLICY_INSTALL, params, UPDATE_IDLE_TIMEOUT)
+        }
+        Command::Policy(Policy::Fetch {
+            repo,
+            revision,
+            file,
+        }) => {
+            let mut params = serde_json::json!({ "repo": repo });
+            if let Some(revision) = revision {
+                params["revision"] = serde_json::Value::String(revision.clone());
+            }
+            if let Some(file) = file {
+                params["file"] = serde_json::Value::String(file.clone());
+            }
+            (proto::method::POLICY_FETCH, params, UPDATE_IDLE_TIMEOUT)
+        }
         Command::Policy(Policy::Reload) => (
             proto::method::ROBOT_RELOAD_POLICIES,
             serde_json::json!({}),
@@ -2373,6 +2448,54 @@ mod tests {
         assert!(answers_to("duck [1]", "duck [1]"));
         assert!(!answers_to("[duck-c51b]", "duck-c51b"));
         assert!(!answers_to("duck-c51b [", "duck-c51b"));
+    }
+
+    /// **The Hub commands take the budget their work needs**, because the failure otherwise
+    /// looks like a robot that stopped talking rather than a mirror having a bad day.
+    #[test]
+    fn the_hub_commands_wait_as_long_as_they_need() {
+        let budget = |args: &[&str]| {
+            let cli = Cli::try_parse_from([&["duckctl"], args].concat()).expect("parses");
+            request_line(&cli.command).expect("a request").1
+        };
+
+        // Reaches the network and answers.
+        assert_eq!(
+            budget(&["policy", "search", "microduck"]),
+            SLOW_REPLY_TIMEOUT
+        );
+        assert_eq!(budget(&["policy", "check"]), SLOW_REPLY_TIMEOUT);
+        // Downloads megabytes, then homes the robot and reloads seven networks.
+        assert_eq!(budget(&["policy", "update"]), UPDATE_IDLE_TIMEOUT);
+        assert_eq!(
+            budget(&["policy", "fetch", "org/repo"]),
+            UPDATE_IDLE_TIMEOUT
+        );
+    }
+
+    /// An omitted flag is an omitted field, not a null: `version`, `revision` and `file` all
+    /// mean "the usual thing" by being absent, and a `null` would be a different request.
+    #[test]
+    fn the_hub_commands_omit_what_was_not_asked_for() {
+        let wire = |args: &[&str]| {
+            let cli = Cli::try_parse_from([&["duckctl"], args].concat()).expect("parses");
+            request_line(&cli.command).expect("a request").0
+        };
+
+        let bare = wire(&["policy", "update"]);
+        assert!(
+            bare.contains(duck_ipc_proto::method::POLICY_INSTALL),
+            "{bare}"
+        );
+        assert!(!bare.contains("version"), "{bare}");
+        assert!(wire(&["policy", "update", "--version", "v1"]).contains(r#""version":"v1""#));
+
+        let fetch = wire(&["policy", "fetch", "org/repo"]);
+        assert!(fetch.contains(r#""repo":"org/repo""#), "{fetch}");
+        assert!(
+            !fetch.contains("revision") && !fetch.contains("file"),
+            "{fetch}"
+        );
     }
 
     /// **`policy reset` is `loadPolicy` with no path**, and that is the whole of the difference.

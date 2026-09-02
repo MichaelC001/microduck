@@ -758,11 +758,21 @@ is a 50 Hz stream answering a question asked once, and BLE deliberately does not
   is no live-only option there, which means whichever daemon serves it needs the lossless writer
   that today only `robotctl` has.
 
-- **Installing from the Hub is still local-only.** `policy.check`, `policy.install`,
-  `policy.fetch` and `policy.search` are refused on both transports. Not for blast radius —
-  `robot.loadPolicy` is open and has the same one — but because that pair reaches the *network*
-  on the robot's behalf and writes to the eMMC, where loading points at a file already there.
-  Over WebRTC, §4 of `remote-webrtc.md` means any LAN peer would inherit it.
+- ~~Installing from the Hub is still local-only~~ — all four are served on both transports now.
+  The reads (`policy.check`, `policy.search`) change nothing and sit beside the `update.check`
+  both transports already carry. The mutations (`policy.install`, `policy.fetch`) are named one
+  by one in `btd`'s `only_these_mutating_calls_are_reachable_over_ble`, which is the list that
+  makes adding one have to say why.
+
+  The uid gate turned out not to be the obstacle it looked like. `policy.install` is
+  `is_mutating`, and `updaterd` authorises that against the *peer's* credentials — which are
+  `btd`'s, not the phone's, exactly as they already are for `update.apply`. The transport is the
+  gate there, not the credential.
+
+  What is still local-only is adding a **skill**: `robotctl policy add` writes
+  `[[policy.skill]]`, and there is no wire method for a repeating table. A remote client can
+  fetch a policy and fill a *slot* with it; making it answer to `robot.do` by name needs the
+  robot.
 
 - ~~The pad bindings have no wire surface at all~~ — `pad.bindings` and `pad.bind` are served
   over both transports. `robotd` answers them, not `configd`, which owns the rest of `pad.*`:

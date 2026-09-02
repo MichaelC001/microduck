@@ -379,10 +379,41 @@ The robot goes to its home pose with torque on, loads, and drives again — a fe
 timeout allows for it. A file that is not `obs[1,61] -> actions[1,14]` is refused before anything
 changes, and a load that fails anyway keeps the policy that was running.
 
-**Installing from the Hub is not here.** `policy.check`, `policy.install` and `policy.search`
-reach the network on the robot's behalf and write to the eMMC, and are refused on this transport
-— so `load` takes a path to a file already on the robot, never `org/repo`. Fetching one is
-`robotctl policy add` or `robotctl policy load` on the robot.
+### From the Hub
+
+What else is published for this robot, and whether the official set has moved:
+
+```bash
+duckctl policy search microduck
+```
+
+```bash
+duckctl policy check
+```
+
+Install the newest official set — or `--version v1` to go back:
+
+```bash
+duckctl policy update
+```
+
+Download somebody else's, without running it:
+
+```bash
+duckctl policy fetch RemiFabre/microduck-flamingo-cycle
+```
+
+The reply names the path it landed at; `policy load <slot> <path>` runs it. **This is not
+`robotctl policy add`**, which also writes a skill entry so `robot do` can run it by name — that
+takes `[[policy.skill]]`, and there is no wire method for it. So a *skill* still has to be added
+on the robot; a *slot* can be filled from here.
+
+`load` therefore takes a path, never `org/repo`: fetching and loading are two calls on this
+transport where `robotctl` spells both with one string.
+
+Nothing a stranger publishes is verified by anybody. What makes it safe to try is the manifest
+gate before the download, the shape gate at load, the joint clamps and the fall reflex — not the
+description. Have the robot on its stand the first time.
 
 ## Which button runs which skill
 
@@ -463,10 +494,9 @@ watching, and `update status` afterwards says how it went.
 ## What is refused
 
 Teleop (`robot.move`, `robot.head`, `robot.enable`, `robot.stop`, `robot.init`, `robot.relax`),
-high-rate telemetry (`robot.subscribe`), reaching the Hub (`policy.check`, `policy.install`,
-`policy.search`), the two update commands a person has to mean (`update.pin`,
-`update.resetToGolden`) and the pairing PIN (`system.pairingPin`, `system.setPairingPin`) are
-refused by `btd` itself and never reach a daemon.
+high-rate telemetry (`robot.subscribe`), the two update commands a person has to mean
+(`update.pin`, `update.resetToGolden`) and the pairing PIN (`system.pairingPin`,
+`system.setPairingPin`) are refused by `btd` itself and never reach a daemon.
 
 `robot.do` is **not** in that list, though it moves the robot: teleop is a stream of fifty small
 updates a second, which is what a 20-byte notification budget cannot carry, and a skill is one

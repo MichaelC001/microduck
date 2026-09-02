@@ -294,20 +294,30 @@ fn permits(call: &proto::Call) -> bool {
         // case where the file changed underneath it.
         RobotReloadPolicies => true,
 
-        // Updating the policy set from the Hub. The closest thing here to `update.apply`, which
-        // *is* routed — and the difference is what an app can do about the outcome. A daemon
-        // update that goes wrong reports unhealthy and reverts itself; a gait that goes wrong
-        // walks badly, which nothing detects and only a person watching the robot can judge.
-        // Worth revisiting with the app, alongside `robot.policies` to show the result.
-        PolicyCheck | PolicyInstall(_) => false,
+        // Is there a newer official policy set, and what else is on the Hub. Both reach the
+        // network, and neither changes anything on the robot — the same kind of question as
+        // `update.check`, which has been routed here since the update path was driven from a
+        // phone.
+        //
+        // They were refused on the grounds that answering "yes, there is a newer gait" for a
+        // client that could not then install one is an odd thing to offer. That was fair while it
+        // was true and stops being an argument the moment `policy.install` is routed, which is
+        // the next arm.
+        PolicyCheck | PolicySearch(_) => true,
 
-        // Browsing the Hub for gaits and installing one from a phone is the most obviously
-        // *appealing* thing in this file, and the one that most wants the app to exist first: it
-        // puts a stranger's network in charge of fifteen servos, and the only judge of whether
-        // that went well is somebody watching the robot. Everything that makes it survivable is
-        // already built — the shape gate, the clamps, the fall reflex — so this is a deferral
-        // about who is looking, not about danger.
-        PolicyFetch(_) | PolicySearch(_) => false,
+        // And installing one. This is the most obviously *appealing* thing in this file: a
+        // stranger's gait, from a phone, onto the robot in front of you.
+        //
+        // What makes it survivable is unchanged and was always the point — the manifest gate
+        // before the download, the shape gate at load, the joint clamps, the fall reflex — so
+        // this was never about danger. It was about who is *watching*, and BLE answers that
+        // better than anything else here: ten metres of radio range means whoever tapped it is
+        // looking at the robot, and the bond is PIN-checked.
+        //
+        // `policy.install` is `is_mutating`, so `updaterd` authorises it against the peer's
+        // uid — which is `btd`'s, not the phone's, exactly as it already is for `update.apply`.
+        // The transport is the gate here, not the credential.
+        PolicyFetch(_) | PolicyInstall(_) => true,
 
         // Power to the joints. A phone button that drops the robot on the floor is not one to
         // offer, and `robot.init` is its counterpart: standing a robot up moves every joint at once,
@@ -429,6 +439,14 @@ mod tests {
                 // neither call discards anything or downloads anything.
                 proto::method::ROLLBACK,
                 proto::method::SELECT,
+                // Replacing the policy set, and fetching a stranger's policy onto the board.
+                // Routed for the reason provisioning is: BLE's physical-presence claim (§4.2)
+                // holds — ten metres of radio range, a PIN-checked bond — and trying a gait is
+                // the thing that most wants whoever asked to be looking at the robot. Everything
+                // that makes it survivable is the same whoever asked: the manifest gate before
+                // the download, the shape gate at load, the clamps, the fall reflex.
+                proto::method::POLICY_INSTALL,
+                proto::method::POLICY_FETCH,
                 proto::method::NET_CONNECT,
                 proto::method::NET_FORGET,
                 proto::method::SYSTEM_SET_NAME,
@@ -582,6 +600,30 @@ mod tests {
             assert_eq!(
                 upstream_for(&call),
                 Some(Upstream::Robot),
+                "{}",
+                call.method()
+            );
+        }
+    }
+
+    /// **The Hub, from a phone.** What is out there, whether the official set has moved, and
+    /// installing one — the four that reach the network, all on `updaterd` beside `update.check`.
+    ///
+    /// `policy.install` and `policy.fetch` are mutating, so they are also named one by one in
+    /// [`only_these_mutating_calls_are_reachable_over_ble`]; this is the half that says they
+    /// arrive somewhere.
+    #[test]
+    fn a_phone_can_browse_and_install_from_the_hub() {
+        for call in [
+            proto::Call::PolicyCheck,
+            proto::Call::PolicySearch(proto::PolicySearchParams {
+                query: "microduck".to_owned(),
+            }),
+            proto::Call::PolicyInstall(proto::PolicyInstallParams::default()),
+        ] {
+            assert_eq!(
+                upstream_for(&call),
+                Some(Upstream::Updater),
                 "{}",
                 call.method()
             );

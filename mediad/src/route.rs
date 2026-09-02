@@ -140,17 +140,19 @@ fn permits(call: &proto::Call) -> bool {
         // robot wants the case where something else changed it too.
         RobotReloadPolicies => true,
 
-        // Installing a policy set from the Hub stays out, and now for a narrower reason than
-        // before. It is not the blast radius — `robot.loadPolicy` above has the same one — it is
-        // that this pair reaches the *network* on the robot's behalf and writes to the eMMC,
-        // where `robot.loadPolicy` only points at a file already on it. `policy.check` is
-        // read-only and would be harmless, but offering the half that answers "yes, there is a
-        // newer gait" to a client that cannot then install it is an odd thing to do.
-        PolicyCheck | PolicyInstall(_) => false,
+        // Is there a newer official set, and what else is on the Hub. Reads that reach the
+        // network and change nothing, alongside the `update.check` this transport already serves.
+        PolicyCheck | PolicySearch(_) => true,
 
-        // And nor fetching a stranger's policy, for the reason above plus §4: there is no
-        // authorisation on this transport, so a LAN peer would inherit it.
-        PolicyFetch(_) | PolicySearch(_) => false,
+        // And installing one, or fetching a stranger's. The peer can watch the robot try the
+        // result, which is the argument that permits everything else consequential here.
+        //
+        // §4 is the caveat and it is real: no authorisation on this transport, so any LAN peer
+        // inherits this, and this pair writes to the eMMC rather than only pointing at a file
+        // already on it. Named rather than hidden — the answer is authorisation, not a smaller
+        // surface, and a robot whose gait a neighbour can replace is a robot whose gait a
+        // neighbour can already replace with `robot.loadPolicy`.
+        PolicyFetch(_) | PolicyInstall(_) => true,
 
         // ── the streams BLE pointed here ────────────────────────────────────
         //
@@ -380,22 +382,24 @@ mod tests {
         }
     }
 
-    /// **Reaching the Hub on the robot's behalf is still refused.**
+    /// **The whole Hub path, from a browser.** Search for a gait, ask whether the official set
+    /// has moved, install one, fetch a stranger's — the four that reach the network.
     ///
-    /// Not for blast radius — `robot.loadPolicy` above has the same one — but because this pair
-    /// pulls from the network and writes to the eMMC, where loading points at a file already
-    /// there. §4 means any LAN peer would inherit it.
+    /// The peer can watch the robot try the result, which is the argument that permits everything
+    /// else consequential here. §4 is the caveat and it is recorded on the arms: there is no
+    /// authorisation on this transport, so a LAN peer inherits it.
     #[test]
-    fn installing_from_the_hub_is_not_offered_to_a_lan_peer() {
+    fn a_watching_peer_can_browse_and_install_from_the_hub() {
         for call in [
             proto::Call::PolicyCheck,
             proto::Call::PolicySearch(proto::PolicySearchParams {
                 query: "microduck".to_owned(),
             }),
+            proto::Call::PolicyInstall(proto::PolicyInstallParams::default()),
         ] {
             assert!(
-                matches!(route_for(&call), Route::Refused),
-                "{} is reachable",
+                matches!(route_for(&call), Route::To(..)),
+                "{} is refused",
                 call.method()
             );
         }
