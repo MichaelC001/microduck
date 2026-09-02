@@ -381,14 +381,21 @@ release:
    ```json
    { "file": "polite-bow.onnx", "kind": "episodic", "duration_s": 4.0 }
    ```
+   The set's manifest is `schema_version: 2`; a plain one-shot needs no more than those three.
 3. Tag it — `hf repos tag create pollen-robotics/microduck-policies v4`.
 4. On a robot: `sudo robotctl policy update`.
 
-`kind` decides what happens: **`episodic`** with a `duration_s` becomes a skill the robot answers
-to by name, ready for `robot do` and a button; **`perpetual`** is a gait, which needs a slot
-pointed at it; **`scripted`** is a policy the daemon drives itself, like the ground pick.
+That entry is what a one-shot needs and nothing more: **`episodic` with a `duration_s`, on the
+all-zero command it was trained against, becomes a skill the robot answers to by name** — ready
+for `robot do` and a button, with nothing else edited. A **`perpetual`** one is a gait and needs
+a slot pointed at it instead.
 
-The manifest, and what each field does, is in
+A policy the daemon has to *drive* — writing a phase over time, or flipping a posture flag —
+declares that under `command.encoding`, and its numbers become that arm's timing rather than a
+new skill. The ground pick and the sit↔stand are the two, and getting one of those entries wrong
+is the one mistake here worth being careful about.
+
+The manifest in full, every field, and what each one changes on the robot:
 [`../design/policy-channel-design.md`](../design/policy-channel-design.md) §9.4.
 
 The shape a policy has to have and what else is checked at load are in
