@@ -16,6 +16,7 @@
 //! test that walks [`Params`]'s own serialization, so a new section cannot be added without
 //! the registry (and therefore the editor) learning about it.
 
+pub mod edit;
 pub mod registry;
 
 use std::path::{Path, PathBuf};
