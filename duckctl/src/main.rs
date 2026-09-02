@@ -847,6 +847,15 @@ enum Command {
         #[arg(value_name = "SKILL")]
         skill: String,
     },
+    /// The Hugging Face account this robot belongs to.
+    ///
+    /// Signing in over Bluetooth is what a robot fresh out of a box needs: it has no network, so
+    /// it has no console and no LAN to open one from. `login` prints a short code to approve on
+    /// huggingface.co from any device — this tool does not have to stay connected while you do,
+    /// which is the point of the flow. `status` afterwards says whether it worked.
+    #[command(subcommand)]
+    Account(Account),
+
     /// What each policy slot is running, and what to run instead.
     #[command(subcommand)]
     Policy(Policy),
@@ -899,6 +908,21 @@ enum Pad {
 /// against `robotctl` is the Hub: `policy.check`, `policy.install` and `policy.search` are not
 /// served over this transport — they reach the network on the robot's behalf and write to the
 /// eMMC — so `load` here takes a path to a file already on the robot, never `org/repo`.
+/// `duckctl account …` — the account half of `robotctl account`, over the radio.
+#[derive(Subcommand, Debug)]
+enum Account {
+    /// Start a login, and print the code to approve.
+    Login {
+        /// Sign in even though this robot already belongs to an account.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Which account this robot belongs to, and whether a login is waiting for approval.
+    Status,
+    /// Forget the account.
+    Logout,
+}
+
 #[derive(Subcommand)]
 enum Policy {
     /// What each slot is running, from where, and which skills this robot has.
@@ -1506,6 +1530,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(note) = restart_note(&cli.command, &value) {
                     eprintln!("{note}");
                 }
+                if let Some(note) = account_note(&cli.command, &value) {
+                    eprintln!("{note}");
+                }
                 Ok(())
             };
         }
@@ -1758,6 +1785,25 @@ fn request_line(command: &Command) -> Result<(String, Duration), Box<dyn std::er
         Command::Do { skill } => (
             proto::method::ROBOT_DO,
             serde_json::json!({ "skill": skill }),
+            REPLY_TIMEOUT,
+        ),
+        // The robot asks Hugging Face for a device code before it answers, so this is one
+        // outbound HTTP round trip rather than a local read — the same budget `policy load` gets
+        // for the same reason. What it does *not* wait for is the approval: that is the whole
+        // shape of the flow, and it is why this tool can disconnect immediately afterwards.
+        Command::Account(Account::Login { force }) => (
+            proto::method::ACCOUNT_LOGIN,
+            serde_json::json!({ "force": force }),
+            SLOW_REPLY_TIMEOUT,
+        ),
+        Command::Account(Account::Status) => (
+            proto::method::ACCOUNT_STATUS,
+            serde_json::json!({}),
+            REPLY_TIMEOUT,
+        ),
+        Command::Account(Account::Logout) => (
+            proto::method::ACCOUNT_LOGOUT,
+            serde_json::json!({}),
             REPLY_TIMEOUT,
         ),
         Command::Policy(Policy::List) => (
@@ -2031,6 +2077,26 @@ fn progress_line(params: &serde_json::Value) -> String {
 /// never restarts mid-flight — `btd` may be the transport it arrived over — so both are restarted
 /// about five seconds *after* the reply goes out (`docs/design/restart-order.md` §1). Every client
 /// has to expect that, and a phone app should show it as a step rather than an error.
+/// What to do with the code `account.login` just answered with.
+///
+/// The reply is JSON like every other, and this is the one call where the *human* next step is
+/// not obvious from it: a code and a URL mean nothing until somebody is told to go and type them.
+/// Printed as a note rather than instead of the JSON, so `--verbose` and piping still behave.
+fn account_note(command: &Command, reply: &serde_json::Value) -> Option<String> {
+    if !matches!(command, Command::Account(Account::Login { .. })) {
+        return None;
+    }
+    let result = reply.get("result")?;
+    let code = result["user_code"].as_str()?;
+    let uri = result["verification_uri"].as_str()?;
+    let minutes = result["expires_in"].as_u64().unwrap_or(0) / 60;
+    Some(format!(
+        "\nOpen {uri} and enter this code:\n\n    {code}\n\n\
+         You have about {minutes} minutes. The robot is doing the waiting, so this tool can \
+         disconnect now — `duckctl account status` says whether it worked."
+    ))
+}
+
 fn restart_note(command: &Command, reply: &serde_json::Value) -> Option<&'static str> {
     let component = match command {
         Command::Update(

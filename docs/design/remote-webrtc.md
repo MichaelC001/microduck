@@ -307,6 +307,13 @@ out:
 - **`update.*` mutations.** For now only, and for a different reason than the PIN: applying an
   update restarts `mediad` and drops the session. Wanted later; §8 is what it will take.
 
+And one category came *in* that is worth naming here rather than only in the route table:
+**`account.*`**, the calls that bind this robot to a Hugging Face account. They are the first
+mutating calls this transport carries, and the console is where somebody would sign a robot in.
+It is also the only thing here whose effect outlives the session in the way an account does —
+[`remote-access-design.md`](remote-access-design.md) §2.6 is the argument and the three
+properties that make it hold, and `mediad::route` carries the short version.
+
 ### Replies are not correlated, deliberately
 
 `btd` forwards whatever a socket emits without parsing it, and has a test pinning that: a

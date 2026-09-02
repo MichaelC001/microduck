@@ -754,6 +754,47 @@ Joining a network **disconnects the robot from the one it is on**, so an ssh ses
 drop. That is the operation working. A scan takes a few seconds — it waits for the radio to sweep
 rather than returning the previous scan's results.
 
+### The Hugging Face account (`updaterd`)
+
+Signing the robot in is what will let you reach it from outside its own network. Nothing else
+needs it yet.
+
+```
+sudo robotctl account login
+```
+
+That prints a code. Open <https://hf.co/oauth/device> on any device, type the code, and the
+command finishes:
+
+```
+Open https://hf.co/oauth/device and enter this code:
+
+    A6MY-0314
+
+Waiting for approval…
+Signed in as PierreRouanet.
+```
+
+```
+robotctl account status
+```
+
+```
+sudo robotctl account logout
+```
+
+Ctrl-C while it is waiting costs nothing — the robot keeps polling, and `account status` says
+whether it was approved. The code is good for five minutes; after that, run `login` again.
+
+A robot that is already signed in refuses, and names the account:
+
+```
+sudo robotctl account login --force
+```
+
+The token lasts thirty days and the robot renews it on its own. A robot switched off for longer
+than that comes back needing `login` again, which `account status` says in as many words.
+
 ### Identity and power (`configd`)
 
 ```

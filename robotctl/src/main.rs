@@ -225,6 +225,23 @@ enum Namespace {
         command: UpdateCommand,
     },
 
+    /// The Hugging Face account this robot belongs to.
+    ///
+    /// A robot on a LAN needs no account: the console is a URL on the same wifi. An account is
+    /// what lets a robot be reached from *outside* the LAN — it is how a rendezvous service knows
+    /// which robots are yours.
+    ///
+    /// Signing in is a device-code flow: this prints a short code, somebody approves it on
+    /// huggingface.co from any device, and the robot picks up the token. No browser on the robot
+    /// and no callback URL, so it works over ssh and it works from a phone.
+    ///
+    /// `docs/design/remote-access-design.md` §2.
+    #[command(subcommand_required = true, arg_required_else_help = true)]
+    Account {
+        #[command(subcommand)]
+        command: AccountCommand,
+    },
+
     /// Which `.onnx` runs in which slot — try a policy, and put it back.
     ///
     /// Slots are `walk`, `stand`, `sitstand`, `ground_pick`, `kick_left`, `kick_right` and
@@ -805,6 +822,35 @@ enum PadCommand {
     /// this robot no longer has and the bond is refused.
     Forget {
         mac: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// `robotctl account …`
+#[derive(Subcommand, Debug)]
+enum AccountCommand {
+    /// Sign this robot in to a Hugging Face account.
+    Login {
+        /// Print the code and exit instead of waiting for it to be approved.
+        ///
+        /// The robot keeps polling either way — the waiting is `updaterd`'s, not this process's
+        /// — so `account status` picks up where this left off. Ctrl-C does the same thing.
+        #[arg(long)]
+        no_wait: bool,
+        /// Sign in even though this robot already belongs to an account.
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Which account this robot belongs to.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Forget the account. The robot stops being reachable from outside the LAN.
+    Logout {
         #[arg(long)]
         json: bool,
     },
@@ -2187,6 +2233,166 @@ fn result_of(response: proto::Response) -> Result<serde_json::Value, Failure> {
         return Err(Failure::from_rpc(error));
     }
     Ok(response.result.unwrap_or(serde_json::Value::Null))
+}
+
+/// `robotctl account` — the Hugging Face account this robot belongs to.
+///
+/// `updaterd`'s, for `policy.*`'s reason: it is the daemon with a network stack, and this binary
+/// deliberately does not link one — it is on the recovery path.
+fn run_account(socket: &Path, command: AccountCommand) -> Result<(), Failure> {
+    let mut client = Client::connect_to("updaterd", socket)?;
+    client.hello()?;
+
+    match command {
+        AccountCommand::Status { json } => {
+            let result = result_of(client.call(&proto::Call::AccountStatus)?)?;
+            if json {
+                println!("{}", compact(&result));
+                return Ok(());
+            }
+            print!("{}", render_account(&decode(&result)?));
+            Ok(())
+        }
+        AccountCommand::Logout { json } => {
+            let result = result_of(client.call(&proto::Call::AccountLogout)?)?;
+            if json {
+                println!("{}", compact(&result));
+                return Ok(());
+            }
+            let done: proto::AccountLogoutResult = decode(&result)?;
+            match done.was {
+                Some(username) => println!(
+                    "signed out {username}\n  \
+                     this robot is no longer reachable from outside its own network"
+                ),
+                None => println!("this robot was not signed in to anything"),
+            }
+            Ok(())
+        }
+        AccountCommand::Login {
+            no_wait,
+            force,
+            json,
+        } => {
+            let result = result_of(client.call(&proto::Call::AccountLogin(
+                proto::AccountLoginParams { force },
+            ))?)?;
+            if json {
+                println!("{}", compact(&result));
+                return Ok(());
+            }
+            let login: proto::AccountLoginResult = decode(&result)?;
+
+            // The code first and alone, because that is the one thing the next thirty seconds
+            // depend on somebody reading. The mini's app learned the expensive version of this
+            // lesson — it opened a browser and the code scrolled away underneath it.
+            println!("Open {} and enter this code:\n", login.verification_uri);
+            println!("    {}\n", login.user_code);
+
+            if no_wait {
+                println!(
+                    "The robot is waiting for it — `robotctl account status` says whether it \
+                     has been approved."
+                );
+                return Ok(());
+            }
+            wait_for_login(&mut client, login.expires_in)
+        }
+    }
+}
+
+/// Poll `account.status` until the login resolves, and say what happened.
+///
+/// **Nothing here is load-bearing for the login itself.** `updaterd` is doing the polling; this
+/// only watches. So Ctrl-C is free, and so is losing the terminal — which is the property that
+/// makes the same call work from a phone that backgrounds itself.
+fn wait_for_login(client: &mut Client, expires_in: u64) -> Result<(), Failure> {
+    /// Slower than the robot's own poll of Hugging Face, because this is a second-hand view of
+    /// it: a tighter loop would only ask `updaterd` the same question between its answers.
+    const EVERY: std::time::Duration = std::time::Duration::from_secs(3);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(expires_in);
+    eprintln!("Waiting for approval…");
+    loop {
+        std::thread::sleep(EVERY);
+        let status: proto::AccountStatusResult =
+            decode(&result_of(client.call(&proto::Call::AccountStatus)?)?)?;
+
+        if let Some(account) = &status.account
+            && status.login.is_none()
+        {
+            println!("Signed in as {}.", account.username);
+            return Ok(());
+        }
+        if let Some(error) = &status.last_error {
+            return Err(Failure::new(
+                exit::FAILED,
+                format!("the login did not complete: {error}"),
+            ));
+        }
+        // `login` gone with no account and no error is a robot that was signed out from
+        // somewhere else mid-flow. Rare, and better named than waited out.
+        if status.login.is_none() && status.account.is_none() {
+            return Err(Failure::new(
+                exit::FAILED,
+                "the login is no longer in flight, and this robot is signed in to nothing"
+                    .to_string(),
+            ));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(Failure::new(
+                exit::FAILED,
+                "the code expired before it was approved — run `account login` again".to_string(),
+            ));
+        }
+    }
+}
+
+/// `account status` for a person.
+fn render_account(status: &proto::AccountStatusResult) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+
+    match &status.account {
+        None => out.push_str(
+            "not signed in\n  \
+             this robot is reachable on its own network only. `robotctl account login` changes \
+             that\n",
+        ),
+        Some(account) => {
+            let _ = writeln!(out, "signed in as {}", account.username);
+            // A token's remaining life is only worth a line when it is short or gone: the
+            // ordinary answer is "twenty-nine days", which nobody asked about.
+            let days = account.token_expires_in / 86_400;
+            if account.token_expires_in <= 0 {
+                let _ = writeln!(
+                    out,
+                    "  the stored token has expired{}",
+                    if account.refreshable {
+                        " and the robot could not renew it — sign in again"
+                    } else {
+                        " and there is nothing to renew it with — sign in again"
+                    }
+                );
+            } else if days < 3 {
+                let _ = writeln!(out, "  the token expires in under {} days", days + 1);
+            }
+        }
+    }
+
+    if let Some(login) = &status.login {
+        let _ = writeln!(
+            out,
+            "a login is waiting for approval: enter {} at {} ({} minutes left)",
+            login.user_code,
+            login.verification_uri,
+            login.expires_in / 60
+        );
+    }
+    if let Some(error) = &status.last_error {
+        let _ = writeln!(out, "last login attempt: {error}");
+    }
+    out
 }
 
 /// Ask `configd` one question and print the answer.
@@ -4163,6 +4369,9 @@ fn run(cli: Cli) -> Result<(), Failure> {
                 return run_pad_bindings(&cli.robot_socket, &cli.pad_config, command);
             }
             return run_pad(&cli.config_socket, command);
+        }
+        Namespace::Account { command } => {
+            return run_account(&cli.socket, command);
         }
         Namespace::Policy { command, file } => {
             return run_policy(&cli.robot_socket, &cli.socket, &file, command);

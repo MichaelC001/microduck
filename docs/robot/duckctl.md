@@ -333,6 +333,29 @@ duckctl --name <robot-name> update watch
 It prints where the update in flight has got to and then everything that follows. It never receives
 a reply, so it ends with Ctrl-C.
 
+## The Hugging Face account
+
+```
+duckctl account login
+```
+
+Prints a code to approve at <https://hf.co/oauth/device>. **The robot does the waiting**, so this
+tool disconnects as soon as it has printed the code — approve it from anywhere, then:
+
+```
+duckctl account status
+```
+
+```
+duckctl account logout
+```
+
+This is the one thing that works on a robot that has never seen a network: no wifi means no
+console and no LAN, and Bluetooth is what is left. Signing in over BLE is the same flow the setup
+wizard runs.
+
+A robot already signed in refuses and names the account. `--force` replaces it.
+
 ## Policies and skills
 
 What each slot runs, and which skills this robot has:

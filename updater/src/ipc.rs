@@ -18,7 +18,7 @@
 //! trigger an update or a rollback, so it is created `0o660`, group-owned, and every
 //! mutating request is logged with the caller's uid/pid from `SO_PEERCRED`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -120,6 +120,13 @@ pub struct Server {
 
     /// Test-only override of the owning uid; `None` means "read it from the socket".
     forced_owner_uid: Option<u32>,
+
+    /// Which Hugging Face account this robot belongs to.
+    ///
+    /// Not part of the engine: it shares nothing with an update but the network stack, and it
+    /// must stay answerable *during* one — `account.status` is polled while a login is in
+    /// flight, and queueing that behind a download would make a wizard look stuck.
+    account: Arc<crate::account::Account>,
 }
 
 impl Server {
@@ -139,7 +146,24 @@ impl Server {
             allow_uids,
             allow_gids,
             forced_owner_uid: None,
+            account: Arc::new(crate::account::Account::new(crate::account::Store::new(
+                crate::account::DEFAULT_PATH,
+            ))),
         }
+    }
+
+    /// Point the account at a token file and a Hugging Face of your choosing.
+    ///
+    /// Only for tests, and it is not optional there: [`Self::with_policy`] uses
+    /// [`crate::account::DEFAULT_PATH`], and a test that ran against it would read — or on a
+    /// developer's machine try to write — the real robot's credential.
+    #[doc(hidden)]
+    pub fn with_account_for_test(mut self, token_path: PathBuf, endpoint: String) -> Self {
+        self.account = Arc::new(crate::account::Account::with_endpoint(
+            crate::account::Store::new(token_path),
+            endpoint,
+        ));
+        self
     }
 
     /// Build a server with an explicit owning uid.
@@ -239,6 +263,15 @@ impl Server {
     /// therefore inherit the bypass and lose the protection: exactly the wrong half of
     /// each. It also needs the same engine mutex and progress plumbing as a
     /// client-triggered update.
+    /// Keep the account token from expiring under a robot that is simply left on.
+    ///
+    /// Separate from [`Self::spawn_periodic_checks`] because it is unconditional: that one is
+    /// off unless a `check_interval` is configured, and a robot with update checks disabled
+    /// still has an account that stops working after thirty days.
+    pub fn spawn_account_maintenance(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(crate::account::maintain(Arc::clone(&self.account)))
+    }
+
     pub fn spawn_periodic_checks(
         self: &Arc<Self>,
         interval: Duration,
@@ -602,6 +635,23 @@ impl Server {
                     Err(e) => Response::err(Some(id), e.to_rpc_error()),
                 }
             }
+            // ── account.* ───────────────────────────────────────────────────────
+            //
+            // None of the three touches the engine, so none takes its lock: a login is an HTTP
+            // round trip and a file, and both are outside every release directory. That is also
+            // what makes `status` answerable during an update, which it has to be.
+            Call::AccountLogin(params) => {
+                match Arc::clone(&self.account).login(params.force).await {
+                    Ok(login) => Response::ok(Some(id), &login),
+                    Err(e) => Response::err(Some(id), e.to_rpc_error()),
+                }
+            }
+            Call::AccountStatus => Response::ok(Some(id), &self.account.status().await),
+            Call::AccountLogout => match self.account.logout().await {
+                Ok(result) => Response::ok(Some(id), &result),
+                Err(e) => Response::err(Some(id), e.to_rpc_error()),
+            },
+
             // Read-only and no engine lock: asking the Hub what exists changes nothing here.
             Call::PolicySearch(params) => match crate::policy::search(&params.query).await {
                 Ok(result) => Response::ok(Some(id), &result),

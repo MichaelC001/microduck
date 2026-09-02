@@ -7,24 +7,31 @@ shape — a bridge from a rendezvous service to the signalling server already ru
 and it is right about the shape. This page owns the two things that shape needs and does not have:
 a **credential that names an account**, and a **service to present it to**.
 
-**Nothing here is built.** What is *established*, by probing the live services rather than by
-reading about them:
+**Built so far** (2026-09-02): §2 — the account. `account.login`, `account.status` and
+`account.logout` are served by `updaterd` and reachable locally, over BLE and over a WebRTC
+datachannel; `robotctl account login` prints a code and waits, `duckctl account login` prints one
+and hangs up. The credential lands in `/etc/robot/hf-token` and renews itself. Nothing consumes it
+yet — that is §3, and it is the next slice.
 
-- **Hugging Face implements the OAuth device grant.** Its discovery document advertises
-  `device_authorization_endpoint: https://huggingface.co/oauth/device` and
-  `urn:ietf:params:oauth:grant-type:device_code` among `grant_types_supported`. A full round trip
-  short of the user's click works today: the endpoint returns a `user_code`, a `verification_uri` of
-  `https://hf.co/oauth/device` and `expires_in: 300`, and polling `/oauth/token` answers
-  `authorization_pending`. §2.2 has the transcript.
-- **The client has to be public.** The device endpoint refuses the `reachy_mini` client id
-  (`71146982-…`) with `invalid_client`: "if you want to use the device code flow without client
-  secret authentication, delete the secret from the oauth app to make it public". §2.3.
-- **The `reachy_mini` rendezvous Space is live and gated.** `pollen-robotics-reachy-mini-central.hf.space`
-  serves a status dashboard anonymously; `/events` and `/api/robot-status` answer **401** without a
-  token. Its *repository* is private, so nobody here can read the server. §4.
-- **Its wire is not the gst signalling protocol on a WebSocket.** It is the same JSON envelopes over
-  **HTTP** — SSE inbound, `POST` outbound — with per-hop peer and session ids. This corrects a claim
-  in `remote-webrtc.md` §7; §3.2 says what it costs.
+What is **established** about the services this depends on, by probing them rather than by reading
+about them:
+
+- **Hugging Face implements the OAuth device grant**, and `huggingface_hub` ships a **first-party
+  public client** for it (`DEVICE_CODE_OAUTH_CLIENT_ID`), so this needs no OAuth app registered
+  anywhere. §2.3.
+- **A token lasts 30 days**, comes with a refresh token, and **that refresh token rotates on every
+  refresh**. §2.7 is what that costs.
+- **The token carries every scope Hugging Face grants** — `write-repos`, `manage-repos`, `jobs`,
+  `read-billing` — because the first-party client takes no `scope` parameter. §2.4, and it is the
+  one thing here that should change before a duck ships.
+- **`/oauth/userinfo` answers with the identity in one round trip**, so nothing decodes a JWT.
+- **The `reachy_mini` rendezvous Space is live and gated.**
+  `pollen-robotics-reachy-mini-central.hf.space` serves a status dashboard anonymously; `/events`
+  and `/api/robot-status` answer **401** without a token. Its *repository* is private, so nobody
+  here can read the server. §4.
+- **Its wire is not the gst signalling protocol on a WebSocket.** It is the same JSON envelopes
+  over **HTTP** — SSE inbound, `POST` outbound — with per-hop peer and session ids. This corrects
+  a claim in `remote-webrtc.md` §7; §3.2 says what it costs.
 
 ## 1. What has to be true for a duck to be reachable
 
@@ -45,11 +52,16 @@ service too was made the other way for this reason, and §3.1 is where it costs 
 
 ## 2. The account is an OAuth device flow against Hugging Face
 
-### 2.1 Why the device grant, and not the flow `reachy_mini` runs
+### 2.1 Why the device grant, which is also where `reachy_mini` ended up
 
-`reachy_mini` uses authorization code + PKCE with the redirect URI pointed back at the robot's own
-HTTP server: `http://reachy-mini.local:8000/api/hf-auth/oauth/callback`, or `localhost` for the
-tethered variant (`apps/sources/hf_auth.py`). It works, and three costs come with it:
+`reachy_mini` has **both**. It started with authorization code + PKCE, pointing the redirect URI
+back at the robot's own HTTP server — `http://reachy-mini.local:8000/api/hf-auth/oauth/callback`,
+or `localhost` for the tethered variant — and added a device-code flow later, described in its own
+source as "refresh-capable, redirect-free login", which is what its mobile app's setup wizard uses
+now. Its reasons are the two below. Worth knowing that this is not a difference of opinion: it is
+the same conclusion reached twice, from different directions.
+
+Three costs come with the redirect flow:
 
 - **A registered redirect URI per hostname.** The app has exactly one, which is why the mobile app
   carries a loopback HTTP bridge that catches HF's callback on `127.0.0.1:8000` and rewrites it as a
@@ -64,72 +76,129 @@ tethered variant (`apps/sources/hf_auth.py`). It works, and three costs come wit
 The device grant inverts that: the robot asks HF for a code, says *"open hf.co/oauth/device and type
 M8HJ-FMGN"*, and polls until somebody has. No redirect URI, no hostname, no requirement that the
 authorising device can reach the robot at all — a phone on cellular is fine. It is the flow specified
-for a device with no browser and no keyboard, which is what a duck is.
+for a device with no browser and no keyboard, which is what a duck is. It is also the only one of the
+two that yields a **refresh token**, which is what keeps a robot reachable past its first month
+(§2.7).
 
 The cost, stated plainly: somebody types eight characters. That is the whole of it, and it is smaller
 than the mDNS dependency it removes.
 
-### 2.2 The flow, and the transcript that proves it
+**Three invariants inherited from `reachy_mini`'s wizard**, none of which is about Python and all of
+which were learned the expensive way:
+
+- **Lead with the code, and never open a browser by yourself.** HF sends no
+  `verification_uri_complete` and its device page asks the user to *type* the code — auto-switching
+  to Safari hid the code before anyone could read it. Offer "copy the code and open Hugging Face" as
+  one action and keep the code on screen. `robotctl account login` prints the code on its own line
+  and nothing else; `duckctl` prints it after the reply.
+- **The client going away mid-flow is expected, not an error.** Opening the HF page backgrounds a
+  phone app, and iOS then tears the GATT link down. By that point the transport has done its job:
+  the daemon is polling and the client comes back to `status`. This is why `login` answers with a
+  code rather than a token, and it is the property `robotctl`'s wait loop is careful to not be
+  load-bearing for.
+- **Appearing on the rendezvous is the only real success signal.** A stored token means the *login*
+  worked, not that the robot is reachable — their wizard treats "a robot with my hardware id is in
+  the listing" as done and everything else as recoverable. §3 has to make that check available
+  here, and `account.status` reporting relay state is where it will go.
+
+### 2.2 The flow, and the transcript it was built from
 
 ```
 POST https://huggingface.co/oauth/device
-     client_id=<duck client>&scope=openid profile
+     client_id=26be6b09-91c5-47da-9861-d2d2bb7a7e36
 
-  → {"device_code":"96e6e116-…","user_code":"M8HJ-FMGN",
+  → {"device_code":"41ad39ae-…","user_code":"A6MY-0314",
      "verification_uri":"https://hf.co/oauth/device","expires_in":300}
 
 POST https://huggingface.co/oauth/token
      grant_type=urn:ietf:params:oauth:grant-type:device_code
-     &client_id=<duck client>&device_code=96e6e116-…
+     &client_id=26be6b09-…&device_code=41ad39ae-…
 
-  → HTTP 400 {"error":"authorization_pending", …}   until the user approves
+  → HTTP 400 {"error":"authorization_pending"}      until somebody approves it
+  → {"access_token":"…","refresh_token":"…","expires_in":2591999,
+     "token_type":"bearer","id_token":"…","scope":"manage-repos write-repos …"}
+
+GET  https://huggingface.co/oauth/userinfo   Authorization: Bearer <access token>
+  → {"name":"Rouanet","preferred_username":"PierreRouanet","orgs":[…], …}
 ```
 
-Three details the response fixes, and each is a decision we do not have to make:
+No `scope` is sent, because the first-party client does not take one (§2.4). Five things this
+answers, each of which is a decision nobody has to make now:
 
-- **No `verification_uri_complete`.** There is no QR-able URL that carries the code, so the code has
-  to be *read by a person* — which means displaying it is the **client's** job, not the daemon's
-  (§2.6). A robot with no screen cannot show it.
-- **No `interval`.** RFC 8628's default of 5 s applies, and `slow_down` has to be honoured if it ever
-  arrives.
-- **`expires_in: 300`.** Five minutes, which is short enough that the client must show a countdown
-  and long enough that nobody hurries.
+- **No `verification_uri_complete`.** There is no URL carrying the code, so the code has to be
+  *read by a person* — which makes displaying it the **client's** job, not the daemon's. The
+  `?user_code=` variant is synthesised on the robot the way `huggingface_hub` does it, for a
+  client that wants one copy-and-open button, and §2.1's first invariant says lead with the code
+  anyway.
+- **No `interval`.** RFC 8628's five seconds applies, and `slow_down` adds five more.
+- **`expires_in: 300`** on the *code*. Five minutes: long enough not to hurry, short enough that a
+  client should show what is left, which is why `account.status` counts it down rather than
+  repeating the original number.
+- **`expires_in: 2591999`** on the *token*, with a `refresh_token`. §2.7.
+- **`/oauth/userinfo` gives the identity in one round trip** — `preferred_username` is the handle
+  and `name` is a display name that can be anything, so the handle is what is stored and shown.
+  The alternative was decoding the `id_token`, which is a JWT parser and a JWKS fetch for the same
+  string.
 
-### 2.3 The OAuth client is a decision — **open**
+### 2.3 The OAuth client is Hugging Face's own — **closed**
 
-Three ways to get a `client_id`, and only one of them is a good idea:
+`huggingface_hub` ships a **first-party public device-code client**, `DEVICE_CODE_OAUTH_CLIENT_ID`
+= `26be6b09-91c5-47da-9861-d2d2bb7a7e36`, which is what `hf auth login` uses. It is public — no
+secret, so nothing needs baking into a release beyond a public identifier — and it needs no OAuth
+app registered anywhere. `updater::account::CLIENT_ID` is that constant, and it is the whole of
+what this decision came to.
 
-- **Register one public app in the `pollen-robotics` org, no secret, device grant enabled.** One
-  stable id baked into the release, revocable in one place, and the only thing on the robot is a
-  public identifier. **Recommended.** It needs somebody with org admin to create it and hand back
-  the id; that is the one thing in this page nobody here can do.
-- **Reuse `reachy_mini`'s `71146982-…`.** Blocked, not merely inelegant: it is a confidential client,
-  so the device endpoint demands Basic auth with its secret. Baking that secret into every duck's
-  release makes it not a secret, and deleting it from the app to make it public would change the
-  security posture of the mini's flow to suit ours.
-- **Dynamic registration.** `POST https://huggingface.co/oauth/register` is unauthenticated and
-  honours `token_endpoint_auth_method: "none"`, so a robot could mint its own public client at first
-  login with no admin involvement at all. It works — that is how the transcript above was obtained.
-  Rejected as the plan: a client per robot (or per release) is a fleet of identities nobody can
-  enumerate or revoke, and it looks like abuse at scale. Worth knowing as the escape hatch if the org
-  route is slow, since it means the design is not *blocked* on an admin.
+Two alternatives, recorded because the first one looks obvious and is blocked:
 
-### 2.4 Scopes: `openid profile read-repos`, and deliberately not more
+- **`reachy_mini`'s own app** (`71146982-…`) is a **confidential** client, so the device endpoint
+  refuses it — *"if you want to use the device code flow without client secret authentication,
+  delete the secret from the oauth app to make it public"*. Baking that secret into every duck
+  makes it not a secret, and making the app public would change the mini's posture to suit us.
+- **Dynamic registration.** `POST /oauth/register` is unauthenticated and honours
+  `token_endpoint_auth_method: "none"`, so a robot could mint its own public client at first login.
+  It works. Pointless now, and a client per robot would be a fleet of identities nobody can
+  enumerate or revoke.
 
-The rendezvous needs to know *who* the token belongs to, which is `openid profile`. `read-repos` is
-one scope further and buys something real: `policy install` reaching a **private** policy repo, from
-the same token file, with no new mechanism (`policy-channel-design.md` §7).
+### 2.4 The scopes are not ours to choose, and that is the thing to fix before shipping
 
-`reachy_mini` asks for `openid profile read-repos write-repos manage-repos inference-api`, because
-its robot installs apps and pushes artifacts. **Do not copy that list.** A duck holds this token
-unattended, on a board that can be lost or given away; a credential that can *push* to the owner's
-repositories is a much worse thing to lose than one that can read them. If a future feature needs to
-write, it is a scope change with a re-login, which is a day's work — where a robot that has been able
-to write all along is not recoverable.
+The first-party client takes **no `scope` parameter**, and the token it issues carries everything
+Hugging Face grants:
+
+```
+manage-repos write-repos read-repos gated-repos contribute-repos write-collections
+read-collections openid write-discussions inference-api jobs webhooks read-billing read-mcp
+```
+
+A duck therefore holds a credential that can **push to its owner's repositories, start Jobs and
+read their billing** — for something whose entire purpose is proving an identity to a rendezvous
+service. Every Reachy Mini in the field is in the same position; that is context, not a defence.
+
+What the account actually needs is `openid profile`, plus `read-repos` for one real thing:
+`policy.install` reaching a **private** policy repo from the same token file, with no new
+mechanism (`policy-channel-design.md` §7).
+
+**So the narrow version is a Pollen-owned public device-code client with
+`openid profile read-repos`** — one constant in `account.rs` and one click by somebody with HF org
+admin. It is not blocking: the flow works today and a scope change is a re-login. It is worth
+doing before a duck goes home with anybody, because the failure mode is asymmetric — a robot that
+has been able to write all along cannot be un-done, while a robot that needs a wider scope later
+just asks for one.
 
 ### 2.5 Where the token lives, and who writes it
 
-`/etc/robot/hf-token`, `root:robot`, `0640`.
+`/etc/robot/hf-token`, `root:robot`, `0640`. JSON: the access token, the refresh token, an
+absolute `expires_at` (the response gives a duration, and a duration means nothing after a reboot)
+and the username, so `account.status` answers with no network at all — a robot that is offline
+still knows who it belongs to.
+
+**Written `0600` and relaxed to `0640` after the group is set**, rather than through
+`fsutil::write_atomic` like everything else this daemon writes. That helper does not set a mode,
+and a token that lands `0644` and is chmodded a moment later is world-readable for that moment —
+the kind of window that is invisible in testing and permanent in a `ps`-and-`cat` afterwards.
+`account::write_private` is the same rename dance with the temp file opened `0600` from the start,
+and a test asserts the landed file gives "others" nothing. On a board with no `robot` group — a
+developer's laptop, a half-provisioned board — it stays root-only and says so once, rather than
+guessing.
 
 **Not in `robotd.toml`.** Every mechanism that exists for that file is wrong for a secret:
 `robotctl configure --list` prints what a robot changes, `policy-channel-design.md`'s full-screen
@@ -143,43 +212,88 @@ behalf, already runs as `root`, and already has a namespace of calls that write 
 daemon that answers `system.info` would be a new kind of thing for it. `mediad` must not own it: it
 runs as `User=mediad` under `ProtectHome=yes`, and it is the process a remote peer talks to.
 
-**`mediad` reads it** — on each connect attempt, plus a slow poll (30 s) while it has none, which is
-also its `waiting for token` state. No cross-daemon notification: `reachy_mini` has a
+**`mediad` will read it** — on each connect attempt, plus a slow poll (30 s) while it has none,
+which is also its `waiting for token` state. Not built: nothing consumes the credential until §3
+exists. No cross-daemon notification: `reachy_mini` has a
 `notify_token_change` call from its auth router into its relay, and re-reading the file on the
 reconnect that is going to happen anyway makes it unnecessary. The cost is that a fresh login takes
 up to a poll interval to become a live producer, which nobody can perceive.
 
 ### 2.6 The calls, and which transports may reach them
 
-`account.login`, `account.status`, `account.logout` on `updaterd`. `login` starts the flow and returns
-`verification_uri`, `user_code` and `expires_in`; progress is a notification, the way `update.*`
-already pushes progress, so a client that reconnects can resubscribe (`duck-ipc-proto`'s rule).
+`account.login`, `account.status` and `account.logout`, on `updaterd` — for `policy.*`'s reasons
+exactly: it is the daemon with a network stack, `robotctl` must not link one (it is on the
+recovery path), and the credential it stores is also what would reach a private Hub repo, which is
+already this daemon's job. `configd` owns *config*, not credentials, and has no HTTP client.
+`mediad` must not own it: it runs unprivileged under `ProtectHome=yes`, and it is the process a
+remote peer talks to.
 
-**`account.login` is the highest-authority call on the robot, and it is worth saying why.** Whoever
-completes it binds the robot to *their* Hugging Face account and thereby gets remote access to its
-camera and its control channel from anywhere. Nothing else in the API hands the robot to a stranger;
-`robot.shutdown` merely stops it.
+**`login` answers with a code and hands the waiting to the daemon.** There is no progress
+notification and no long-held connection; a client polls `status`. That is not a simplification,
+it is the requirement — see §2.1's second invariant.
 
-So it is **local and BLE only, refused over WebRTC** — the same table `route.rs` already keeps, with
-the same reasoning `system.setPairingPin` is refused by: BLE is the authenticated transport, and ten
-metres of radio means whoever ran it is in the room (`remote-webrtc.md` §4). `account.status` is safe
-everywhere and useful everywhere — a client wants to say "signed in as *someone*, relay connected".
-`account.logout` moves the same boundary as `login` and goes with it.
+**All three are routed to all three transports**: local, BLE and a WebRTC datachannel. BLE matters
+most and is the easy call — it is the only transport that reaches a robot fresh out of a box,
+which has no network, hence no console and no LAN to open one from, and it is where a setup wizard
+already lives. Locally it is `robotctl`, which is how a developer does anything.
 
-### 2.7 Whether the token expires is the one unknown that matters — **open**
+**WebRTC is the one worth arguing about, and it is worth writing down rather than assuming.** The
+console is the obvious place to put a "sign in" button — a page with the robot already on screen
+— and the alternative is ssh or a phone. Against that: this is the one call on that transport
+whose effect is **durable in a way nothing else there is**. Everything else a LAN peer may do is
+bounded by the session; `account.login` converts *having been on the wifi once* into remote access
+that outlives being there. §4 of `remote-webrtc.md` accepts that anyone on the network has the
+robot and its camera. It did not consider anyone on the network having them from another continent
+next month.
 
-HF advertises `refresh_token` in `grant_types_supported`, and what the token response actually carries
-— `expires_in`, `refresh_token`, or neither — cannot be known without one real authorization, which
-needs a human click. It decides a real piece of work:
+Three things make that acceptable rather than merely permitted:
 
-- **No expiry** → store the access token, and §2.5 is finished.
-- **Expiry** → store the refresh token too, refresh ahead of time, and handle a refresh that fails as
-  "signed out" rather than as an error nobody sees. That is a scheduler and a second secret.
+- **A robot that already belongs to somebody refuses.** `account.login` without `force` answers
+  `INVALID_PARAMS` naming the account, so a LAN peer cannot silently take a robot from its owner —
+  it has to say so, and a well-behaved client has to ask a person first.
+- **It is visible.** `account.status` names the account, from any transport, with no
+  authorisation at all. "Which account does this robot belong to" is a question anybody can ask.
+- **It is revocable** — `account.logout` from anywhere, and revoking the grant on Hugging Face,
+  which no robot-side gate could offer.
 
-`reachy_mini` stores only the access token, at `~/.cache/huggingface/token`, and its robots stay
-reachable — evidence that long-lived tokens are at least possible, not proof about the device grant's.
-**Answer this before writing §2.5's storage**, because "one string in a file" and "two strings plus a
-clock" are different designs and the cheap one is only correct if the answer is no.
+**One consequence that lives in another file, and it found a bug.** `account.login` and
+`account.logout` are `Call::is_mutating`, which is what `updaterd` authorises against a peer's
+uid, so `mediad` had to be added to `allow_users` in `deploy/updater.toml` alongside `btd`. That
+grants `mediad` exactly what its route table permits and nothing more — but the two files now have
+to agree, so `mediad::route`'s `only_these_mutating_calls_are_reachable_over_webrtc` names every
+mutating method that transport may carry, and routing a new one has to change that list on
+purpose. `btd` has had the same test since BLE could apply an update.
+
+Writing it down immediately turned up two methods nobody had noticed were broken:
+**`policy.install` and `policy.fetch` were routed to WebRTC while `mediad` was not in
+`allow_users`**, so `updaterd` answered them `PERMISSION_DENIED` — the console could offer a Hub
+browser whose install button could not work. The `allow_users` line added here for the account
+fixes them too. That is the argument for a named list over a counted one: the list is where a
+transport's authority and a config file's grants are forced to agree out loud.
+
+### 2.7 The token expires in 30 days, and the refresh token rotates — **closed**
+
+A device-code token comes back as `expires_in: 2591999` — thirty days — with a `refresh_token`,
+and refreshing **rotates** it: the answer carries a *new* refresh token and the old one is spent.
+So the store is two strings plus a clock, and there are three consequences worth naming.
+
+**A robot that is simply left on must renew itself.** `updater::account::maintain` wakes every six
+hours and refreshes anything with under a week left — three-quarters of the way through the
+token's life, leaving a week of retries for a board whose network is marginal. It is spawned
+unconditionally, unlike the update scheduler, because a robot with update checks switched off
+still has an account that stops working after a month.
+
+**Rotation leaves one window that cannot be closed.** Between "Hugging Face issued a new pair" and
+"the new pair is on disk", the old refresh token is already dead. A power cut in that window
+leaves a robot holding a credential HF will not renew. No write ordering fixes it — the rotation
+happened on their side — so it is handled rather than prevented: the write is atomic (a reader
+sees the old pair or the new one, never half of one), the failure surfaces in
+`account.status`'s `last_error`, and the fix is signing in again. Renewing a week early is what
+makes that a nuisance rather than an outage.
+
+**A robot switched off for more than thirty days comes back needing a login**, and no margin can
+save it. `account.token_expires_in` goes negative, which is how a client says so rather than
+leaving somebody to discover it when the robot fails to appear.
 
 ## 3. The bridge
 
@@ -279,29 +393,31 @@ service authenticated both ends, and after this page that argument gets *stronge
 has proved account ownership, where a LAN peer has proved only that it is on the wifi. The robot can
 tell them apart by source address (§7 notes it), and nothing yet acts on the difference. Keep it true.
 
-## 4. Which rendezvous — **open**
+## 4. The rendezvous is the one `reachy_mini` uses — **decided**
 
-`pollen-robotics-reachy-mini-central.hf.space` is live, and what a robot needs from it is small:
-`GET /events` (SSE, Bearer), `POST /send` (Bearer), `GET /api/robot-status`. Its `meta` is free-form,
-so a duck registers with whatever identifies it — `producer.rs` already assembles exactly the fields a
-listing wants (name, serial, release, `api_version`), which is what `webrtc-console.md` §5 predicted
-the rendezvous would need.
+`pollen-robotics-reachy-mini-central.hf.space`, the Space the mini's fleet already registers
+with. Decided rather than derived: it costs no backend work, it is proven under real robots, and
+the whole of this page becomes a client-side project.
 
-**Reusing it** costs no backend work, is proven under a fleet of real robots, and makes the whole of
-this page a client-side project. Against that: we do not own its deploys, its lease and session
-gating were written around a robot with a different lock model, a duck appears in whatever lists a
-user's robots (a feature or a bug depending on intent), and **its repository is private** — so nobody
-on this side can read the server they depend on, which is how §3.2's protocol surprise happened at all.
+What a robot needs from it is small: `GET /events` (SSE, `Authorization: Bearer <hf token>`),
+`POST /send` (same), and `GET /api/robot-status` to ask whether it is still listed. Its `meta` is
+free-form, so a duck registers with whatever identifies it — and `producer.rs` already assembles
+exactly the fields a listing wants (name, serial, release, `api_version`), which is what
+`webrtc-console.md` §5 predicted the rendezvous would need. A `kind` of `microduck` goes in the
+same structure, so a client that lists a user's robots can tell a duck from a mini without
+opening a session.
 
-**Our own instance** is a Space and a couple of hundred lines: we own the lease policy, the eviction
-sweeper and the deploy schedule, and the duck's identity model is ours. Against that: a second service
-to run and watch, duplicating something that exists and works.
+Three things follow from reusing it, and they are costs rather than objections:
 
-**Recommendation: reuse for the first proof, and decide on the answer to §5.** The service URL is one
-config key — `reachy_mini` keeps it in an env var for exactly this reason — so moving later costs a
-line. What actually couples us is not the relay, it is the client: if the client is a page we publish,
-the service stays a rendezvous and reuse is nearly free; if the client is somebody else's app, we are
-inside their product and should own neither the Space nor the decision alone.
+- **We do not own its deploys.** A change there can break remote access on ducks, and nobody here
+  would have reviewed it. The mitigation is that the URL is one constant — `reachy_mini` keeps it
+  in an env var for this reason — so moving to our own instance is a line, not a project.
+- **Its repository is private**, so nobody on this side can read the server they depend on. That
+  is how §3.2's protocol surprise came to be a surprise at all: the wire had to be reverse-read
+  from the client. Read access would be worth having even with the decision made.
+- **Its lease, eviction and session gating were written around a robot with a different lock
+  model** — `RobotAppLock`, local app versus remote session. A duck has no app, so §3.4 takes its
+  reconnect behaviour and leaves that part.
 
 ## 5. The client, and where it is served — **open**
 
@@ -350,22 +466,30 @@ that argument; it adds the one thing §4 could not name, which is **when the bin
 performs it**:
 
 - Before `account.login`, a duck is unreachable from outside the LAN. There is nothing to attack.
-- After it, one account owns it, and `account.login`/`account.logout` are the calls that can move that
-  ownership — hence BLE-and-local only (§2.6). A remote peer that could re-bind the robot to its own
-  account would be the one call able to take the robot away from its owner.
+- After it, one account owns it, and `account.login`/`account.logout` are the calls that can move
+  that ownership. They are routed to every transport, including WebRTC, and §2.6 is the argument
+  for that plus the three properties that make it hold — a robot already signed in refuses, the
+  binding is readable by anybody, and it is revocable from more places than the robot.
+- **A remote peer re-binding the robot is a narrower risk than it looks**, and it is worth being
+  precise about why: only clients of the account the robot *currently* belongs to can reach it
+  remotely at all, so a remote `account.login` is the owner's own client. The exposure that is
+  real is the LAN one, and that is what `force` exists for.
 - A robot that changes hands must be logged out. That is the same list as the pairing PIN and the
   calibration — a hand-over process, in M6 — and this is one more item on it, worth adding while the
   list is still being written rather than after a second-hand duck streams to a stranger.
 - The token is a bearer credential in a file, so a stolen board yields it. The answer is §2.4's
-  read-only scopes, not encryption: a robot has to read this file unattended at boot, so anything it
-  can decrypt without a human is something the thief can decrypt too.
+  read-only scopes, not encryption: a robot has to read this file unattended at boot, so anything
+  it can decrypt without a human is something the thief can decrypt too. Which is the sharpest
+  argument for narrowing the scopes — as it stands, a stolen duck yields a token that can write to
+  its owner's repositories.
 
 ## 8. Order of work
 
 Five slices, and the first two are independently useful and need no client:
 
-1. **`account login`** — the device flow, the token file, `account status`. `updaterd`. Verifiable on
-   its own: it prints the Hugging Face username. Answers §2.7 the moment it first succeeds.
+1. **`account login`** — the device flow, the token file, `account status`. `updaterd`. **Done**:
+   three calls, three transports, two CLIs, and a token that renews itself. Verifiable on its own,
+   which is what made it the first slice: it prints the Hugging Face username.
 2. **The relay, registering only** — producer registration, the negotiated heartbeat, reconnect and
    backoff, the split-brain poll. `mediad`. Verifiable with no client at all: the service's dashboard
    counts a producer and `/api/robot-status` lists the duck.
@@ -378,10 +502,13 @@ Five slices, and the first two are independently useful and need no client:
 
 | | needs |
 |---|---|
-| §2.3 the OAuth client id | one public app in the `pollen-robotics` HF org, no secret, device grant — created by somebody with org admin |
-| §2.7 token expiry | one real authorization, then read the token response. A click |
-| §4 which rendezvous | read access to the Space's repository, **or** the decision to stand up our own |
-| §5 where the client is served | follows §4, and is the decision that actually couples us to a service |
+| §2.4 the scope breadth | one public device-code client in the `pollen-robotics` HF org with `openid profile read-repos`, created by somebody with org admin. Not blocking — a scope change is a re-login — and it should not ship without it |
+| §4 read access to the Space | the rendezvous is decided; its source is a private repo, and depending on a server nobody here can read is how §3.2 happened |
+| §5 where the client is served | follows the shape of §3, and is the decision that actually couples us to a service |
+
+Closed since this page was written: the OAuth client (§2.3 — Hugging Face ships one), whether the
+token expires (§2.7 — thirty days, with a rotating refresh token), and which rendezvous to use
+(§4 — the mini's).
 
 ## 10. Not doing
 

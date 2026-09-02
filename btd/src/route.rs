@@ -329,6 +329,26 @@ fn permits(call: &proto::Call) -> bool {
         // The transport is the gate here, not the credential.
         PolicyFetch(_) | PolicyInstall(_) => true,
 
+        // ── the account, which BLE is the right transport for ────────────────
+        //
+        // Signing the robot in to a Hugging Face account is what makes it reachable from outside
+        // the LAN at all, and this is the transport that should carry it — for the reason
+        // `remote-webrtc.md` §4 gives about BLE generally: it is PIN-bonded, and ten metres of
+        // radio range means whoever tapped the button is in the room with the robot.
+        //
+        // It also happens to be the *only* transport that can do it on a robot fresh out of a
+        // box. A duck with no wifi has no console to open and no LAN to open it from, and BLE is
+        // already how such a robot is given a network — so a wizard that joins the wifi and then
+        // signs the robot in is one flow on one transport, which is what the mini's app does.
+        //
+        // The code the flow produces has to be *read by a person*, so the reply carrying it is
+        // the point: this call sends about eighty bytes back, well inside what framing chunks,
+        // and needs no link at all while the user is off approving it — see
+        // `duck_ipc_proto::API_VERSION`'s v21 note on why `login` answers with a code and not
+        // with a token. That is what makes an iPhone dropping the GATT link mid-flow a
+        // non-event rather than a lost login.
+        AccountLogin(_) | AccountStatus | AccountLogout => true,
+
         // Power to the joints. A phone button that drops the robot on the floor is not one to
         // offer, and `robot.init` is its counterpart: standing a robot up moves every joint at once,
         // which wants the person doing it to be looking at the robot rather than at a screen. Both
@@ -457,6 +477,13 @@ mod tests {
                 // the download, the shape gate at load, the clamps, the fall reflex.
                 proto::method::POLICY_INSTALL,
                 proto::method::POLICY_FETCH,
+                // Binding the robot to a Hugging Face account, and unbinding it. Provisioning,
+                // like the two below it and for the same reason: a robot out of a box has no
+                // network, so it has no console and no LAN to open one from, and this is the
+                // transport that reaches it. Physical presence is not stretched either — the
+                // person approving the code is holding the phone that is bonded to the robot.
+                proto::method::ACCOUNT_LOGIN,
+                proto::method::ACCOUNT_LOGOUT,
                 proto::method::NET_CONNECT,
                 proto::method::NET_FORGET,
                 proto::method::SYSTEM_SET_NAME,

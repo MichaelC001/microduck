@@ -159,6 +159,37 @@ fn permits(call: &proto::Call) -> bool {
         // neighbour can already replace with `robot.loadPolicy`.
         PolicyFetch(_) | PolicyInstall(_) => true,
 
+        // ── the account, permitted, and this one is worth reading ────────────
+        //
+        // The console is the obvious place to sign a robot in from: it is a page with the robot
+        // already on screen, and the alternative is ssh or a phone. So `account.*` is routed
+        // here.
+        //
+        // **It is also the largest thing this transport grants, and by a different measure than
+        // anything above.** Everything else on this list is bounded by the session: a LAN peer
+        // drives the robot while it is on the wifi, and stops when it leaves. `account.login`
+        // converts being on the wifi *once* into remote access that outlives being there — the
+        // one call here whose effect is durable in that particular way. §4 accepts that anyone
+        // on the network has the robot and its camera; it did not consider anyone on the network
+        // having them from another continent next month.
+        //
+        // Three things make that acceptable rather than merely permitted, and they are the
+        // reason this is a paragraph and not a line:
+        //
+        // - **A robot that already belongs to somebody refuses.** `account.login` without
+        //   `force` answers with the account it belongs to (`Error::AlreadySignedIn`), so a LAN
+        //   peer cannot silently take a robot from its owner — it has to say so.
+        // - **It is visible.** `account.status` names the account, from any transport, without
+        //   authorisation. A robot signed in to a stranger is a question anybody can ask.
+        // - **It is revocable**, by `account.logout` here or on the robot, and by revoking the
+        //   grant on Hugging Face — which no robot-side gate could offer.
+        //
+        // What it is *not* is a reason to route `policy.fetch` after all: that one reaches the
+        // network to put a stranger's weights in charge of fifteen servos, where this reaches it
+        // to prove an identity. Same "the robot touches the network on a peer's behalf", very
+        // different thing arriving.
+        AccountLogin(_) | AccountStatus | AccountLogout => true,
+
         // ── the streams BLE pointed here ────────────────────────────────────
         //
         // `pad.input` exists to measure the cadence of its own delivery, and `btd` refuses it
@@ -306,6 +337,64 @@ mod tests {
                 call.method()
             );
         }
+    }
+
+    /// Exactly which **mutating** calls a WebRTC peer may make, named one by one.
+    ///
+    /// `btd` has had this test since BLE could apply an update; `mediad` did not need one while
+    /// nothing mutating was routed here, and `account.login` is what changed that. It is the same
+    /// boundary and it deserves the same shape of guard: spelled out rather than counted, so
+    /// routing a new mutating method has to change this line and say why in the commit.
+    ///
+    /// The reason a *list* matters more here than the `permits` table alone is that
+    /// `Call::is_mutating` is also what `updaterd` authorises against, and `deploy/updater.toml`
+    /// names `mediad` in `allow_users` — so anything both mutating *and* permitted here is a call
+    /// a LAN peer can get `updaterd` to perform. That is two files agreeing, and this is the test
+    /// that notices when they stop.
+    #[test]
+    fn only_these_mutating_calls_are_reachable_over_webrtc() {
+        let mutating_and_permitted: Vec<&str> = proto::test_support::every_call()
+            .iter()
+            .filter(|call| call.is_mutating() && permits(call))
+            .map(proto::Call::method)
+            .collect();
+
+        assert_eq!(
+            mutating_and_permitted,
+            // In `every_call()`'s order, which is the enum's — the list is a set, and sorting
+            // it by hand would be a second thing to get right.
+            vec![
+                // Powering the robot off. Routed since this transport existed: it drops the
+                // session and leaves nothing mid-transition, which is what you offer a robot
+                // that is misbehaving in front of you.
+                proto::method::ROBOT_SHUTDOWN,
+                // Installing a policy set, and fetching a stranger's policy. Permitted by the
+                // table above — and **this test is how they were found to be broken**. They are
+                // mutating, they were routed here, and `mediad` was not in `allow_users`, so
+                // `updaterd` answered PERMISSION_DENIED: the console could offer a Hub browser
+                // whose install button could not work. Adding `mediad` there for `account.login`
+                // fixed them by accident, which is the sort of accident a named list turns into
+                // a decision.
+                proto::method::POLICY_INSTALL,
+                proto::method::POLICY_FETCH,
+                // Binding this robot to a Hugging Face account, and unbinding it. The argument
+                // is in the table above — briefly: the console is where somebody would sign a
+                // robot in, a robot that already belongs to somebody refuses without `force`,
+                // and `account.status` makes the answer visible to anyone who asks.
+                proto::method::ACCOUNT_LOGIN,
+                proto::method::ACCOUNT_LOGOUT,
+                // Renaming it. The console shows the name in its header, so the place to change
+                // it is the place it is wrong.
+                proto::method::SYSTEM_SET_NAME,
+                // Rebooting it, for `robot.shutdown`'s reason.
+                proto::method::SYSTEM_REBOOT,
+                // Forgetting a gamepad. `pad.pair` is refused — it needs a pad in the room in a
+                // fifteen-second window, which a remote peer cannot satisfy — but unbonding one
+                // is a thing you do *because* the pad is not there.
+                proto::method::PAD_FORGET,
+            ],
+            "a mutating call was routed to WebRTC; is `deploy/updater.toml` still narrow enough?"
+        );
     }
 
     /// The two calls that must never reach a network transport, whatever else changes.

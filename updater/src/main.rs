@@ -611,6 +611,11 @@ async fn serve(args: Args) -> ExitCode {
     ));
     let socket = args.socket.clone();
 
+    // Unconditional, unlike the update scheduler below: a Hugging Face token lasts thirty days
+    // and its refresh token rotates, so a robot that is on for a month loses remote access
+    // unless something renews it. `docs/design/remote-access-design.md` §2.7.
+    server.spawn_account_maintenance();
+
     // The scheduler is what makes `min_supported` effective: without it the floor is
     // inert, because a robot only learns of it when someone opens the app.
     match check_interval {
