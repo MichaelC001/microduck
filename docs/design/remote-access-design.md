@@ -25,13 +25,12 @@ about them:
   `read-billing` — because the first-party client takes no `scope` parameter. §2.4, and it is the
   one thing here that should change before a duck ships.
 - **`/oauth/userinfo` answers with the identity in one round trip**, so nothing decodes a JWT.
-- **The `reachy_mini` rendezvous Space is live and gated.**
-  `pollen-robotics-reachy-mini-central.hf.space` serves a status dashboard anonymously; `/events`
-  and `/api/robot-status` answer **401** without a token. Its *repository* is private, so nobody
-  here can read the server. §4.
+- **The rendezvous is ours**, and it is `pollen-robotics/reachy_mini_central` — a FastAPI app in
+  a Space, readable and changeable by us. Everything §3 and §4 say about it below is read off that
+  server rather than inferred from a client.
 - **Its wire is not the gst signalling protocol on a WebSocket.** It is the same JSON envelopes
-  over **HTTP** — SSE inbound, `POST` outbound — with per-hop peer and session ids. This corrects
-  a claim in `remote-webrtc.md` §7; §3.2 says what it costs.
+  over **HTTP** — SSE inbound, `POST` outbound, `Authorization: Bearer` — with per-hop peer and
+  session ids. This corrects a claim in `remote-webrtc.md` §7; §3.2 says what it costs.
 
 ## 1. What has to be true for a duck to be reachable
 
@@ -343,11 +342,21 @@ like. That is not defensive over-engineering on its part: a half-open TCP connec
 NAT rebinding, a sleeping captive portal — absorbs server-pushed keepalives silently for minutes,
 during which the robot believes it is reachable and is not.
 
-So the relay re-emits `setPeerStatus` periodically, at a cadence **negotiated from the welcome**:
-`recommended_heartbeat_interval_seconds` if offered, else `lease_seconds / 3`, else 5 s — clamped to
-[1 s, 60 s] so a misconfigured service can neither ask for a request storm nor talk us into a cadence
-slower than our own eviction. That ladder is `reachy_mini`'s and it is right; the clamp is the part
-worth copying most.
+The numbers, from the server rather than from a guess: `PRODUCER_LEASE_SECONDS` is **30**, and
+the SSE welcome advertises `recommended_heartbeat_interval_seconds: 10.0`. The lease is keyed
+*only* on inbound `POST /send` — a healthy-looking SSE stream refreshes nothing.
+
+So the relay re-emits `setPeerStatus` at the cadence the welcome names, falling back to 5 s and
+clamped to [1 s, 60 s] so a misconfigured service can neither ask for a request storm nor talk us
+into a cadence slower than our own eviction. `reachy_mini`'s ladder has a middle rung —
+`lease_seconds / 3` — for a server that publishes the lease but not the cadence. **This server
+publishes no `lease_seconds`**, so that rung is unreachable here; it is not worth reproducing a
+negotiation step for a field nothing sends.
+
+**The SSE side has its own keepalive to size against.** After 30 s with nothing to deliver the
+server emits an `event: ping`, whose only job is to stop the HTTP/2 proxy in front of the Space
+from killing an idle connection. A read timeout on our side therefore has to be comfortably more
+than 30 s — `reachy_mini` uses 60, which is two missed pings, and that is the number to take.
 
 ### 3.4 The failure modes are already known, which is the main reason to read their relay
 
@@ -356,10 +365,12 @@ Four, each cheap to build in now and expensive to rediscover:
 - **Split-brain.** The SSE stream is healthy and the service no longer lists us — a `setPeerStatus`
   round trip cancelled mid-flight leaves exactly this. Nothing in the connection notices. Their
   answer: poll `/api/robot-status` every 30 s, and force a reconnect after two consecutive misses.
-- **Concurrent sessions.** The service is supposed to gate them; enforce one at a time on the robot
-  anyway, and refuse with an `endSession` carrying a *reason* rather than by silence. A second peer
-  driving the same robot is `remote-webrtc.md` §9's interleaving bug with two remote writers instead
-  of a pad and a peer.
+- **Concurrent sessions.** The server does gate this — `handle_start_session` answers
+  `sessionRejected` with `reason: "robot_busy"` and the `activeApp` that holds it, and pushes a
+  `sessionStateChanged` to the owner's other devices so their UI flips inside the round trip. So
+  the robot-side gate is belt-and-braces rather than a workaround, and it should stay: a second
+  peer driving the same robot is `remote-webrtc.md` §9's interleaving bug with two remote writers
+  instead of a pad and a peer, and that is a bad enough outcome to check twice.
 - **Ordering at registration.** Register as a producer *before* reporting `connected`, or every
   observer — a status call, a page, a person — sees "remote access enabled" while the service does not
   yet know the robot exists.
@@ -393,6 +404,33 @@ service authenticated both ends, and after this page that argument gets *stronge
 has proved account ownership, where a LAN peer has proved only that it is on the wifi. The robot can
 tell them apart by source address (§7 notes it), and nothing yet acts on the difference. Keep it true.
 
+### 3.7 What a duck has to call itself, and it is not free-form after all
+
+`meta` is free-form to the *protocol*, but the server reads two keys out of it, so a duck that
+fills it in arbitrarily gets subtly wrong behaviour rather than a clear failure:
+
+- **`hardware_id`** (or `install_id`) is the **stable-identity key**. On `setPeerStatus` the server
+  looks for another producer of the *same user* carrying the same value and evicts the older one —
+  ending its session if it had one. It exists because a re-flashed daemon, a duplicated SD card or
+  a stale tray process would otherwise show up as a second robot forever.
+
+  So a duck **must** put something stable there, and the obvious candidate already exists:
+  `producer.rs` reads the SoC serial for the local `meta`, which is exactly "stable per physical
+  robot across reinstalls and renames". Leaving the key out means a robot that reconnects with a
+  fresh token is listed twice; putting the *name* there means renaming a robot forks its identity.
+- **`name`** is what the listing shows a person, and the consumer's `name` is what the server
+  reports back as `activeApp` to the owner's other devices. `transport` (`"wifi"` / `"usb"`) is a
+  mini-ism a duck can leave alone; a `kind` of `microduck` is what lets one client list both
+  families without opening a session.
+
+**And a hazard that belongs in the provisioning path, not here: peers are keyed by token.**
+`get_or_create_peer` is a `token -> peer_id` map, and a second SSE connection on the same token
+supersedes the first. Two robots sharing one token therefore take turns being reachable, and
+neither is broken in a way that looks like a bug. Each duck runs its own device flow, so each gets
+its own token — *unless* an image is cloned with `/etc/robot/hf-token` in it, which is exactly what
+this project's flashing path does with everything else in `/etc/robot`. Whatever produces a golden
+image has to exclude that file, and this is the note that says why.
+
 ## 4. The rendezvous is the one `reachy_mini` uses — **decided**
 
 `pollen-robotics-reachy-mini-central.hf.space`, the Space the mini's fleet already registers
@@ -407,17 +445,22 @@ exactly the fields a listing wants (name, serial, release, `api_version`), which
 same structure, so a client that lists a user's robots can tell a duck from a mini without
 opening a session.
 
-Three things follow from reusing it, and they are costs rather than objections:
+**We own it**, which is what makes this reuse rather than a dependency: `pollen-robotics/reachy_mini_central`
+is a FastAPI app in a Space, and it can be read and changed on this side. Two things follow:
 
-- **We do not own its deploys.** A change there can break remote access on ducks, and nobody here
-  would have reviewed it. The mitigation is that the URL is one constant — `reachy_mini` keeps it
-  in an env var for this reason — so moving to our own instance is a line, not a project.
-- **Its repository is private**, so nobody on this side can read the server they depend on. That
-  is how §3.2's protocol surprise came to be a surprise at all: the wire had to be reverse-read
-  from the client. Read access would be worth having even with the decision made.
-- **Its lease, eviction and session gating were written around a robot with a different lock
-  model** — `RobotAppLock`, local app versus remote session. A duck has no app, so §3.4 takes its
-  reconnect behaviour and leaves that part.
+- **The protocol is a fact, not a guess.** Every number in §3 — the 30 s lease keyed on `POST /send`,
+  the 10 s advertised cadence, the 30 s SSE ping, the `sessionRejected` gate, the `hardware_id`
+  eviction — is read off `app.py`. An earlier version of this page said the repository was private;
+  that was a wrong-name 401 mistaken for a permissions error, and the wire was reverse-read from
+  the client for no reason.
+- **A duck-shaped need is a pull request, not a fork.** If ducks want a different lease, a `kind`
+  filter on the listing, or an eviction rule that does not assume one robot per token, those are
+  changes to a server we maintain. Which also means the reverse: a change made there for the mini
+  can break ducks, and after this page there is a second family of robots on it.
+
+The one thing that does not transfer is its **lock model** — `RobotAppLock`, local app versus
+remote session, which the mini's relay gates incoming sessions on. A duck has no app, so §3.4
+takes the reconnect behaviour and leaves that part.
 
 ## 5. The client, and where it is served — **open**
 
@@ -438,12 +481,16 @@ Three ways:
 **Recommendation: the third, then the first.** The proof that the token path and the lease work needs
 no UI, and deferring the hosting decision by a slice costs nothing.
 
-One thing to know before that page is written: `EventSource` **cannot set headers**, so a browser
-speaking the service's SSE wire must either put the token in the query string — which is what
-`reachy-mini-js` does, and what puts a bearer token into Space access logs and every proxy in between
-— or read the stream with `fetch` and parse SSE by hand. The robot relay uses a header and is right to
-(`central_signaling_relay.py` says so in as many words). The page should too, which makes it `fetch`
-plus a few lines of line-splitting rather than one browser API.
+One thing to know before that page is written, and it is settled rather than a preference:
+`EventSource` **cannot set headers**, so a browser speaking the SSE wire must either put the token
+in the query string or read the stream with `fetch` and split SSE by hand. `reachy-mini-js` does
+the former. **The server is removing it** — `_resolve_hf_token` accepts `?token=` only as a
+transitional fallback, logs a deprecation warning per client IP, and says in its own docstring that
+the query form goes once the known clients ship the header. A bearer token in a query string is
+also a bearer token in the Space's access log and in every proxy in between.
+
+So the page is `fetch` plus a few lines of line-splitting, not one browser API — and it should be
+written that way first rather than written twice.
 
 ## 6. NAT: decide the STUN server, defer TURN
 
@@ -503,12 +550,16 @@ Five slices, and the first two are independently useful and need no client:
 | | needs |
 |---|---|
 | §2.4 the scope breadth | one public device-code client in the `pollen-robotics` HF org with `openid profile read-repos`, created by somebody with org admin. Not blocking — a scope change is a re-login — and it should not ship without it |
-| §4 read access to the Space | the rendezvous is decided; its source is a private repo, and depending on a server nobody here can read is how §3.2 happened |
 | §5 where the client is served | follows the shape of §3, and is the decision that actually couples us to a service |
 
 Closed since this page was written: the OAuth client (§2.3 — Hugging Face ships one), whether the
-token expires (§2.7 — thirty days, with a rotating refresh token), and which rendezvous to use
-(§4 — the mini's).
+token expires (§2.7 — thirty days, with a rotating refresh token), which rendezvous to use (§4 —
+the mini's), and whether we can read it (§4 — we maintain it; the "private repo" in an earlier
+draft was a wrong-name 401).
+
+One item this page created rather than closed: **a golden image must not carry
+`/etc/robot/hf-token`**, because peers are keyed by token and two robots sharing one take turns
+being reachable. §3.7. That belongs to whoever owns the flashing path.
 
 ## 10. Not doing
 
