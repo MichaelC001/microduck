@@ -504,9 +504,8 @@ mod tests {
             "schema_version": 2, "kind": "episodic", "duration_s": 1.0, "chain": true
         }));
         assert!(roll.chain);
-        assert_eq!(
-            PolicyManifest::default().chain,
-            false,
+        assert!(
+            !PolicyManifest::default().chain,
             "absent means a single run"
         );
     }
