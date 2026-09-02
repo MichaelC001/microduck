@@ -138,7 +138,10 @@ through `rkaiq`.
 **Three things keep it open.**
 
 **Outside the LAN.** The same design with a rendezvous service and TURN in front (§7),
-deliberately built second.
+deliberately built second. [`remote-access-design.md`](../design/remote-access-design.md) now owns
+it: a Hugging Face account reached by the OAuth device flow, and a bridge from a rendezvous Space to
+the signalling server already on the robot. Four decisions in its §9 gate the work, and two of them
+are somebody else's click.
 
 **The SDK, and a small Python client.** §5.3 designs it as WebSocket plus snapshot: the same
 JSON-RPC, no media stack, `get_frame` returning a JPEG, a few dozen lines — and `mediad`'s
