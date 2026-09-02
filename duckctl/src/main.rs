@@ -911,8 +911,14 @@ enum Pad {
 /// `duckctl account …` — the account half of `robotctl account`, over the radio.
 #[derive(Subcommand, Debug)]
 enum Account {
-    /// Start a login, and print the code to approve.
+    /// Start a login, and open the page to approve it on.
     Login {
+        /// Print the code and the URL, and open nothing.
+        ///
+        /// Also the automatic behaviour when stderr is not a terminal, so a script does not
+        /// launch a browser on somebody's desktop.
+        #[arg(long)]
+        no_open: bool,
         /// Sign in even though this robot already belongs to an account.
         #[arg(long)]
         force: bool,
@@ -1791,7 +1797,7 @@ fn request_line(command: &Command) -> Result<(String, Duration), Box<dyn std::er
         // outbound HTTP round trip rather than a local read — the same budget `policy load` gets
         // for the same reason. What it does *not* wait for is the approval: that is the whole
         // shape of the flow, and it is why this tool can disconnect immediately afterwards.
-        Command::Account(Account::Login { force }) => (
+        Command::Account(Account::Login { force, .. }) => (
             proto::method::ACCOUNT_LOGIN,
             serde_json::json!({ "force": force }),
             SLOW_REPLY_TIMEOUT,
@@ -2077,24 +2083,62 @@ fn progress_line(params: &serde_json::Value) -> String {
 /// never restarts mid-flight — `btd` may be the transport it arrived over — so both are restarted
 /// about five seconds *after* the reply goes out (`docs/design/restart-order.md` §1). Every client
 /// has to expect that, and a phone app should show it as a step rather than an error.
-/// What to do with the code `account.login` just answered with.
+/// Show the code `account.login` just answered with, and open the page to approve it on.
 ///
 /// The reply is JSON like every other, and this is the one call where the *human* next step is
 /// not obvious from it: a code and a URL mean nothing until somebody is told to go and type them.
 /// Printed as a note rather than instead of the JSON, so `--verbose` and piping still behave.
+///
+/// **The code is printed before the browser opens, and that order is the whole of the caution
+/// here.** `remote-access-design.md` §2.1 inherits an invariant from the mini's phone app — never
+/// open a browser by yourself — and it is about a phone: the browser replaces the only screen and
+/// backgrounds the app, so a code shown a moment earlier is gone before it is read. A terminal
+/// does not have that problem, the code stays in the scrollback, and this tool already launches a
+/// browser for `duckctl open`. So it opens — after printing, so a failure to open leaves the code
+/// on screen rather than an error where the instructions should have been.
+///
+/// It opens `verification_uri_complete`, which carries `?user_code=` and saves typing the code at
+/// all. Hugging Face preserves that parameter across its own login redirect, so it survives a
+/// browser that is not signed in yet.
 fn account_note(command: &Command, reply: &serde_json::Value) -> Option<String> {
-    if !matches!(command, Command::Account(Account::Login { .. })) {
-        return None;
-    }
+    use std::io::IsTerminal;
+
+    let no_open = match command {
+        Command::Account(Account::Login { no_open, .. }) => *no_open,
+        _ => return None,
+    };
     let result = reply.get("result")?;
     let code = result["user_code"].as_str()?;
     let uri = result["verification_uri"].as_str()?;
     let minutes = result["expires_in"].as_u64().unwrap_or(0) / 60;
-    Some(format!(
+
+    let mut note = format!(
         "\nOpen {uri} and enter this code:\n\n    {code}\n\n\
          You have about {minutes} minutes. The robot is doing the waiting, so this tool can \
          disconnect now — `duckctl account status` says whether it worked."
-    ))
+    );
+
+    // Not a terminal means a script, and a script that opens a browser window on whoever runs it
+    // is a surprise rather than a convenience.
+    if no_open || !std::io::stderr().is_terminal() {
+        return Some(note);
+    }
+
+    let complete = result["verification_uri_complete"]
+        .as_str()
+        .unwrap_or(uri)
+        .to_string();
+    match webbrowser::open(&complete) {
+        Ok(()) => note.push_str(&format!("\n\nOpened {complete}")),
+        // A warning, never a failure: the login has started, the code is valid for minutes, and
+        // the terminal above says everything needed to finish it by hand. This is the opposite of
+        // `duckctl open`, where opening the browser *is* the command and failing it is the result.
+        Err(e) => note.push_str(&format!(
+            "\n\nCould not open a browser ({e}) — the URL and code above still work. \
+             `--no-open` skips this."
+        )),
+    }
+    Some(note)
 }
 
 fn restart_note(command: &Command, reply: &serde_json::Value) -> Option<&'static str> {
@@ -2338,6 +2382,78 @@ mod tests {
         let (line, _) = request_line(&cli.command).expect("a request");
         assert!(line.contains(r#""method":"system.setName""#), "{line}");
         assert!(line.contains(r#""name":"leduckpierre""#), "{line}");
+    }
+
+    /// `account login` sends `force` as the robot's route table expects it.
+    #[test]
+    fn a_forced_login_says_so_on_the_wire() {
+        let cli = Cli::try_parse_from(["duckctl", "account", "login", "--force"])
+            .expect("the login form parses");
+        let (line, _) = request_line(&cli.command).expect("a request");
+        assert!(line.contains(r#""method":"account.login""#), "{line}");
+        assert!(line.contains(r#""force":true"#), "{line}");
+
+        let cli = Cli::try_parse_from(["duckctl", "account", "login"]).expect("parses");
+        let (line, _) = request_line(&cli.command).expect("a request");
+        assert!(line.contains(r#""force":false"#), "{line}");
+    }
+
+    /// The code and the URL reach the terminal, and `--no-open` opens nothing.
+    ///
+    /// The assertion that matters is the *order*: the code is in the note whether or not a
+    /// browser could be launched, because a login whose instructions were replaced by an error
+    /// message is a login nobody can finish by hand. `remote-access-design.md` §2.1.
+    #[test]
+    fn a_login_note_carries_the_code_without_opening_anything() {
+        let cli =
+            Cli::try_parse_from(["duckctl", "account", "login", "--no-open"]).expect("parses");
+        let reply = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "user_code": "A6MY-0314",
+                "verification_uri": "https://hf.co/oauth/device",
+                "verification_uri_complete": "https://hf.co/oauth/device?user_code=A6MY-0314",
+                "expires_in": 300,
+                "interval": 5
+            }
+        });
+
+        let note = account_note(&cli.command, &reply).expect("a note for a login");
+        assert!(note.contains("A6MY-0314"), "the code: {note}");
+        assert!(
+            note.contains("https://hf.co/oauth/device"),
+            "where to type it: {note}"
+        );
+        assert!(
+            note.contains("about 5 minutes"),
+            "how long it is good for: {note}"
+        );
+        assert!(
+            !note.contains("Opened"),
+            "--no-open must not launch a browser: {note}"
+        );
+        assert!(
+            note.contains("duckctl account status"),
+            "the note has to say how to find out whether it worked: {note}"
+        );
+    }
+
+    /// Every other command gets no login note, including the two next to it in the namespace.
+    #[test]
+    fn only_a_login_gets_the_code_note() {
+        let reply = serde_json::json!({ "result": { "account": null } });
+        for args in [
+            vec!["duckctl", "account", "status"],
+            vec!["duckctl", "account", "logout"],
+            vec!["duckctl", "info"],
+        ] {
+            let cli = Cli::try_parse_from(&args).expect("parses");
+            assert!(
+                account_note(&cli.command, &reply).is_none(),
+                "{args:?} must get no login note"
+            );
+        }
     }
 
     /// The point of the whole thing: a robot named by nobody who is typing. The environment has to

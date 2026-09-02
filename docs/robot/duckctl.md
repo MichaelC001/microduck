@@ -339,8 +339,9 @@ a reply, so it ends with Ctrl-C.
 duckctl account login
 ```
 
-Prints a code to approve at <https://hf.co/oauth/device>. **The robot does the waiting**, so this
-tool disconnects as soon as it has printed the code — approve it from anywhere, then:
+Prints a code and opens <https://hf.co/oauth/device> with it already filled in. **The robot does
+the waiting**, so this tool disconnects as soon as it has printed the code — approve it in the
+browser it opened, or from any other device, then:
 
 ```
 duckctl account status
@@ -353,6 +354,13 @@ duckctl account logout
 This is the one thing that works on a robot that has never seen a network: no wifi means no
 console and no LAN, and Bluetooth is what is left. Signing in over BLE is the same flow the setup
 wizard runs.
+
+```
+duckctl account login --no-open
+```
+
+for the code and the URL without a browser — which is also what you get automatically when the
+output is not a terminal, so a script launches nothing.
 
 A robot already signed in refuses and names the account. `--force` replaces it.
 

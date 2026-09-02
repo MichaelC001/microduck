@@ -85,11 +85,24 @@ than the mDNS dependency it removes.
 **Three invariants inherited from `reachy_mini`'s wizard**, none of which is about Python and all of
 which were learned the expensive way:
 
-- **Lead with the code, and never open a browser by yourself.** HF sends no
-  `verification_uri_complete` and its device page asks the user to *type* the code — auto-switching
-  to Safari hid the code before anyone could read it. Offer "copy the code and open Hugging Face" as
-  one action and keep the code on screen. `robotctl account login` prints the code on its own line
-  and nothing else; `duckctl` prints it after the reply.
+- **Lead with the code. Whether to open a browser is a property of the surface, not a rule.** The
+  mini's app learned that auto-switching to Safari hid the code before anyone could read it — but
+  that is a *phone*: the browser replaces the only screen and backgrounds the app, so the code is
+  gone. A terminal keeps it in the scrollback, and the same reasoning gives three different
+  answers here:
+
+  - `robotctl account login` opens nothing, because it runs **on the robot**, which has no
+    display. It prints the code and waits.
+  - `duckctl account login` prints the code and *then* opens the page, because it runs on your
+    own machine — where `duckctl open` already launches a browser. `--no-open` suppresses it, and
+    so does stderr not being a terminal, because a script that opens a browser window on whoever
+    runs it is a surprise. A browser that will not launch is a warning appended to the code, never
+    an error replacing it.
+  - A phone app keeps the mini's rule as written, for the mini's reason.
+
+  What makes opening worth anything is `verification_uri_complete`: HF sends none, so the robot
+  synthesises the `?user_code=` form, and Hugging Face preserves that parameter across its own
+  login redirect — so the code is filled in even for a browser that was not signed in yet.
 - **The client going away mid-flow is expected, not an error.** Opening the HF page backgrounds a
   phone app, and iOS then tears the GATT link down. By that point the transport has done its job:
   the daemon is polling and the client comes back to `status`. This is why `login` answers with a
