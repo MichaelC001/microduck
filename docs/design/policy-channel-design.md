@@ -104,19 +104,32 @@ handler and its completion at the home pose):
 
 ```text
 IPC call        → validate what this side can, set an intent, answer accepted
-loop            → finish the tick, home the robot with torque on
-at home         → re-resolve the params, rebuild the controller (load + warm-up)
+loop            → re-resolve the params, start loading the controller on a worker thread
+                  (load + warm-up), and decide whether the change touches the network
+                  that is driving
+  if it does    → home the robot with torque on; swap in at home, fresh
+  if it does not→ swap in wherever the robot is, carrying the running state across
 on success      → publish the new policy names, resume
 ```
 
-Two differences from a mode switch, and only the second needs new code.
+Three differences from a mode switch.
 
 **Scope.** A load overrides one field of `policy_params` and re-resolves, exactly as the mode
 switch sets `policy_params.mode` and re-resolves. Rebuilding the controller reloads all seven
-sessions rather than the one that changed. That is the cost the mode switch already pays and
-which has been accepted in shipped behaviour, so it is not being optimised here; if it turns out
-to matter on the board, loading on a worker thread and swapping in at the home pose is a fix for
-both callers and should be done as one.
+sessions rather than the one that changed — on a worker thread, because a swap can now happen
+under a moving robot and the loop cannot stall for the load.
+
+**Only a change to the network driving moves the robot.** The first field report against this
+design: load a walk, walk, sit, `policy reset walk` — and the robot ramped to home and stood up.
+The reset was right about the config and wrong about the robot: `sitstand` had it, and the reset
+did not touch `sitstand`. So the loop compares the change against what stepped last tick, by the
+resolved path of that one network (the whole skill list when a skill is driving, since a skill is
+an index into it). Unchanged, and the new controller is swapped in wherever the robot is, taking
+over the old one's seat, skill and filter state, so the next tick is the same network from the
+same place. Changed, and the robot goes home first as every change used to, holding there until
+the load lands if it has not yet. A reload always counts as a change to whatever is driving: it
+exists for the case where the paths are unchanged and the bytes are not, so the paths cannot
+answer.
 
 **A request that is already true does no work.** Resetting a slot nobody overrode, or loading
 the file a slot is already running, is answered as an acceptance that queued nothing — the same

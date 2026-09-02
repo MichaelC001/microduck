@@ -920,6 +920,12 @@ fn builtin_skills() -> Vec<SkillDef> {
         }
     }
 
+    fallback_skills()
+}
+
+/// The three skills every robot has had since the prototype, for a board whose set says nothing
+/// about itself — and the timing a skill slot borrows when it names one the set left out.
+fn fallback_skills() -> Vec<SkillDef> {
     let kick = |name: &str, file: &str| SkillDef {
         name: name.to_owned(),
         // The kick files are `ball_kick_*.onnx`, which is not `<name>.onnx` — the names are the
@@ -950,6 +956,10 @@ fn builtin_skills() -> Vec<SkillDef> {
         kick("kick_left", "ball_kick_left.onnx"),
         kick("kick_right", "ball_kick_right.onnx"),
     ]
+}
+
+fn fallback_skill(name: &str) -> Option<SkillDef> {
+    fallback_skills().into_iter().find(|s| s.name == name)
 }
 
 /// One policy slot, named — the seven `[policy]` path keys as a value rather than a field name.
@@ -984,6 +994,10 @@ impl Slot {
         Slot::KickRight,
         Slot::Roulade,
     ];
+
+    /// The slots that are one-shot skills: each names the `[[policy.skill]]` entry of the same
+    /// name, and its path is what that skill runs. See `PolicyParams::resolved_skills`.
+    pub const SKILLS: [Slot; 3] = [Slot::KickLeft, Slot::KickRight, Slot::Roulade];
 
     /// The serde key, exactly as `[policy]` spells it.
     pub fn as_str(self) -> &'static str {
@@ -1080,12 +1094,33 @@ impl PolicyParams {
     /// to re-declare one cannot silently remove it, which is the failure mode of the other rule.
     ///
     /// A named skill keeps the built-in's position in the priority order; a new one goes last.
+    ///
+    /// **The three skill slots are applied last and win.** `kick_left`, `kick_right` and `roulade`
+    /// are `[policy]` keys like `walk`, and `robotctl policy load roulade <file>` writes that key —
+    /// so the file it names has to be the one the `roulade` skill runs, or the load reports a
+    /// file the robot never touches, which is what it did. A slot naming a skill the set does not
+    /// declare adds it with the built-in's timing; `"none"` switches it off, as it does for a
+    /// `[[policy.skill]]` entry.
     pub fn resolved_skills(&self) -> Vec<SkillDef> {
         let mut resolved = builtin_skills();
         for configured in &self.skills {
             match resolved.iter_mut().find(|s| s.name == configured.name) {
                 Some(builtin) => *builtin = configured.clone(),
                 None => resolved.push(configured.clone()),
+            }
+        }
+        for slot in Slot::SKILLS {
+            let Some(path) = self.slot(slot) else {
+                continue;
+            };
+            match resolved.iter_mut().find(|s| s.name == slot.as_str()) {
+                Some(skill) => skill.path = Some(path.clone()),
+                None => {
+                    if let Some(mut skill) = fallback_skill(slot.as_str()) {
+                        skill.path = Some(path.clone());
+                        resolved.push(skill);
+                    }
+                }
             }
         }
         // A skill whose path is the `"none"` sentinel is switched off, which is how a built-in is
@@ -1133,13 +1168,12 @@ impl PolicyParams {
             }
         };
 
-        let (walk_default, stand, sitstand, ground_pick, kick) = match self.mode {
+        let (walk_default, stand, sitstand, ground_pick) = match self.mode {
             Mode::Walk => (
                 "alpha_walking.onnx",
                 Some("alpha_stand.onnx"),
                 Some("alpha_sitstand.onnx"),
                 Some("alpha_ground_pick.onnx"),
-                true,
             ),
             // The prototype's roller preset, since rebased on the alpha defaults: roller
             // policy, crouch on the ground-pick trigger, and everything else — sit/stand,
@@ -1152,8 +1186,18 @@ impl PolicyParams {
                 None,
                 Some("alpha_sitstand.onnx"),
                 Some("roller_crouch.onnx"),
-                true,
             ),
+        };
+
+        // What each skill slot reports is what the skill of that name will run — derived from the
+        // list rather than resolved beside it, so `robot.policies` cannot name a file the robot is
+        // not running.
+        let skills = self.resolved_skills();
+        let skill_file = |name: &str| {
+            skills
+                .iter()
+                .find(|s| s.name == name)
+                .and_then(|s| s.resolved_path())
         };
 
         ResolvedPolicy {
@@ -1175,9 +1219,9 @@ impl PolicyParams {
             stand: path(&self.stand, stand),
             sitstand: path(&self.sitstand, sitstand),
             ground_pick: path(&self.ground_pick, ground_pick),
-            kick_left: path(&self.kick_left, kick.then_some("ball_kick_left.onnx")),
-            kick_right: path(&self.kick_right, kick.then_some("ball_kick_right.onnx")),
-            roulade: path(&self.roulade, Some("roulade.onnx")),
+            kick_left: skill_file("kick_left"),
+            kick_right: skill_file("kick_right"),
+            roulade: skill_file("roulade"),
             action_scale: self.action_scale.unwrap_or(match self.mode {
                 Mode::Walk => 0.9,
                 Mode::Roller => 0.8,
@@ -1196,7 +1240,7 @@ impl PolicyParams {
                 Mode::Roller => 0.8,
             }),
             ground_pick_gain_ratio: self.ground_pick_gain_ratio,
-            skills: self.resolved_skills(),
+            skills,
             voltage_adapt: self.voltage_adapt,
             nominal_voltage: self.nominal_voltage,
         }
@@ -1887,6 +1931,84 @@ mod tests {
             "{:?}",
             kick.resolved_path()
         );
+    }
+
+    /// **A skill slot is the file the skill runs.** `robotctl policy load roulade <file>` writes
+    /// `[policy] roulade`, and until this the daemon reported that file in the slot while the
+    /// `roulade` skill went on running the built-in — a load that changed the report and nothing
+    /// else.
+    #[test]
+    fn a_skill_slot_override_is_what_the_skill_runs() {
+        use std::path::PathBuf;
+
+        let params = super::PolicyParams {
+            roulade: Some(PathBuf::from("/srv/roll.onnx")),
+            kick_left: Some(PathBuf::from("/srv/left.onnx")),
+            ..Default::default()
+        };
+        let resolved = params.resolved();
+
+        let file = |name: &str| {
+            resolved
+                .skills
+                .iter()
+                .find(|s| s.name == name)
+                .and_then(|s| s.resolved_path())
+        };
+        assert_eq!(file("roulade"), Some(PathBuf::from("/srv/roll.onnx")));
+        assert_eq!(file("kick_left"), Some(PathBuf::from("/srv/left.onnx")));
+        assert!(
+            file("kick_right")
+                .unwrap()
+                .ends_with("ball_kick_right.onnx"),
+            "an untouched slot keeps the built-in"
+        );
+        // And the report agrees with the list, in both directions.
+        assert_eq!(resolved.roulade, file("roulade"));
+        assert_eq!(resolved.kick_left, file("kick_left"));
+        assert_eq!(resolved.kick_right, file("kick_right"));
+    }
+
+    /// The slot beats a `[[policy.skill]]` entry of the same name: `policy load` is the later,
+    /// more explicit decision, and it keeps the entry's timing.
+    #[test]
+    fn a_skill_slot_overrides_the_entry_path_and_keeps_its_timing() {
+        use std::path::PathBuf;
+
+        let params = super::PolicyParams {
+            roulade: Some(PathBuf::from("/srv/roll.onnx")),
+            skills: vec![super::SkillDef {
+                name: "roulade".into(),
+                path: Some(PathBuf::from("/srv/other.onnx")),
+                duration: 2.5,
+                chain: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let roulade = params
+            .resolved()
+            .skills
+            .into_iter()
+            .find(|s| s.name == "roulade")
+            .unwrap();
+        assert_eq!(roulade.path, Some(PathBuf::from("/srv/roll.onnx")));
+        assert_eq!(roulade.duration, 2.5);
+    }
+
+    /// `"none"` in a skill slot switches the skill off, exactly as it does in the entry.
+    #[test]
+    fn a_skill_slot_set_to_none_removes_the_skill() {
+        use std::path::PathBuf;
+
+        let params = super::PolicyParams {
+            kick_right: Some(PathBuf::from("none")),
+            ..Default::default()
+        };
+        let resolved = params.resolved();
+        let names: Vec<&str> = resolved.skills.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["roulade", "kick_left"]);
+        assert_eq!(resolved.kick_right, None, "and the report says so");
     }
 
     /// **A policy that does not end itself needs the daemon to end it.**

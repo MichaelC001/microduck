@@ -205,8 +205,10 @@ No release, no file to edit, no restart:
 sudo robotctl policy load walk /home/radxa/my_walking.onnx
 ```
 
-The robot goes to its home pose, loads it, and drives again. `sudo robotctl policy reset walk`
-puts that slot back; with no slot, it puts all seven back.
+If the robot is walking, it goes to its home pose, loads it, and drives again. If it is doing
+something else — sitting, standing still — nothing moves: the network being replaced is not the
+one running, and the swap happens underneath. `sudo robotctl policy reset walk` puts that slot
+back; with no slot, it puts all seven back.
 
 #### Trying somebody else's
 

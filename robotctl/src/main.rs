@@ -231,8 +231,10 @@ enum Namespace {
     /// `roulade`. Each one is a config key; `load` writes it and `reset` removes it, so a change
     /// survives a reboot and undoing it is one command rather than an edit.
     ///
-    /// The swap is live: the robot returns to its home pose, loads, and drives again, without a
-    /// restart and without going limp. A file that is not `obs[1,61] -> actions[1,14]` is refused
+    /// The swap is live, without a restart and without going limp. Only a change to the network
+    /// that is driving right now sends the robot to its home pose first; a `walk` reset while it
+    /// sits, or a `stand` load while it walks, happens without the robot moving. A file that is
+    /// not `obs[1,61] -> actions[1,14]` is refused
     /// before anything changes, and a load that fails anyway leaves the policy that was running
     /// in place — trying a gait must not be able to cost you the one you had.
     ///
@@ -820,7 +822,8 @@ enum PolicyCommand {
 
     /// Run a different policy in one slot, from now on.
     ///
-    /// The robot goes home, loads it, and drives again. The path is resolved against the
+    /// Loaded live: if that slot's network is the one driving, the robot goes home first and
+    /// drives again from there; otherwise nothing moves. The path is resolved against the
     /// directory you are in, and the file has to still be there at the next boot — a slot whose
     /// file has gone falls back to this robot's own policy and says so in `robotctl health`.
     Load {

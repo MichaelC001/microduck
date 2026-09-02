@@ -166,6 +166,32 @@ enum SkillPhase {
     Unwinding,
 }
 
+/// Which network drove the robot on the last step, as a policy change needs to know it.
+///
+/// [`Net`] with the skill index replaced by the skill's name, because an index is only meaningful
+/// against one skill list and a change may be about to install another.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Driving {
+    Walk,
+    Stand,
+    SitStand,
+    GroundPick,
+    /// A one-shot skill, by its config name.
+    Skill(String),
+}
+
+impl std::fmt::Display for Driving {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Driving::Walk => f.write_str("walk"),
+            Driving::Stand => f.write_str("stand"),
+            Driving::SitStand => f.write_str("sitstand"),
+            Driving::GroundPick => f.write_str("ground_pick"),
+            Driving::Skill(name) => f.write_str(name),
+        }
+    }
+}
+
 pub struct Controller {
     policy: Policy,
     tuning: Tuning,
@@ -190,6 +216,8 @@ pub struct Controller {
     /// with different numbers.
     active: Option<ActiveSkill>,
     sit: Sit,
+    /// The network the last [`Self::step`] ran. `None` before the first.
+    last_net: Option<Net>,
 }
 
 impl Controller {
@@ -203,7 +231,45 @@ impl Controller {
             ground_pick: None,
             active: None,
             sit: Sit::Up,
+            last_net: None,
         }
+    }
+
+    /// The network that drove on the last step, or `None` before there was one.
+    pub fn driving(&self) -> Option<Driving> {
+        Some(match self.last_net? {
+            Net::Walk => Driving::Walk,
+            Net::Stand => Driving::Stand,
+            Net::SitStand => Driving::SitStand,
+            Net::GroundPick => Driving::GroundPick,
+            Net::Skill(index) => Driving::Skill(
+                self.skills
+                    .skills
+                    .get(index)
+                    .map_or_else(|| index.to_string(), |d| d.name.clone()),
+            ),
+        })
+    }
+
+    /// Pick up where `from` left off.
+    ///
+    /// For a controller built to replace one whose driving network it has *not* changed — a new
+    /// `walk` under a robot that is sitting, a new `stand` under one that is walking. The seat,
+    /// the skill mid-flight, the ground-pick phase, the last action the observation feeds back
+    /// and the low-pass anchor all carry across, so the swap is invisible: the next tick runs the
+    /// same network from the same state, and the replaced one is simply there when it is next
+    /// selected. A fresh controller in its place would start `Sit::Up`, which under a seated
+    /// robot is a stand-up nobody asked for.
+    ///
+    /// The caller has checked that the network driving is unchanged, and that the skill list is
+    /// unchanged if a skill is what is driving — `active` addresses that list by index.
+    pub fn carry_over(&mut self, from: &Controller) {
+        self.last_action = from.last_action;
+        self.previous = from.previous;
+        self.ground_pick = from.ground_pick;
+        self.active = from.active;
+        self.sit = from.sit;
+        self.last_net = from.last_net;
     }
 
     /// Reset the feedback state.
@@ -444,6 +510,8 @@ impl Controller {
                 }
             }
         };
+
+        self.last_net = Some(net);
 
         let observation = Observation::build(
             &sensors.imu,
