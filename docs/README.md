@@ -3,6 +3,10 @@
 The [README](../README.md) is the front door — what a microduck is, and where to go. If you have
 one in front of you and want to drive it, start at the [cheat sheet](robot/cheatsheet.md).
 
+It is also where a **publisher** starts: [`policy-manifest.md`](policy-manifest.md) is the
+contract for a `manifest.json` beside a microduck `.onnx`, and it owns every field. The design
+docs give the reasoning and point at it.
+
 ## `robot/` — you have a robot
 
 | | |
