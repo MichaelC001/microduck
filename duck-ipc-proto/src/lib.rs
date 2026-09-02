@@ -162,6 +162,20 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// [`code::METHOD_NOT_FOUND`] naming it, which is the designed skew behaviour rather than a
 /// handshake refusal.
 ///
+/// # v19 — `robot.policies` carries the skills
+///
+/// One field, and it is what makes any of this usable from something that is not `robotctl`:
+/// which one-shot skills a robot has is config now, so a client cannot assume a list and cannot
+/// offer a "bow" button without being told there is a bow. The names were already published in
+/// `robot.subscribe`'s acknowledgement, but that is a 50 Hz stream and the question is asked
+/// once — the wrong shape for a phone, and BLE deliberately does not route it.
+///
+/// Additive: a client that ignores the field is unaffected, and an older `robotd` omits it,
+/// which deserialises to empty rather than failing because results are not
+/// `deny_unknown_fields`. A client reading an empty list should treat it as "this robot did not
+/// say" rather than "this robot has no skills" — the same distinction `unavailable` draws for
+/// the gait.
+///
 /// # v18 — `policy.*` and `robot.reloadPolicies`
 ///
 /// The official policy set stops needing a daemon release to change. `policy.check` asks the Hub
@@ -185,7 +199,7 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// An older `robotd` answers either with [`code::METHOD_NOT_FOUND`] naming the method, which is
 /// the designed skew behaviour and not a handshake refusal. See
 /// `docs/design/policy-channel-design.md` §8.
-pub const API_VERSION: u32 = 18;
+pub const API_VERSION: u32 = 19;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -1937,6 +1951,15 @@ pub struct PoliciesResult {
     pub enabled: bool,
     /// One entry per slot this build has, including the empty ones.
     pub slots: Vec<PolicySlot>,
+    /// The one-shot skills this robot has, in priority order — the names `robot.do` answers to.
+    ///
+    /// **A client cannot offer a "bow" button without knowing the robot has a bow.** Which skills
+    /// exist is config now, so there is no list to compile in; the other place it is published is
+    /// `robot.subscribe`'s acknowledgement, and that is a 50 Hz stream — the wrong thing to open
+    /// over BLE to answer a question asked once. Here it rides the read a client already makes to
+    /// show what is loaded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<String>,
 }
 
 /// One policy slot's state, for [`PoliciesResult`].

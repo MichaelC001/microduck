@@ -197,13 +197,30 @@ fn permits(call: &proto::Call) -> bool {
         // `safeToRestart` would learn nothing it could act on.
         RobotSafeToRestart | RobotModelApi | RobotRemoteSessionActive => false,
 
-        // Motor control. **Never over BLE**, which is what §4.1 means by a subset: BLE is too
-        // slow and too constrained for the full surface, and teleop belongs on WebRTC's
-        // datachannel (`docs/design/remote-webrtc.md` §2). A 20-byte notification budget and a
-        // link that does not exist for the first ~73s of a boot is not a control transport. The
-        // skills, the body pose and the mouth are motor control like the rest.
-        RobotMove(_) | RobotHead(_) | RobotLook(_) | RobotEnable(_) | RobotDo(_) | RobotPose(_)
+        // Teleop. **Never over BLE**, which is what §4.1 means by a subset: BLE is too slow and
+        // too constrained for the full surface, and teleop belongs on WebRTC's datachannel
+        // (`docs/design/remote-webrtc.md` §2). A 20-byte notification budget and a link that does
+        // not exist for the first ~73s of a boot is not a control transport. The body pose and
+        // the mouth ride with it: all of these are a stream of small updates, and the argument is
+        // about the stream, not about any one of them.
+        RobotMove(_) | RobotHead(_) | RobotLook(_) | RobotEnable(_) | RobotPose(_)
         | RobotMouth(_) => false,
+
+        // **A skill is not teleop**, and it sat in that group for longer than it deserved. It is
+        // one request — "do the bow" — not fifty a second, so the notification budget and the
+        // latency argument above simply do not reach it. Nor does it need a control link at all:
+        // the deadman zeroes the twist by itself, so a robot with nothing driving it stands still
+        // and bows.
+        //
+        // What the refusals in this file mostly turn on is who is *watching*, and BLE answers
+        // that better than anything else here does — the radio reaches about ten metres, so a
+        // phone that can send this is in the room with the robot by construction. It is also the
+        // authenticated transport: the characteristic takes `encrypt_authenticated_write` and the
+        // bond is PIN-checked, which WebRTC has no equivalent of (`remote-webrtc.md` §4).
+        //
+        // Which skills a robot has is config, so a client asks `robot.policies` rather than
+        // assuming a list; an unknown name is refused with the names it does know.
+        RobotDo(_) => true,
 
         // Harmless and rather charming from a phone — but it rides the same refusal as the
         // rest of robot.* until the app path exists to want it: opening one call to the
@@ -235,24 +252,31 @@ fn permits(call: &proto::Call) -> bool {
         RobotSetMode(_) => false,
 
         // Loading a policy is `robot.setMode` with a wider blast radius: it puts an arbitrary
-        // `.onnx` in charge of fifteen servos, and in slice 3 that file can come from a stranger
-        // on the Hub. Everything that makes it survivable — the shape gate, the clamps, the
-        // fall reflex — is unchanged whoever asked, so the refusal is not about danger; it is
-        // that trying a gait means watching the robot try it, and a phone in the room is not
-        // yet a client that does. Reconsider with the app, which is where
-        // `docs/design/policy-channel-design.md` §13 leaves it.
-        RobotLoadPolicy(_) => false,
+        // `.onnx` in charge of fifteen servos, and that file can come from a stranger on the Hub.
+        // Everything that makes it survivable — the shape gate, the clamps, the fall reflex — is
+        // unchanged whoever asked, so this was never about danger; it was that trying a gait
+        // means watching the robot try it, and there was no client that did.
+        //
+        // Both halves have since turned. There is a client, and BLE is the transport that best
+        // meets the watching condition: ten metres of radio range means whoever tapped it is
+        // looking at the robot, and the bond is PIN-authenticated. A load that fails keeps the
+        // controller that was running, so the failure mode is "nothing happened", not "gaitless
+        // robot on the floor".
+        //
+        // It is a *persistent* change, unlike everything else opened here — the choice is written
+        // to `robotd.toml` and survives a reboot — which is precisely why it wants the
+        // authenticated transport rather than the open one.
+        RobotLoadPolicy(_) => true,
 
-        // What each slot is running. Read-only and harmless, and refused on the same ground as
-        // `robot.mode` directly above: routing a read to the radio before a client exists to
-        // display it widens the surface and buys nothing. It goes with `robot.loadPolicy` when
-        // the app wants either.
-        RobotPolicies => false,
+        // What each slot is running, and which skills this robot has. Read-only, and the read a
+        // client makes before it can offer either of the two above: there is no compiled-in list
+        // of skills to assume any more, so this is how a phone knows there is a bow to ask for.
+        RobotPolicies => true,
 
-        // Re-reading the slots is `robot.loadPolicy` without the arguments, and carries the same
-        // refusal: it changes what drives fifteen servos, and doing that is something to watch
-        // the robot through rather than tap.
-        RobotReloadPolicies => false,
+        // Re-reading the slots after something else edited the config. Same blast radius as
+        // `robot.loadPolicy` and the same answer, and a client that can load wants this for the
+        // case where the file changed underneath it.
+        RobotReloadPolicies => true,
 
         // Updating the policy set from the Hub. The closest thing here to `update.apply`, which
         // *is* routed — and the difference is what an app can do about the outcome. A daemon
@@ -511,6 +535,62 @@ mod tests {
         ];
         for (call, want) in expected {
             assert_eq!(upstream_for(&call), Some(want), "{}", call.method());
+        }
+    }
+
+    /// **A phone can ask for a skill, see what the robot has, and change what it runs.**
+    ///
+    /// The three together, because none of them is much use alone: `robot.policies` is how a
+    /// client learns there is a bow to ask for — which skills exist is config, so there is no
+    /// list to compile in — and `robot.do` is the asking.
+    #[test]
+    fn a_phone_can_run_a_skill_and_change_a_policy() {
+        let expected = [
+            proto::Call::RobotPolicies,
+            proto::Call::RobotDo(proto::DoParams {
+                skill: "polite-bow".to_owned(),
+            }),
+            proto::Call::RobotLoadPolicy(proto::LoadPolicyParams {
+                slot: Some("walk".to_owned()),
+                path: Some("/opt/robot/policies/current/alpha_walking.onnx".to_owned()),
+            }),
+            proto::Call::RobotReloadPolicies,
+        ];
+        for call in expected {
+            assert_eq!(
+                upstream_for(&call),
+                Some(Upstream::Robot),
+                "{}",
+                call.method()
+            );
+        }
+    }
+
+    /// **A skill is not teleop, and teleop is still refused.**
+    ///
+    /// `robot.do` spent a while grouped with these, and the distinction is the whole reason it
+    /// could be opened: one request against a stream of fifty a second. If somebody ever moves
+    /// `robot.move` into that arm by widening a pattern, this is what says no.
+    #[test]
+    fn teleop_stays_off_the_radio() {
+        for call in [
+            proto::Call::RobotMove(proto::MoveParams {
+                vx: 0.0,
+                vy: 0.0,
+                vyaw: 0.0,
+            }),
+            proto::Call::RobotHead(proto::HeadParams {
+                neck_pitch: 0.0,
+                head_pitch: 0.0,
+                head_yaw: 0.0,
+                head_roll: 0.0,
+            }),
+            proto::Call::RobotEnable(proto::EnableParams {
+                on: true,
+                toggle: false,
+            }),
+        ] {
+            assert_eq!(upstream_for(&call), None, "{}", call.method());
         }
     }
 

@@ -3423,6 +3423,7 @@ fn dispatch(
                     .to_owned(),
                 enabled: state.policy_enabled,
                 slots: state.policy_slots.load().as_ref().clone(),
+                skills: state.policies.load().skills.clone(),
             },
         ),
 

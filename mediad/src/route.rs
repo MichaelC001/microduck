@@ -102,26 +102,39 @@ fn permits(call: &proto::Call) -> bool {
         // where it belongs.
         RobotSetMode(_) => false,
 
-        // Nor loading a policy, and this one is a deferral rather than a rule — which is the
-        // distinction §5 of the design asks these arms to be honest about. The "peer can watch"
-        // argument that permits `robot.init` and `robot.shutdown` above genuinely does cover
-        // trying a gait over a video link, and a failed load now keeps the running controller
-        // rather than leaving the robot gaitless. What is missing is a client: nothing on this
-        // transport can name a slot or a file yet, and §4 means any LAN peer would inherit it
-        // the moment it could. Lift it when there is something to lift it *for*.
-        RobotLoadPolicy(_) => false,
+        // And loading one. This was a deferral rather than a rule, and it said what would lift
+        // it: "nothing on this transport can name a slot or a file yet — lift it when there is
+        // something to lift it *for*." There is now. The "peer can watch" argument that permits
+        // `robot.init` and `robot.shutdown` above covers trying a gait over a video link at least
+        // as well, and better than it covers standing the robot up: the peer is looking at the
+        // thing the gait is about to move. A load that fails keeps the running controller, so the
+        // failure mode is "nothing happened".
+        //
+        // The honest caveat is §4, and it is sharper here than for anything else opened on this
+        // transport: there is no authorisation, so any LAN peer inherits this, and unlike
+        // `robot.move` the effect *persists* — the choice is written to `robotd.toml` and is
+        // still there after a reboot. BLE, which is PIN-bonded, carries the same call with a
+        // caller who is at least known and within ten metres. That difference is worth
+        // remembering when §4 is revisited; it is not a reason to withhold the call from the
+        // transport that can actually show somebody the result.
+        RobotLoadPolicy(_) => true,
 
-        // Reading what each slot runs, on the other hand, is the same kind of question as the
-        // update reads below — what software is this robot on — and a remote client watching a
-        // gait misbehave has an obvious use for the answer.
+        // Reading what each slot runs — and which skills this robot has, which is how a client
+        // knows there is a bow to ask `robot.do` for. The same kind of question as the update
+        // reads below, and a remote client watching a gait misbehave has an obvious use for it.
         RobotPolicies => true,
 
-        // Both mutations stay out, for the reason `robot.loadPolicy` above does: §4 means any LAN
-        // peer inherits whatever is opened here, and nothing on this transport can name a policy
-        // set yet. `policy.check` is read-only and would be harmless, but it is half of a pair
-        // whose other half is not, and routing the half that answers "yes there is a newer gait"
-        // to a client that cannot then install it is an odd thing to offer.
-        RobotReloadPolicies | PolicyCheck | PolicyInstall(_) => false,
+        // Re-reading the slots goes with loading one: a client that can change what drives the
+        // robot wants the case where something else changed it too.
+        RobotReloadPolicies => true,
+
+        // Installing a policy set from the Hub stays out, and now for a narrower reason than
+        // before. It is not the blast radius — `robot.loadPolicy` above has the same one — it is
+        // that this pair reaches the *network* on the robot's behalf and writes to the eMMC,
+        // where `robot.loadPolicy` only points at a file already on it. `policy.check` is
+        // read-only and would be harmless, but offering the half that answers "yes, there is a
+        // newer gait" to a client that cannot then install it is an odd thing to do.
+        PolicyCheck | PolicyInstall(_) => false,
 
         // And nor fetching a stranger's policy, for the reason above plus §4: there is no
         // authorisation on this transport, so a LAN peer would inherit it.
@@ -323,6 +336,54 @@ mod tests {
 
     /// A WebRTC peer reaches services `btd` deliberately holds no socket to. Worth pinning,
     /// because it is the concrete difference between the two transports' needs: `mediad` will hold
+    /// **A peer watching the video can run a skill and change what the robot walks with.**
+    ///
+    /// The argument that permits `robot.init` and `robot.shutdown` — the peer can see the robot —
+    /// covers a gait better than it covers standing up, because the peer is looking at the thing
+    /// the gait is about to move. `robot.policies` carries the skill list a client needs before
+    /// it can offer either.
+    #[test]
+    fn a_watching_peer_can_run_a_skill_and_change_a_policy() {
+        for call in [
+            proto::Call::RobotPolicies,
+            proto::Call::RobotDo(proto::DoParams {
+                skill: "polite-bow".to_owned(),
+            }),
+            proto::Call::RobotLoadPolicy(proto::LoadPolicyParams {
+                slot: Some("walk".to_owned()),
+                path: Some("/opt/robot/policies/current/alpha_walking.onnx".to_owned()),
+            }),
+            proto::Call::RobotReloadPolicies,
+        ] {
+            assert!(
+                matches!(route_for(&call), Route::To(..)),
+                "{} is refused",
+                call.method()
+            );
+        }
+    }
+
+    /// **Reaching the Hub on the robot's behalf is still refused.**
+    ///
+    /// Not for blast radius — `robot.loadPolicy` above has the same one — but because this pair
+    /// pulls from the network and writes to the eMMC, where loading points at a file already
+    /// there. §4 means any LAN peer would inherit it.
+    #[test]
+    fn installing_from_the_hub_is_not_offered_to_a_lan_peer() {
+        for call in [
+            proto::Call::PolicyCheck,
+            proto::Call::PolicySearch(proto::PolicySearchParams {
+                query: "microduck".to_owned(),
+            }),
+        ] {
+            assert!(
+                matches!(route_for(&call), Route::Refused),
+                "{} is reachable",
+                call.method()
+            );
+        }
+    }
+
     /// five connections where `btd` holds three.
     #[test]
     fn reaches_padd_and_tofd_which_btd_cannot() {

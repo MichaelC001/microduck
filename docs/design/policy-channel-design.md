@@ -668,6 +668,9 @@ its meaning for the things that genuinely are models and not control policies, s
 | `kind` says who ends a policy, not how long | An episodic one returns itself; a perpetual one needs the daemon to drive it back (§10.1) |
 | Skills leave walk, stand, sitstand and ground_pick alone | The fallback pair, one driven internally, one scripted — none is a generic one-shot (§10.2) |
 | Buttons are config; Start and Select are not | The button that stops a robot is the one worth not being able to lose (§10.3) |
+| `robot.do` is not teleop, so BLE may carry it | One request, not a stream; and it needs no control link, the deadman zeroes the twist (§10.4) |
+| Loading a policy is served on both transports | Every refusal said it was waiting for a client; there is one (§10.4) |
+| Installing from the Hub is not | It reaches the network and writes the eMMC, where loading points at a file already there (§15) |
 | The seeder never replaces an installed set | Otherwise a daemon update silently reverts a gait chosen with `policy update` (§9) |
 | Origin is the org in the path | Honest without a lookup, and a label rather than a boundary (§9.2) |
 | The manifest can refuse but never bless | It is a stranger's claim; the shape gate is the check (§9.2) |
@@ -688,20 +691,50 @@ its meaning for the things that genuinely are models and not control policies, s
   tag.
 - **Signing community policies**, and any curated-org scheme that would require it.
 
+### 10.4 Reaching it from a phone
+
+`robot.do`, `robot.policies`, `robot.loadPolicy` and `robot.reloadPolicies` are served over
+**both** BLE and WebRTC. What changed is not the safety of any of it — the shape gate, the joint
+clamps and the fall reflex are the same whoever asked — but that a client now exists, which is
+what every one of these refusals said it was waiting for.
+
+**A skill is not teleop.** `robot.do` spent a while grouped with `robot.move` and friends under
+BLE's transport argument — a 20-byte notification budget and a link that does not exist for the
+first ~73 s of a boot. That argument is about a *stream*: fifty small updates a second. A skill is
+one request, and it needs no control link at all, because the deadman zeroes the twist by itself
+and a robot with nothing driving it stands still and bows.
+
+**BLE is the transport that best meets the watching condition**, which is what most refusals here
+turn on. Its radio reaches about ten metres, so whoever tapped the button is in the room with the
+robot by construction — and the bond is PIN-checked with `encrypt_authenticated_write`. WebRTC
+answers the same condition differently: the peer is watching the video, which is the argument
+that already permits `robot.init` and `robot.shutdown`, and covers a gait better than it covers
+standing up, because the peer is looking at the thing the gait is about to move.
+
+The asymmetry worth remembering is the other way round from the intuition. **BLE is
+authenticated; WebRTC is not** — §4 of `remote-webrtc.md` means any LAN peer inherits whatever is
+opened. And `robot.loadPolicy` *persists*: unlike `robot.move`, the choice is written to
+`robotd.toml` and is still there after a reboot. So the call with the longest-lived effect is the
+one whose exposure differs most between the two transports. That is a reason to sharpen §4, not a
+reason to withhold the call from the transport that can show somebody the result.
+
+**`robot.policies` carries the skill list**, and that is the piece that makes the rest usable. A
+client cannot offer a bow without knowing the robot has one, and which skills exist is config now
+— nothing to compile in. The names were already in `robot.subscribe`'s acknowledgement, but that
+is a 50 Hz stream answering a question asked once, and BLE deliberately does not route it.
+
 ## 15. Open
 
-- **None of this is reachable remotely.** Every policy method is refused over BLE, and over
-  WebRTC all but the `robot.policies` read. The refusals are written as deferrals rather than
-  rules, and each says what would lift it: the reads (`policies`, `check`, `search`) change
-  nothing and are the easy half; the mutations are a question about who is *watching*, since a
-  gait that goes wrong walks badly and nothing detects that but a person looking at the robot.
-  WebRTC has the sharper version — §4 of `remote-webrtc.md` means any LAN peer inherits whatever
-  is opened.
+- **Installing from the Hub is still local-only.** `policy.check`, `policy.install`,
+  `policy.fetch` and `policy.search` are refused on both transports. Not for blast radius —
+  `robot.loadPolicy` is open and has the same one — but because that pair reaches the *network*
+  on the robot's behalf and writes to the eMMC, where loading points at a file already there.
+  Over WebRTC, §4 of `remote-webrtc.md` means any LAN peer would inherit it.
 
-  The pad bindings are further out than the rest: they have **no wire surface at all**.
-  `robotctl pad bind` edits the config file directly, so there is nothing for a phone to call.
-  Exposing them means new methods and a decision about which daemon owns them — `configd` owns
-  config, but `padd` is the reader and `robotd` is the authority on which skills exist.
+- **The pad bindings have no wire surface at all.** `robotctl pad bind` edits the config file
+  directly, so unlike everything else there is nothing for a phone to call and routing will not
+  help. Exposing them means new methods plus a decision about which daemon owns them: `configd`
+  owns config, `padd` is the reader, and `robotd` is the authority on which skills exist.
 
 - **A running skill has no fall reflex** for its whole duration (§10.2). Fine for a half-second
   kick; a skill configured to hold for ten seconds is ten seconds without one.

@@ -4302,6 +4302,7 @@ mod tests {
             mode: "walk".into(),
             enabled: true,
             slots,
+            skills: Vec::new(),
         }
     }
 
