@@ -142,9 +142,13 @@ mode = "walk"
 # head_lowpass = 0.5
 # legs_lowpass = 0.7
 
-# The ground pick: one cycle length in seconds (the move hands back at 70% of the cycle,
-# as the prototype does), its action scale, and a gain multiplier while it runs. Unset
-# period/scale resolve per mode: 4.0 / 1.0 walking, 3.0 / 0.8 for the roller crouch.
+# The ground pick: one cycle length in seconds, its action scale, and a gain multiplier while
+# it runs. Unset period/scale come from the installed set's manifest — the phase-encoded entry
+# tagged with this mode (4.0 / 1.0 for the walking pick, 5.0 / 0.8 for the roller crouch, as
+# they are trained) — and, on a board whose set predates the manifest, from the prototype's
+# 4.0 / 1.0 walking, 3.0 / 0.8 roller. The move hands back at the manifest's `end_phase`
+# (70% of the cycle); there is no key for that. The sitstand's rise and settle times come from
+# the set the same way.
 # ground_pick_period = 4.0
 # ground_pick_action_scale = 1.0
 # ground_pick_gain_ratio = 1.0

@@ -39,13 +39,6 @@ use duck_control::policy::{Net, Policy, PolicyError};
 /// Joint indices the head low-pass covers: neck_pitch, head_pitch, head_yaw, head_roll.
 const HEAD_JOINTS: std::ops::Range<usize> = 5..9;
 
-/// The ground pick hands back at this fraction of its cycle — the prototype's cutoff.
-const GROUND_PICK_END_PHASE: f64 = 0.7;
-
-/// How long the sitstand network rises (posture flag 0) before the main policy takes over.
-/// 1 s is enough on the robot — velstand owns the tail of the rise fine.
-const RISE_SECS: f64 = 1.0;
-
 /// How recently a request must have arrived, at the end of a chaining skill's window, for
 /// another to start. The prototype chains roulade on "X still held at the window boundary";
 /// here the client holds the button by re-sending the request every tick, so "held" is "a
@@ -83,14 +76,24 @@ impl Default for Tuning {
     }
 }
 
-/// The scripted-skill numbers, resolved per mode by `params`.
+/// The scripted-skill numbers, resolved per mode by `params` — from the installed set's
+/// manifest where it says, and from the prototype's literals where it does not.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SkillTuning {
     /// One ground-pick cycle, seconds.
     pub ground_pick_period: f64,
+    /// The ground pick hands back at this fraction of its cycle — the prototype's cutoff is
+    /// 0.7. Ending at 1.0 replays the reach on the way out.
+    pub ground_pick_end_phase: f64,
     pub ground_pick_action_scale: f64,
     /// Gain multiplier while the pick runs.
     pub ground_pick_gain_ratio: f64,
+    /// How long the sitstand network rises (posture flag 0) before the main policy takes over.
+    /// 1 s is enough on the robot — velstand owns the tail of the rise fine.
+    pub sitstand_rise_s: f64,
+    /// How long the seat takes to settle after the posture flag flips: the ~2 s glide the
+    /// network is trained on. The shutdown sit waits twice this before cutting torque.
+    pub sitstand_ramp_s: f64,
     /// The one-shot skills, in priority order — name, duration, whether holding chains, and
     /// what each changes about the robot while it runs. Config, resolved over the built-ins.
     pub skills: Vec<robotd_params::SkillDef>,
@@ -100,8 +103,11 @@ impl Default for SkillTuning {
     fn default() -> Self {
         Self {
             ground_pick_period: 4.0,
+            ground_pick_end_phase: robotd_params::DEFAULT_GROUND_PICK_END_PHASE,
             ground_pick_action_scale: 1.0,
             ground_pick_gain_ratio: 1.0,
+            sitstand_rise_s: robotd_params::DEFAULT_SITSTAND_RISE_S,
+            sitstand_ramp_s: robotd_params::DEFAULT_SITSTAND_RAMP_S,
             skills: Vec::new(),
         }
     }
@@ -203,7 +209,7 @@ pub struct Controller {
     /// Previous filtered targets, kept only for the low-pass. `None` until the first tick,
     /// so the filter starts from reality rather than dragging up from zero.
     previous: Option<[f64; NUM_JOINTS]>,
-    /// Ground-pick phase, 0..[`GROUND_PICK_END_PHASE`]. `None` when inactive.
+    /// Ground-pick phase, 0..`skills.ground_pick_end_phase`. `None` when inactive.
     ground_pick: Option<f64>,
     /// **A running skill switches the fall reflex off**, because `busy()` is what gates the
     /// limp-fall predictor and any active skill makes it true. That was uncontroversial when
@@ -284,6 +290,12 @@ impl Controller {
 
     pub fn has_sitstand(&self) -> bool {
         self.policy.has_sitstand()
+    }
+
+    /// How long a shutdown sit gets before torque is cut: twice the seat's settle time, which
+    /// is the prototype's four seconds over its ~2 s glide.
+    pub fn shutdown_sit_secs(&self) -> f64 {
+        2.0 * self.skills.sitstand_ramp_s
     }
 
     pub fn is_sitting(&self) -> bool {
@@ -371,7 +383,7 @@ impl Controller {
             }
             Sit::Sitting => {
                 self.sit = Sit::Rising {
-                    remaining: RISE_SECS,
+                    remaining: self.skills.sitstand_rise_s,
                 };
                 Ok("stand")
             }
@@ -390,7 +402,7 @@ impl Controller {
     /// instead of dragging the legs through a linear ramp to the standing pose.
     pub fn begin_boot_rise(&mut self) {
         self.sit = Sit::Rising {
-            remaining: RISE_SECS,
+            remaining: self.skills.sitstand_rise_s,
         };
     }
 
@@ -603,7 +615,7 @@ impl Controller {
         // phase after the motor write.
         if let Some(phase) = self.ground_pick.as_mut() {
             *phase += dt / self.skills.ground_pick_period;
-            if *phase >= GROUND_PICK_END_PHASE {
+            if *phase >= self.skills.ground_pick_end_phase {
                 self.ground_pick = None;
             }
         }
@@ -651,8 +663,11 @@ mod tests {
 
         let s = SkillTuning::default();
         assert_eq!(s.ground_pick_period, 4.0);
+        assert_eq!(s.ground_pick_end_phase, 0.7);
         assert_eq!(s.ground_pick_action_scale, 1.0);
         assert_eq!(s.ground_pick_gain_ratio, 1.0);
+        assert_eq!(s.sitstand_rise_s, 1.0);
+        assert_eq!(s.sitstand_ramp_s, 2.0);
         // The one-shots' numbers live with the skills now — `robotd_params` owns the built-in
         // three and asserts their durations, and this struct simply carries the resolved list.
         assert!(
@@ -672,10 +687,11 @@ mod tests {
     }
 
     /// The ground pick ends at 70% of its cycle — ending at 100% replays the reach on the
-    /// way out, which is the prototype bug the 0.7 cutoff fixed there.
+    /// way out, which is the prototype bug the 0.7 cutoff fixed there. The cutoff and the rise
+    /// come from the set's manifest now; these are what a board with no manifest gets.
     #[test]
     fn the_ground_pick_cutoff_is_the_prototypes() {
-        assert_eq!(GROUND_PICK_END_PHASE, 0.7);
-        assert_eq!(RISE_SECS, 1.0);
+        assert_eq!(robotd_params::DEFAULT_GROUND_PICK_END_PHASE, 0.7);
+        assert_eq!(robotd_params::DEFAULT_SITSTAND_RISE_S, 1.0);
     }
 }

@@ -98,8 +98,10 @@ const HOME_RAMP: Duration = Duration::from_secs(2);
 /// `microduck_runtime`.
 const BATTERY_EMA_ALPHA: f64 = 0.1;
 
-/// How long the shutdown sit gets before torque is cut and the machine powers off. The
-/// sitstand descent is a deliberate ~2 s glide; the prototype gives it four seconds.
+/// How long the shutdown sit gets before torque is cut and the machine powers off, when no
+/// controller is there to say. The sitstand descent is a deliberate ~2 s glide; the prototype
+/// gives it four seconds, and a running controller derives the same from the set's `ramp_s`
+/// (`Controller::shutdown_sit_secs`).
 const SHUTDOWN_SIT: Duration = Duration::from_secs(4);
 
 /// How many consecutive failed bus reads the policy may drive through on the last good
@@ -1425,8 +1427,11 @@ fn try_controller(
         };
         let skills = SkillTuning {
             ground_pick_period: policy_cfg.ground_pick_period,
+            ground_pick_end_phase: policy_cfg.ground_pick_end_phase,
             ground_pick_action_scale: policy_cfg.ground_pick_action_scale,
             ground_pick_gain_ratio: policy_cfg.ground_pick_gain_ratio,
+            sitstand_rise_s: policy_cfg.sitstand_rise_s,
+            sitstand_ramp_s: policy_cfg.sitstand_ramp_s,
             skills: policy_cfg.skills.clone(),
         };
         let paths = PolicyPaths {
@@ -2109,9 +2114,12 @@ async fn control_loop<T: RobotIo>(
                 poweroff();
             }
         }
+        let shutdown_sit_hold = controller.as_ref().map_or(SHUTDOWN_SIT, |c| {
+            Duration::from_secs_f64(c.shutdown_sit_secs())
+        });
         if let Some(started) = shutdown_sit
             && !powered_off
-            && tick_start.duration_since(started) >= SHUTDOWN_SIT
+            && tick_start.duration_since(started) >= shutdown_sit_hold
         {
             tracing::warn!("sit complete: cutting torque and powering off");
             cut_torque_before_poweroff(&mut safety);

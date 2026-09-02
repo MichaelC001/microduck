@@ -444,16 +444,27 @@ daemon release rather than a tag:
 - `robotd-params` knew which policies were one-shot skills and how long each ran. It now takes
   them from the manifest, falling back the same way.
 
-Three kinds, and only one becomes a skill:
+Three kinds, and `kind` says who ends the policy:
 
 | `kind` | means | a skill? |
 | --- | --- | --- |
 | `perpetual` | runs until told otherwise — a gait, or a hold a person has to end | no |
-| `episodic` | runs for `duration_s` on an all-zero command and returns itself to a safe pose | **yes** |
-| `scripted` | the daemon generates its command over time — the ground pick's phase | no |
+| `episodic` | runs for `duration_s` and returns itself to a safe pose | **yes**, on a constant command |
+| `scripted` | episodic, but interruptible — the daemon can change its command mid-flight | no |
 
-`name` defaults to the file's stem, so only a policy whose role differs from its training run
-needs one: `ball_kick_left.onnx` answers to `kick_left`, and `roulade.onnx` says nothing.
+What the daemon *feeds* a policy is a separate axis, `command.encoding`, and it decides what an
+episodic entry becomes. On a constant command (the default, `idle` on the way back) an episodic
+policy is a **skill**: kicks, roulade, every community one-shot so far. On a `phase` command it is
+the **ground pick** — the daemon writes `[cos 2πφ, sin 2πφ, 0]` with φ advancing over `period_s`
+and hands back at `end_phase`; the entry's numbers become that mode's ground-pick defaults, and it
+is not a skill, because a generic one-shot would feed it zeros. The `posture_flag` encoding is
+the sit↔stand: `scripted`, because dropping the flag mid-descent is a legitimate thing to do,
+with `unwind_s` the length of the rise and `ramp_s` how long the seat takes to settle.
+
+`mode` tags a policy as one drive mode's — absent means walking — which is how the roller crouch
+is the ground pick of roller mode rather than a second one for walking. `name` defaults to the
+file's stem, so only a policy whose role differs from its training run needs one:
+`ball_kick_left.onnx` answers to `kick_left`, and `roulade.onnx` says nothing.
 
 **The per-policy fields are the same ones a single-policy repo uses**, plus `file`. That is what
 makes the ask to a community publisher "add these fields" rather than "adopt our format", and it
@@ -474,37 +485,59 @@ versions on the Hub, and a test over the copy would pass while a board downloade
   "robot": { "model": "microduck", "hw_rev": 1, "servos": "xl330", "control_hz": 50 },
   "description": "The policy set a microduck ships with: walking, standing, and the one-shots its buttons run.",
   "policies": [
-    { "file": "alpha_walking.onnx",     "kind": "perpetual" },
-    { "file": "alpha_stand.onnx",       "kind": "perpetual" },
-    { "file": "alpha_sitstand.onnx",    "kind": "perpetual" },
-    { "file": "roller.onnx",            "kind": "perpetual" },
-    { "file": "alpha_ground_pick.onnx", "kind": "scripted" },
-    { "file": "roller_crouch.onnx",     "kind": "scripted" },
-    { "file": "roulade.onnx",           "kind": "episodic", "duration_s": 1.0, "chain": true },
-    { "file": "ball_kick_left.onnx",    "name": "kick_left",  "kind": "episodic", "duration_s": 0.5 },
-    { "file": "ball_kick_right.onnx",   "name": "kick_right", "kind": "episodic", "duration_s": 0.5 }
+    { "file": "alpha_walking.onnx", "kind": "perpetual" },
+    { "file": "alpha_stand.onnx",   "kind": "perpetual" },
+    { "file": "roller.onnx",        "kind": "perpetual", "mode": "roller", "action_scale": 0.8 },
+
+    { "file": "alpha_sitstand.onnx", "name": "sitstand", "kind": "scripted",
+      "command": { "encoding": "posture_flag", "slot": "twist.vx", "sit": 1.0, "stand": 0.0, "idle": [0.0, 0.0, 0.0] },
+      "ramp_s": 2.0, "unwind_s": 1.0 },
+
+    { "file": "alpha_ground_pick.onnx", "name": "ground_pick", "kind": "episodic", "duration_s": 2.8,
+      "command": { "encoding": "phase", "slots": "twist.vx,twist.vy", "period_s": 4.0, "end_phase": 0.7 } },
+
+    { "file": "roller_crouch.onnx", "name": "crouch", "kind": "episodic", "duration_s": 3.5, "mode": "roller", "action_scale": 0.8,
+      "command": { "encoding": "phase", "slots": "twist.vx,twist.vy", "period_s": 5.0, "end_phase": 0.7 } },
+
+    { "file": "roulade.onnx",         "kind": "episodic", "duration_s": 1.0, "chain": true },
+    { "file": "ball_kick_left.onnx",  "name": "kick_left",  "kind": "episodic", "duration_s": 0.5 },
+    { "file": "ball_kick_right.onnx", "name": "kick_right", "kind": "episodic", "duration_s": 0.5 }
   ]
 }
 ```
 
 Read that against what a robot does with it. The nine `file` entries are the download list, so
-the seeder fetches exactly these. The three `episodic` ones with a `duration_s` become skills —
-which reproduces the built-in three exactly, and is the check that the manifest is *right* rather
-than merely plausible. `ball_kick_left.onnx` carries a `name` because its role differs from its
-training run; `roulade.onnx` does not, because the file's stem is already the name.
+the seeder fetches exactly these. The three `episodic` entries on a constant command become
+skills — which reproduces the built-in three exactly, and is the check that the manifest is
+*right* rather than merely plausible. `ball_kick_left.onnx` carries a `name` because its role
+differs from its training run; `roulade.onnx` does not, because the file's stem is already the
+name.
 
-`alpha_ground_pick.onnx` is `scripted` and that word earns its place. It writes a phase over time
-rather than a constant, and calling it `episodic` would load it as a generic one-shot and feed it
-an all-zero command — a robot moving plausibly and wrongly, which `duck_control::obs`'s header
-calls the hardest failure to see. Marking it `scripted` keeps it out of the skill list while
-still declaring that it exists.
+The two `phase` entries are the ground pick of each mode, and their numbers are what the daemon
+used to carry as literals: a 4 s cycle for the pick, and — the correction this shape paid for —
+a **5 s** cycle for the crouch, which is what `Mjlab-RollerCrouch` trains on and not the 3 s the
+roller preset had inherited from the prototype. `duration_s` is `period_s × end_phase`, written
+out so a reader need not multiply. `[policy] ground_pick_period` and `ground_pick_action_scale`
+still override the set's numbers, because the config file is the list of a person's decisions.
+
+The `scripted` sitstand is recorded, not turned into a skill: it is driven by the sit toggle, the
+shutdown sit and the seated-boot rise, through a flag the daemon flips. Its `unwind_s` is how long
+the rise runs on the sitstand network before the gait takes over (the daemon's `RISE_SECS`, now
+the set's to say), and `ramp_s` how long the seat takes to settle — the shutdown sit waits twice
+that before cutting torque, which is the prototype's four seconds over its 2 s glide.
+
+`action_scale` on a perpetual entry (`roller.onnx`) is recorded and not read: the gait's scale
+resolves per mode from `[policy]`, and the manifest has no way to say which perpetual is the
+walking slot and which the standing one.
 
 **Adding a policy to the set** is then four steps and no daemon release:
 
 1. Upload the `.onnx` to the repo.
-2. Add an entry to `manifest.json`. `kind` decides what happens next: `episodic` with a
-   `duration_s` becomes a skill a robot can be asked for by name; `perpetual` is a gait, which
-   needs a slot pointed at it; `scripted` is neither and is simply recorded.
+2. Add an entry to `manifest.json`. `kind` and `command.encoding` decide what happens next:
+   `episodic` with a `duration_s` on a constant command becomes a skill a robot can be asked for
+   by name; `episodic` on a `phase` command is a mode's ground pick and sets its timing;
+   `perpetual` is a gait, which needs a slot pointed at it; `scripted` is recorded, and the
+   daemon's own arm for it reads its timing.
 3. Tag the revision — `hf repos tag create pollen-robotics/microduck-policies v4`.
 4. On a robot: `robotctl policy update`.
 
@@ -586,10 +619,13 @@ globally when it was squatting in the walk slot.
 
 `walk` and `stand` are the fallback pair, chosen by command magnitude, and there is nothing below
 them to hand back to. `sitstand` is latched and driven internally by the shutdown sit and the
-seated-boot rise, not only by a button. `ground_pick` writes a scripted phase rather than a
-constant. None of the four is a generic one-shot, and a set entry may not answer to
-`ground_pick` or `sit_toggle` — a second network behind either name would be fed an all-zero
-command it never trained on.
+seated-boot rise, not only by a button — `scripted`, in the manifest's word. `ground_pick`
+writes a phase rather than a constant. None of the four is a generic one-shot, and a set entry
+may not answer to `ground_pick` or `sit_toggle` — a second network behind either name would be
+fed an all-zero command it never trained on. The guard is on the encoding as well as the name: a
+`phase` or `posture_flag` entry is never loaded as a skill however it is called. What the set
+*does* get to say about these arms is their timing (§9.3) — the pick's cycle and cutoff, the
+rise and the seat's settle — since those are properties of the trained network, not of the build.
 
 **A running skill has the fall reflex off** for its whole duration: the limp-fall predictor is
 only consulted while the controller is not `busy()`, and any active skill makes it busy. That was
@@ -696,8 +732,10 @@ its meaning for the things that genuinely are models and not control policies, s
 | A set records the repo it came from | One writer, one copy, nothing to configure twice or drift (§9.1) |
 | Reload is a third thing, not reset-all | They look identical from outside and conflating them discards every override (§9.1) |
 | One-shot skills are config, not code | Kicks and roulade were the same arm with different numbers; a community one is a fifth set (§10) |
-| `kind` says who ends a policy, not how long | An episodic one returns itself; a perpetual one needs the daemon to drive it back (§10.1) |
-| Skills leave walk, stand, sitstand and ground_pick alone | The fallback pair, one driven internally, one scripted — none is a generic one-shot (§10.2) |
+| `kind` says who ends a policy, not how long | An episodic one returns itself; a perpetual one needs the daemon to drive it back; a scripted one is episodic but interruptible (§9.3, §10.1) |
+| `command.encoding` says what the daemon feeds it | Constant → a skill; `phase` → the ground pick; `posture_flag` → the sit↔stand. Only the first is loadable as a one-shot (§9.3) |
+| The set carries its own timing | The pick's cycle and cutoff, the rise and the seat's settle are properties of the trained network, not literals in a build; `[policy]` keys still win (§9.4) |
+| Skills leave walk, stand, sitstand and ground_pick alone | The fallback pair, one driven internally, one phase-driven — none is a generic one-shot (§10.2) |
 | Buttons are config; Start and Select are not | The button that stops a robot is the one worth not being able to lose (§10.3) |
 | `robot.do` is not teleop, so BLE may carry it | One request, not a stream; and it needs no control link, the deadman zeroes the twist (§10.4) |
 | Loading a policy is served on both transports | Every refusal said it was waiting for a client; there is one (§10.4) |

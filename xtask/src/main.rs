@@ -1262,6 +1262,10 @@ mod tests {
                 { "file": "alpha_walking.onnx", "kind": "perpetual" },
                 { "file": "ball_kick_left.onnx", "name": "kick_left",
                   "kind": "episodic", "duration_s": 0.5 },
+                // A command block: nested keys the pattern must neither match nor choke on.
+                { "file": "alpha_ground_pick.onnx", "name": "ground_pick", "kind": "episodic",
+                  "duration_s": 2.8, "command": { "encoding": "phase", "period_s": 4.0,
+                  "end_phase": 0.7, "slots": "twist.vx,twist.vy" } },
                 { "file": "roulade.onnx" }
             ]
         });
@@ -1298,6 +1302,7 @@ mod tests {
             vec![
                 "alpha_walking.onnx".to_string(),
                 "ball_kick_left.onnx".to_string(),
+                "alpha_ground_pick.onnx".to_string(),
                 "roulade.onnx".to_string()
             ],
             "the pattern and the manifest have drifted"

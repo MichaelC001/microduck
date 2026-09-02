@@ -643,10 +643,12 @@ pub struct PolicyParams {
     pub head_lowpass: Option<f64>,
     /// Same, for the ten leg joints. Walking default 0.7.
     pub legs_lowpass: Option<f64>,
-    /// One ground-pick cycle, seconds. The move ends at 70% of the cycle, as the prototype
-    /// does. Absent resolves per mode: 4.0 walking, 3.0 roller (the crouch).
+    /// One ground-pick cycle, seconds. The move ends at the set's `end_phase` (70% of the
+    /// cycle, as the prototype does). Absent resolves from the installed set's phase-encoded
+    /// entry for this mode, else 4.0 walking, 3.0 roller (the crouch).
     pub ground_pick_period: Option<f64>,
-    /// Action scale while the ground pick runs. Absent: 1.0 walking, 0.8 roller.
+    /// Action scale while the ground pick runs. Absent: the set's entry, else 1.0 walking,
+    /// 0.8 roller.
     pub ground_pick_action_scale: Option<f64>,
     /// Gain multiplier while the ground pick runs.
     pub ground_pick_gain_ratio: f64,
@@ -822,30 +824,83 @@ pub struct SetPolicy {
     /// `roulade.onnx` needs no name while `ball_kick_left.onnx` says `kick_left` — the names are
     /// roles and the files are training runs, an indirection worth keeping.
     pub name: Option<String>,
-    /// `"episodic"` or `"perpetual"`, and the difference is who supplies the ending.
+    /// `"episodic"`, `"perpetual"` or `"scripted"`, and the difference is who supplies the
+    /// ending.
     ///
-    /// Only an episodic policy becomes a skill on its own. A gait is not something to ask for by
-    /// name, and a perpetual one has no length of its own — how long to hold a foot up is a
-    /// person's choice, so it takes a config entry rather than appearing.
+    /// An episodic policy runs for `duration_s` and returns itself to a safe pose. On a constant
+    /// command it is a skill on its own; on a phase command (`command.encoding = "phase"`) it is
+    /// the ground pick — the daemon writes the phase, and the numbers here are how fast. A
+    /// perpetual one has no length of its own — how long to hold a foot up is a person's choice,
+    /// so it takes a config entry rather than appearing. A scripted one is episodic but
+    /// interruptible: the daemon drives it through a command it can change mid-flight, which is
+    /// what the sit↔stand posture flag is.
     pub kind: Option<String>,
-    /// Seconds it runs, for a policy that ends itself.
+    /// Seconds it runs, for a policy that ends itself. For a phase policy this is
+    /// `period_s × end_phase`, recorded so a reader need not multiply.
     pub duration_s: Option<f64>,
     /// Whether a request arriving while it runs starts another when this one finishes — how a
     /// client maps "the button is held" onto a one-shot.
     pub chain: bool,
     /// Scales raw output into a joint offset, when this policy wants its own.
     pub action_scale: Option<f64>,
-    /// Seconds a perpetual policy needs to get back to its idle command.
+    /// Seconds a perpetual policy needs to get back to its idle command — or, for the sit↔stand,
+    /// how long the rise on posture flag 0 gets before the gait takes over.
     pub unwind_s: Option<f64>,
-    /// The command block. Only `idle` is read — the twist that means "stop doing the thing".
+    /// Seconds the network takes to reach its commanded posture after the flag flips. The
+    /// sit↔stand is trained on a 2 s slewed target, so the seat is a ~2 s glide; the shutdown sit
+    /// waits twice that before cutting torque.
+    pub ramp_s: Option<f64>,
+    /// Which drive mode this policy belongs to. Absent means walking. The roller crouch is the
+    /// ground pick of `"roller"` mode, and the two must not be confused with each other.
+    pub mode: Option<Mode>,
+    /// The command block: how the daemon is meant to drive this network.
     pub command: Option<SetCommand>,
 }
 
 /// The machine-readable half of a manifest's command block.
+///
+/// Three encodings exist in the set, and `encoding` names which one this is:
+///
+/// - absent or `"constant"`: the skill family — a fixed twist for the window, `idle` on the way
+///   back. Every kick, the roulade, and every community one-shot so far.
+/// - `"phase"`: `[cos 2πφ, sin 2πφ, 0]` with φ advancing from 0 over `period_s` seconds and the
+///   move handing back at `end_phase`. The ground pick, and the roller crouch.
+/// - `"posture_flag"`: one slot carries `sit` or `stand`. The sit↔stand.
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(default)]
 pub struct SetCommand {
+    pub encoding: Option<String>,
+    /// The twist that means "stop doing the thing".
     pub idle: Option<[f64; 3]>,
+    /// Phase encoding: seconds per full cycle.
+    pub period_s: Option<f64>,
+    /// Phase encoding: the fraction of the cycle at which the move hands back. The pick's rise
+    /// is over well before 1.0, and running to 1.0 replays the reach on the way out.
+    pub end_phase: Option<f64>,
+    /// Posture flag: the value that means "sit".
+    pub sit: Option<f64>,
+    /// Posture flag: the value that means "stand".
+    pub stand: Option<f64>,
+}
+
+/// The ground pick's cycle: what a phase-encoded set entry declares.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PhaseTiming {
+    /// Seconds per full cycle.
+    pub period_s: f64,
+    /// Fraction of the cycle at which the move hands back.
+    pub end_phase: f64,
+    /// Action scale while it runs, if the entry says.
+    pub action_scale: Option<f64>,
+}
+
+/// The sit↔stand's timing: what the scripted set entry declares.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SitStandTiming {
+    /// Seconds the rise runs on the sitstand network before the gait takes over.
+    pub rise_s: f64,
+    /// Seconds the seat takes to settle after the flag flips.
+    pub ramp_s: f64,
 }
 
 impl SetPolicy {
@@ -857,10 +912,122 @@ impl SetPolicy {
                 .unwrap_or_else(|| self.file.clone())
         })
     }
+
+    pub fn is_episodic(&self) -> bool {
+        self.kind.as_deref() == Some("episodic")
+    }
+
+    pub fn is_scripted(&self) -> bool {
+        self.kind.as_deref() == Some("scripted")
+    }
+
+    fn encoding(&self) -> Option<&str> {
+        self.command.as_ref().and_then(|c| c.encoding.as_deref())
+    }
+
+    /// The daemon writes this policy's command as a phase. A `period_s` with no `encoding` is
+    /// taken the same way — the field has no other meaning.
+    pub fn is_phase(&self) -> bool {
+        self.encoding() == Some("phase")
+            || self.command.as_ref().is_some_and(|c| c.period_s.is_some())
+    }
+
+    /// The daemon writes this policy's command as a posture flag.
+    pub fn is_posture_flag(&self) -> bool {
+        self.encoding() == Some("posture_flag")
+    }
+
+    /// The mode this policy belongs to; absent means walking.
+    pub fn mode(&self) -> Mode {
+        self.mode.unwrap_or_default()
+    }
+
+    /// **An episodic policy on a constant command**: what becomes a skill on its own.
+    ///
+    /// A phase-encoded one does not — it is the ground pick, whose command the daemon generates,
+    /// and loading it as a generic one-shot would feed it all-zeros: a robot moving plausibly and
+    /// wrongly, which `duck_control::obs`'s header calls the hardest failure to see.
+    pub fn is_zero_command_skill(&self) -> bool {
+        self.is_episodic() && !self.is_phase() && !self.is_posture_flag()
+    }
+
+    /// The phase timing, for an episodic policy the daemon drives through a phase.
+    pub fn phase_timing(&self) -> Option<PhaseTiming> {
+        if !self.is_episodic() || !self.is_phase() {
+            return None;
+        }
+        let command = self.command.as_ref()?;
+        Some(PhaseTiming {
+            period_s: command.period_s?,
+            end_phase: command.end_phase.unwrap_or(DEFAULT_GROUND_PICK_END_PHASE),
+            action_scale: self.action_scale,
+        })
+    }
+
+    /// The sit↔stand timing, for the scripted posture-flag policy.
+    pub fn sitstand_timing(&self) -> Option<SitStandTiming> {
+        if !self.is_scripted() || !self.is_posture_flag() {
+            return None;
+        }
+        Some(SitStandTiming {
+            rise_s: self.unwind_s.unwrap_or(DEFAULT_SITSTAND_RISE_S),
+            ramp_s: self.ramp_s.unwrap_or(DEFAULT_SITSTAND_RAMP_S),
+        })
+    }
+}
+
+impl SetManifest {
+    /// The ground pick of one mode, if the set declares it: the phase-encoded episodic entry
+    /// tagged with that mode (walking when untagged). The first one wins, and a set that lists
+    /// two for the same mode has made a mistake this cannot see.
+    pub fn ground_pick(&self, mode: Mode) -> Option<PhaseTiming> {
+        self.policies
+            .iter()
+            .filter(|p| p.mode() == mode)
+            .find_map(|p| p.phase_timing())
+    }
+
+    /// The sit↔stand's timing, if the set declares it. The sitstand is mode-independent — both
+    /// presets load the same network — so the first scripted posture-flag entry is it.
+    pub fn sitstand(&self) -> Option<SitStandTiming> {
+        self.policies.iter().find_map(|p| p.sitstand_timing())
+    }
+
+    /// The entries that are skills on their own: episodic, constant-command, and not named as
+    /// something the daemon drives itself.
+    ///
+    /// **A set cannot claim a name the daemon drives itself.** The ground pick and the sit toggle
+    /// live in their own arm of the cascade, and a second entry answering to the same name would
+    /// shadow one with a network fed an all-zero command it was never trained on. The manifest
+    /// lives on the Hub and cannot be checked from here, so the guard belongs on the board.
+    ///
+    /// It guards the *name* and the *encoding*, not the file. A set that marks
+    /// `alpha_ground_pick.onnx` episodic with neither a name nor a phase command still produces a
+    /// skill — called `alpha_ground_pick`, running a phase-scripted network on zeros. That is a
+    /// publisher's mistake rather than a trap: it shadows nothing, it is plainly visible in
+    /// `robotctl policy list`, and nothing invokes it unless somebody asks for it by that name.
+    /// Catching it would mean a hardcoded list of our own filenames, which is the coupling this
+    /// whole manifest exists to remove.
+    pub fn skills(&self) -> impl Iterator<Item = &SetPolicy> {
+        self.policies
+            .iter()
+            .filter(|p| p.is_zero_command_skill())
+            .filter(|p| !DAEMON_OWNED_SKILLS.contains(&p.skill_name().as_str()))
+    }
 }
 
 /// Skill names the daemon implements itself, which a policy set may not take over.
 const DAEMON_OWNED_SKILLS: [&str; 2] = ["ground_pick", "sit_toggle"];
+
+/// The ground pick hands back at this fraction of its cycle when the set does not say — the
+/// prototype's cutoff. Ending at 100% replays the reach on the way out.
+pub const DEFAULT_GROUND_PICK_END_PHASE: f64 = 0.7;
+/// How long the sitstand network rises (posture flag 0) before the gait takes over, when the
+/// set does not say. 1 s is enough on the robot — velstand owns the tail of the rise fine.
+pub const DEFAULT_SITSTAND_RISE_S: f64 = 1.0;
+/// How long the seat takes after the flag flips, when the set does not say: the ~2 s glide the
+/// sit↔stand is trained on (`POSTURE_RAMP_S`).
+pub const DEFAULT_SITSTAND_RAMP_S: f64 = 2.0;
 
 /// Read the installed set's manifest, if it has one.
 pub fn set_manifest() -> Option<SetManifest> {
@@ -875,30 +1042,14 @@ pub fn set_manifest() -> Option<SetManifest> {
 /// A board whose set predates the manifest keeps its kicks and its roulade with no config
 /// written and no migration run, which is the whole reason absence resolves to something rather
 /// than nothing. This goes when every tagged set carries one.
-fn builtin_skills() -> Vec<SkillDef> {
-    // What the set itself declares. A policy is a skill only if it says it is episodic and how
-    // long it runs — a gait is not something to ask for by name, and a perpetual one needs a
-    // hold length that only a person can choose.
-    if let Some(manifest) = set_manifest() {
+fn builtin_skills(manifest: Option<&SetManifest>) -> Vec<SkillDef> {
+    // What the set itself declares. A policy is a skill only if it says it is episodic, drives on
+    // a constant command, and how long it runs — a gait is not something to ask for by name, a
+    // perpetual one needs a hold length that only a person can choose, and a phase-encoded one
+    // is the ground pick.
+    if let Some(manifest) = manifest {
         let from_set: Vec<SkillDef> = manifest
-            .policies
-            .iter()
-            .filter(|p| p.kind.as_deref() == Some("episodic"))
-            // **A set cannot claim a name the daemon drives itself.** The ground pick writes a
-            // scripted phase and the sit toggle is latched and driven internally by the shutdown
-            // sit and the seated-boot rise; both live in their own arm of the cascade, and a
-            // second entry answering to the same name would shadow one with a network fed an
-            // all-zero command it was never trained on. The manifest lives on the Hub and cannot
-            // be checked from here, so the guard belongs on the board.
-            //
-            // It guards the *name*, not the file. A set that marks `alpha_ground_pick.onnx`
-            // episodic without naming it still produces a skill — called `alpha_ground_pick`,
-            // running a phase-scripted network on zeros. That is a publisher's mistake rather
-            // than a trap: it shadows nothing, it is plainly visible in `robotctl policy list`,
-            // and nothing invokes it unless somebody asks for it by that name. Catching it would
-            // mean a hardcoded list of our own filenames, which is the coupling this whole
-            // manifest exists to remove.
-            .filter(|p| !DAEMON_OWNED_SKILLS.contains(&p.skill_name().as_str()))
+            .skills()
             .filter_map(|p| {
                 Some(SkillDef {
                     name: p.skill_name(),
@@ -1061,8 +1212,14 @@ pub struct ResolvedPolicy {
     pub head_lowpass: Option<f64>,
     pub legs_lowpass: Option<f64>,
     pub ground_pick_period: f64,
+    /// Fraction of the cycle at which the ground pick hands back.
+    pub ground_pick_end_phase: f64,
     pub ground_pick_action_scale: f64,
     pub ground_pick_gain_ratio: f64,
+    /// Seconds the sitstand network rises before the gait takes over.
+    pub sitstand_rise_s: f64,
+    /// Seconds the seat takes to settle after the flag flips.
+    pub sitstand_ramp_s: f64,
     /// The one-shot skills, config merged over the built-ins, in priority order.
     pub skills: Vec<SkillDef>,
     pub voltage_adapt: bool,
@@ -1102,7 +1259,13 @@ impl PolicyParams {
     /// declare adds it with the built-in's timing; `"none"` switches it off, as it does for a
     /// `[[policy.skill]]` entry.
     pub fn resolved_skills(&self) -> Vec<SkillDef> {
-        let mut resolved = builtin_skills();
+        self.resolved_skills_with(set_manifest().as_ref())
+    }
+
+    /// [`Self::resolved_skills`] against a manifest already read — or none, which is the
+    /// fallback three.
+    pub fn resolved_skills_with(&self, manifest: Option<&SetManifest>) -> Vec<SkillDef> {
+        let mut resolved = builtin_skills(manifest);
         for configured in &self.skills {
             match resolved.iter_mut().find(|s| s.name == configured.name) {
                 Some(builtin) => *builtin = configured.clone(),
@@ -1159,6 +1322,18 @@ impl PolicyParams {
     }
 
     pub fn resolved(&self) -> ResolvedPolicy {
+        self.resolved_with(set_manifest().as_ref())
+    }
+
+    /// [`Self::resolved`] against a manifest already read — or none, which is what a board whose
+    /// set predates the manifest has, and resolves to the prototype's numbers.
+    ///
+    /// **The set says how its own policies run.** The ground pick's cycle and the sit↔stand's rise
+    /// used to be literals here, per mode, which meant a retrained pick with a longer cycle was a
+    /// daemon release. They come from the set's phase-encoded and posture-flag entries now; the
+    /// literals stay as the fallback, and a `[policy]` key still overrides either, because the
+    /// file is the list of a person's decisions.
+    pub fn resolved_with(&self, manifest: Option<&SetManifest>) -> ResolvedPolicy {
         let release = |name: &str| PathBuf::from(POLICY_DIR).join(name);
         let path = |field: &Option<PathBuf>, default: Option<&str>| -> Option<PathBuf> {
             match field {
@@ -1192,13 +1367,17 @@ impl PolicyParams {
         // What each skill slot reports is what the skill of that name will run — derived from the
         // list rather than resolved beside it, so `robot.policies` cannot name a file the robot is
         // not running.
-        let skills = self.resolved_skills();
+        let skills = self.resolved_skills_with(manifest);
         let skill_file = |name: &str| {
             skills
                 .iter()
                 .find(|s| s.name == name)
                 .and_then(|s| s.resolved_path())
         };
+
+        // The set's own timing for the two networks the daemon drives itself, for this mode.
+        let pick = manifest.and_then(|m| m.ground_pick(self.mode));
+        let seat = manifest.and_then(|m| m.sitstand());
 
         ResolvedPolicy {
             enabled: self.enabled,
@@ -1231,15 +1410,26 @@ impl PolicyParams {
             gain: self.gain,
             head_lowpass: Some(self.head_lowpass.unwrap_or(0.5)).filter(|a| *a < 1.0),
             legs_lowpass: Some(self.legs_lowpass.unwrap_or(0.7)).filter(|a| *a < 1.0),
-            ground_pick_period: self.ground_pick_period.unwrap_or(match self.mode {
-                Mode::Walk => 4.0,
-                Mode::Roller => 3.0,
-            }),
-            ground_pick_action_scale: self.ground_pick_action_scale.unwrap_or(match self.mode {
-                Mode::Walk => 1.0,
-                Mode::Roller => 0.8,
-            }),
+            ground_pick_period: self
+                .ground_pick_period
+                .or(pick.map(|t| t.period_s))
+                .unwrap_or(match self.mode {
+                    Mode::Walk => 4.0,
+                    Mode::Roller => 3.0,
+                }),
+            ground_pick_end_phase: pick
+                .map(|t| t.end_phase)
+                .unwrap_or(DEFAULT_GROUND_PICK_END_PHASE),
+            ground_pick_action_scale: self
+                .ground_pick_action_scale
+                .or(pick.and_then(|t| t.action_scale))
+                .unwrap_or(match self.mode {
+                    Mode::Walk => 1.0,
+                    Mode::Roller => 0.8,
+                }),
             ground_pick_gain_ratio: self.ground_pick_gain_ratio,
+            sitstand_rise_s: seat.map_or(DEFAULT_SITSTAND_RISE_S, |t| t.rise_s),
+            sitstand_ramp_s: seat.map_or(DEFAULT_SITSTAND_RAMP_S, |t| t.ramp_s),
             skills,
             voltage_adapt: self.voltage_adapt,
             nominal_voltage: self.nominal_voltage,
@@ -1682,9 +1872,7 @@ mod tests {
         .unwrap();
 
         let skills: Vec<(&str, f64)> = manifest
-            .policies
-            .iter()
-            .filter(|p| p.kind.as_deref() == Some("episodic"))
+            .skills()
             .map(|p| (p.file.as_str(), p.duration_s.unwrap()))
             .collect();
         assert_eq!(
@@ -1718,22 +1906,22 @@ mod tests {
                   "kind": "episodic", "duration_s": 2.0 },
                 // Mislabelled but not renamed: a junk skill, and it is allowed through.
                 { "file": "alpha_ground_pick.onnx", "kind": "episodic", "duration_s": 4.0 },
+                // Labelled correctly: episodic on a phase command is the ground pick, and the
+                // encoding keeps it out of the skill list whatever it is called.
+                { "file": "roller_crouch.onnx", "name": "crouch", "kind": "episodic",
+                  "duration_s": 3.5, "mode": "roller",
+                  "command": { "encoding": "phase", "period_s": 5.0, "end_phase": 0.7 } },
                 { "file": "roulade.onnx", "kind": "episodic", "duration_s": 1.0 }
             ]
         }))
         .unwrap();
 
-        let claimed: Vec<String> = manifest
-            .policies
-            .iter()
-            .filter(|p| p.kind.as_deref() == Some("episodic"))
-            .map(|p| p.skill_name())
-            .filter(|n| !super::DAEMON_OWNED_SKILLS.contains(&n.as_str()))
-            .collect();
+        let claimed: Vec<String> = manifest.skills().map(|p| p.skill_name()).collect();
         assert_eq!(
             claimed,
             vec!["alpha_ground_pick".to_string(), "roulade".to_string()],
-            "sit_toggle is refused; the mislabelled one is a visible mistake, not a trap"
+            "sit_toggle is refused, the phase-encoded crouch is the ground pick; the mislabelled \
+             one is a visible mistake, not a trap"
         );
     }
 
@@ -1766,6 +1954,179 @@ mod tests {
                 .iter()
                 .all(|p| p.kind.as_deref() != Some("episodic")),
             "nothing here is a skill, so builtin_skills keeps the three it knows"
+        );
+    }
+
+    /// The manifest the set actually publishes, as this build reads it. One place to see the
+    /// whole shape; the tests below take it apart.
+    fn published_set() -> super::SetManifest {
+        serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "policies": [
+                { "file": "alpha_walking.onnx", "kind": "perpetual" },
+                { "file": "alpha_stand.onnx",   "kind": "perpetual" },
+                { "file": "roller.onnx",        "kind": "perpetual", "mode": "roller",
+                  "action_scale": 0.8 },
+                { "file": "alpha_sitstand.onnx", "name": "sitstand", "kind": "scripted",
+                  "command": { "encoding": "posture_flag", "slot": "twist.vx",
+                               "sit": 1.0, "stand": 0.0, "idle": [0.0, 0.0, 0.0] },
+                  "ramp_s": 2.5, "unwind_s": 1.5 },
+                { "file": "alpha_ground_pick.onnx", "name": "ground_pick", "kind": "episodic",
+                  "duration_s": 2.8,
+                  "command": { "encoding": "phase", "slots": "twist.vx,twist.vy",
+                               "period_s": 4.0, "end_phase": 0.7 } },
+                { "file": "roller_crouch.onnx", "name": "crouch", "kind": "episodic",
+                  "duration_s": 3.5, "mode": "roller", "action_scale": 0.8,
+                  "command": { "encoding": "phase", "slots": "twist.vx,twist.vy",
+                               "period_s": 5.0, "end_phase": 0.7 } },
+                { "file": "roulade.onnx",         "kind": "episodic", "duration_s": 1.0,
+                  "chain": true },
+                { "file": "ball_kick_left.onnx",  "name": "kick_left",  "kind": "episodic",
+                  "duration_s": 0.5 },
+                { "file": "ball_kick_right.onnx", "name": "kick_right", "kind": "episodic",
+                  "duration_s": 0.5 }
+            ]
+        }))
+        .unwrap()
+    }
+
+    /// **The set says how fast its own ground pick runs, per mode.** The pick's cycle and the
+    /// crouch's were literals here — 4.0 and 3.0 — and the crouch is trained on a 5 s cycle, so
+    /// a board ran it at 3 s until somebody noticed. A phase-encoded episodic entry tagged with
+    /// a mode is that mode's ground pick, and its numbers are the defaults.
+    #[test]
+    fn the_set_declares_each_modes_ground_pick() {
+        let set = published_set();
+
+        let walk = super::PolicyParams::default().resolved_with(Some(&set));
+        assert_eq!(walk.ground_pick_period, 4.0);
+        assert_eq!(walk.ground_pick_end_phase, 0.7);
+        assert_eq!(
+            walk.ground_pick_action_scale, 1.0,
+            "the pick says nothing, mode default"
+        );
+
+        let roller = super::PolicyParams {
+            mode: super::Mode::Roller,
+            ..Default::default()
+        }
+        .resolved_with(Some(&set));
+        assert_eq!(
+            roller.ground_pick_period, 5.0,
+            "the crouch's own cycle, not the literal"
+        );
+        assert_eq!(roller.ground_pick_action_scale, 0.8);
+        assert!(
+            roller.ground_pick.unwrap().ends_with("roller_crouch.onnx"),
+            "and the slot still loads the crouch"
+        );
+    }
+
+    /// The file is a list of decisions: a `[policy]` key still beats the set.
+    #[test]
+    fn a_config_key_overrides_the_sets_ground_pick_timing() {
+        let set = published_set();
+        let tuned = super::PolicyParams {
+            mode: super::Mode::Roller,
+            ground_pick_period: Some(6.0),
+            ground_pick_action_scale: Some(0.7),
+            ..Default::default()
+        }
+        .resolved_with(Some(&set));
+        assert_eq!(tuned.ground_pick_period, 6.0);
+        assert_eq!(tuned.ground_pick_action_scale, 0.7);
+        assert_eq!(
+            tuned.ground_pick_end_phase, 0.7,
+            "there is no key for the cutoff"
+        );
+    }
+
+    /// **The set says how the sit↔stand is timed.** The rise was a literal second and the
+    /// shutdown sit a literal four; the scripted posture-flag entry carries both.
+    #[test]
+    fn the_set_declares_the_sitstands_timing() {
+        let set = published_set();
+        let resolved = super::PolicyParams::default().resolved_with(Some(&set));
+        assert_eq!(resolved.sitstand_rise_s, 1.5);
+        assert_eq!(resolved.sitstand_ramp_s, 2.5);
+        assert!(
+            resolved.sitstand.unwrap().ends_with("alpha_sitstand.onnx"),
+            "scripted is recorded, not turned into a skill"
+        );
+    }
+
+    /// **A phase-encoded or posture-flag policy is never a zero-command skill.** Both are driven
+    /// by the daemon through commands it generates; loading either as a generic one-shot would
+    /// run it on all-zeros. The published set's skills are exactly the three the prototype had.
+    #[test]
+    fn the_published_set_yields_the_three_skills_and_nothing_else() {
+        let set = published_set();
+        let resolved = super::PolicyParams::default().resolved_with(Some(&set));
+        let names: Vec<&str> = resolved.skills.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["roulade", "kick_left", "kick_right"]);
+        let roulade = &resolved.skills[0];
+        assert_eq!(roulade.duration, 1.0);
+        assert!(roulade.chain);
+    }
+
+    /// **Absence is the prototype.** No manifest, or one that predates these fields, resolves to
+    /// the literals the daemon has always used — a board is never left with a pick that will not
+    /// end or a rise that never hands back.
+    #[test]
+    fn a_set_that_says_nothing_about_timing_leaves_the_prototypes_numbers() {
+        let old: super::SetManifest = serde_json::from_value(serde_json::json!({
+            "policies": [
+                { "file": "alpha_ground_pick.onnx", "kind": "scripted" },
+                { "file": "roller_crouch.onnx", "kind": "scripted" },
+                { "file": "alpha_sitstand.onnx", "kind": "perpetual" },
+                { "file": "roulade.onnx", "kind": "episodic", "duration_s": 1.0, "chain": true }
+            ]
+        }))
+        .unwrap();
+        for manifest in [None, Some(&old)] {
+            let walk = super::PolicyParams::default().resolved_with(manifest);
+            assert_eq!(walk.ground_pick_period, 4.0);
+            assert_eq!(
+                walk.ground_pick_end_phase,
+                super::DEFAULT_GROUND_PICK_END_PHASE
+            );
+            assert_eq!(walk.ground_pick_action_scale, 1.0);
+            assert_eq!(walk.sitstand_rise_s, super::DEFAULT_SITSTAND_RISE_S);
+            assert_eq!(walk.sitstand_ramp_s, super::DEFAULT_SITSTAND_RAMP_S);
+            let roller = super::PolicyParams {
+                mode: super::Mode::Roller,
+                ..Default::default()
+            }
+            .resolved_with(manifest);
+            assert_eq!(roller.ground_pick_period, 3.0);
+            assert_eq!(roller.ground_pick_action_scale, 0.8);
+        }
+    }
+
+    /// A phase entry with a `period_s` but no `encoding` is still a phase entry — the field
+    /// means nothing else — and one with no `end_phase` hands back at the prototype's cutoff.
+    #[test]
+    fn a_period_alone_makes_a_phase_entry() {
+        let set: super::SetManifest = serde_json::from_value(serde_json::json!({
+            "policies": [
+                { "file": "alpha_ground_pick.onnx", "kind": "episodic", "duration_s": 3.5,
+                  "command": { "period_s": 5.0 } }
+            ]
+        }))
+        .unwrap();
+        assert_eq!(
+            set.ground_pick(super::Mode::Walk),
+            Some(super::PhaseTiming {
+                period_s: 5.0,
+                end_phase: 0.7,
+                action_scale: None
+            })
+        );
+        assert_eq!(set.skills().count(), 0, "not a zero-command skill");
+        assert_eq!(
+            set.ground_pick(super::Mode::Roller),
+            None,
+            "untagged means walking"
         );
     }
 
