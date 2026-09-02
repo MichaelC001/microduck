@@ -365,6 +365,13 @@ its own verdict — going *back* is as much the point as going forward.
 and wrong about the bytes, which is exactly the case that needs a separate method — and one that
 is never short-circuited, since "already loaded" is the answer it exists to disbelieve.
 
+A reload replaces every network, so it goes home first when one is *in motion* — the same rule
+every disturbing change follows. **A seated robot is not in motion**: `policy update` on a robot
+sitting on the bench used to ramp it to home and stand it up, because the sitstand network was
+driving and a reload counted that as disturbed. The seat is a static pose on a constant flag, so
+the swap now happens in place and the seat carries across, as it does for a change to a network
+that is not driving.
+
 A reload changes no configuration, so **a slot you loaded yourself survives it**. That is not a
 nicety: the reload runs at the end of every `policy update`, and an install that quietly discarded
 someone's gait experiment would be the worst possible time to discover the two were conflated.

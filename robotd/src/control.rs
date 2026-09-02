@@ -180,7 +180,12 @@ enum SkillPhase {
 pub enum Driving {
     Walk,
     Stand,
+    /// The sitstand network, in motion: rising, or the tick the flag flipped.
     SitStand,
+    /// The sitstand network holding the seat. Parked, not travelling — the one driving state a
+    /// network can be swapped under without the robot noticing, which is why it is its own
+    /// variant rather than a flag beside `SitStand`.
+    Seated,
     GroundPick,
     /// A one-shot skill, by its config name.
     Skill(String),
@@ -192,6 +197,7 @@ impl std::fmt::Display for Driving {
             Driving::Walk => f.write_str("walk"),
             Driving::Stand => f.write_str("stand"),
             Driving::SitStand => f.write_str("sitstand"),
+            Driving::Seated => f.write_str("seated"),
             Driving::GroundPick => f.write_str("ground_pick"),
             Driving::Skill(name) => f.write_str(name),
         }
@@ -246,6 +252,7 @@ impl Controller {
         Some(match self.last_net? {
             Net::Walk => Driving::Walk,
             Net::Stand => Driving::Stand,
+            Net::SitStand if self.sit == Sit::Sitting => Driving::Seated,
             Net::SitStand => Driving::SitStand,
             Net::GroundPick => Driving::GroundPick,
             Net::Skill(index) => Driving::Skill(
@@ -268,7 +275,9 @@ impl Controller {
     /// robot is a stand-up nobody asked for.
     ///
     /// The caller has checked that the network driving is unchanged, and that the skill list is
-    /// unchanged if a skill is what is driving — `active` addresses that list by index.
+    /// unchanged if a skill is what is driving — `active` addresses that list by index. The one
+    /// exception is a seated robot, which carries across whatever changed: the seat is a static
+    /// pose on a constant flag, and any sitstand network asked to hold it holds it.
     pub fn carry_over(&mut self, from: &Controller) {
         self.last_action = from.last_action;
         self.previous = from.previous;

@@ -1334,10 +1334,19 @@ impl PendingSwap {
 /// `None` driving, or a network that resolves to the same file, is a change the robot need not
 /// move for.
 ///
-/// A reload is the exception, and always disturbs: it exists for the case where every path is
-/// unchanged and the bytes behind them are not, so the paths cannot say whether the running
-/// network is affected. It is also the one change that is never issued while somebody is
+/// A reload is the exception, and disturbs whatever is in motion: it exists for the case where
+/// every path is unchanged and the bytes behind them are not, so the paths cannot say whether the
+/// running network is affected. It is also the one change that is never issued while somebody is
 /// trying a gait.
+///
+/// **A seated robot is disturbed by nothing.** The second report: `robotctl policy update` on a
+/// robot sitting on the bench, and it ramped to home and stood up — the update ends in a reload,
+/// and the reload took the mode switch's path because the sitstand network was driving. But the
+/// home-first ramp exists to stop a network being swapped under a *moving* gait, and a seated
+/// robot is parked: the network holds a static pose on a constant flag, and `busy()` already says
+/// sitting is not travelling. Swapping bytes under that is exactly what `carry_over` was built
+/// for — the seat, the flag and the filter anchor go across, and the next tick holds the same
+/// pose from the same place. Standing it up to change a file it was not using was the surprise.
 fn change_disturbs(
     driving: Option<&Driving>,
     change: &intents::PolicyChange,
@@ -1347,6 +1356,9 @@ fn change_disturbs(
     let Some(driving) = driving else {
         return false;
     };
+    if matches!(driving, Driving::Seated) {
+        return false;
+    }
     if matches!(change, intents::PolicyChange::Reload) {
         return true;
     }
@@ -1354,6 +1366,7 @@ fn change_disturbs(
         Driving::Walk => before.walk != after.walk,
         Driving::Stand => before.stand != after.stand,
         Driving::SitStand => before.sitstand != after.sitstand,
+        Driving::Seated => false,
         Driving::GroundPick => before.ground_pick != after.ground_pick,
         Driving::Skill(_) => before.skills != after.skills,
     }
@@ -5446,21 +5459,61 @@ mod tests {
     }
 
     /// A reload cannot read its effect off the paths — same names, maybe different bytes — so it
-    /// disturbs whatever is driving, and nothing when nothing is.
+    /// disturbs whatever is in motion, and nothing when nothing is.
     #[test]
     fn a_reload_disturbs_whatever_is_driving() {
         let cfg = Params::default().policy.resolved();
-        assert!(change_disturbs(
-            Some(&Driving::SitStand),
-            &intents::PolicyChange::Reload,
-            &cfg,
-            &cfg
-        ));
+        for moving in [
+            Driving::Walk,
+            Driving::Stand,
+            Driving::SitStand,
+            Driving::GroundPick,
+        ] {
+            assert!(
+                change_disturbs(Some(&moving), &intents::PolicyChange::Reload, &cfg, &cfg),
+                "{moving} is in motion"
+            );
+        }
         assert!(!change_disturbs(
             None,
             &intents::PolicyChange::Reload,
             &cfg,
             &cfg
+        ));
+    }
+
+    /// **`robotctl policy update` on a seated robot must not stand it up.** The update ends in a
+    /// reload; the reload found the sitstand network driving and went home first — which is the
+    /// stand-up. A seated robot is parked, and no change moves it: the swap happens in place and
+    /// the seat carries across.
+    #[test]
+    fn nothing_disturbs_a_seated_robot() {
+        let before = Params::default().policy.resolved();
+        let mut other = Params::default().policy;
+        other.sitstand = Some(std::path::PathBuf::from("/srv/other_sitstand.onnx"));
+        let after = other.resolved();
+        assert_ne!(before.sitstand, after.sitstand);
+
+        for change in [
+            intents::PolicyChange::Reload,
+            intents::PolicyChange::ResetAll,
+            intents::PolicyChange::Slot {
+                slot: Slot::SitStand,
+                path: Some(std::path::PathBuf::from("/srv/other_sitstand.onnx")),
+            },
+        ] {
+            assert!(
+                !change_disturbs(Some(&Driving::Seated), &change, &before, &after),
+                "{} under a seated robot swaps in place",
+                describe_change(&change)
+            );
+        }
+        // And the same network in motion — the rise — still goes home first.
+        assert!(change_disturbs(
+            Some(&Driving::SitStand),
+            &intents::PolicyChange::Reload,
+            &before,
+            &before
         ));
     }
 
