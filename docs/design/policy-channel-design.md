@@ -451,6 +451,17 @@ daemon release rather than a tag:
 - `robotd-params` knew which policies were one-shot skills and how long each ran. It now takes
   them from the manifest, falling back the same way.
 
+**And `policy.install` installs the manifest with the set**, from the same two rules. It took its
+download list from what was already on the board at first, which made the tenth policy a tag the
+seeder honoured and `robotctl policy update` could not — installable only by a daemon release,
+which is what this whole channel exists to stop. It also left the new set without a
+`manifest.json`, so `robotd` fell back to the three skill names it was compiled with and every
+per-skill number the set declared was quietly lost by the command whose only job is moving
+between revisions. The revision's own manifest is the list now, and the file is written into the
+set beside the policies it describes; the board's own `.onnx` names remain the fallback for a
+revision that has no manifest. A `file` that is not a plain name is dropped rather than fetched,
+in the script and in the daemon both — it is somebody else's document, and it chooses a path.
+
 **The field-by-field contract is [`../policy-manifest.md`](../policy-manifest.md)** — the two
 axes, every field, what each one changes on the robot. It is not repeated here, and this section
 is only the reasoning for the mechanism existing at all.

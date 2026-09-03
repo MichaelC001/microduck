@@ -105,6 +105,14 @@ The same fields, once per entry, under `policies`, plus `file`. The live copy is
 `phase` entries set each mode's ground-pick timing and its `scripted` entry the sit↔stand's,
 which is how a retrained pick with a longer cycle is a tag rather than a daemon release.
 
+Every `file` is a plain file name — no directory, no leading dot. A set whose manifest names one
+with a path in it has that entry skipped, by the seeder and by `robotctl policy update` both.
+
+The manifest is installed **into the set**, so `/opt/robot/policies/current/manifest.json` is
+what `robotd` reads for the skills. It is also the download list: adding a policy is an entry
+here and a tag, and both the first seed of a board and every `policy update` after it take the
+list from the revision they are installing.
+
 ## Changes from schema 1
 
 Schema 1 was the official set's first shape: `kind` with the values `perpetual`, `episodic`,
