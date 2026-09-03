@@ -2267,10 +2267,17 @@ pub struct PolicySearchParams {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AccountLoginParams {
-    /// Sign in even though this robot already belongs to an account.
+    /// Sign in even though this robot already belongs to an account, or is already waiting for
+    /// a code to be approved.
     ///
     /// Without it, a robot that is already signed in refuses with [`code::INVALID_PARAMS`] naming
-    /// the account it belongs to. That is not ceremony: `account.login` is routed to BLE and to a
+    /// the account it belongs to, and one with a live code refuses with [`code::BUSY`]. The
+    /// second is the same permission as the first in a smaller size — replacing an *attempt* at
+    /// belonging to somebody — and it is the only way out of a code nobody is going to approve
+    /// that does not mean signing the robot out or waiting five minutes for it to expire.
+    ///
+    /// A superseded login is inert: it keeps its device code, and if Hugging Face approves it
+    /// later the answer is dropped rather than written. That is not ceremony: `account.login` is routed to BLE and to a
     /// datachannel, so on a LAN anybody who can reach the robot can start one — and a login that
     /// silently replaced the owner would convert "was on the wifi once" into remote access that
     /// outlives being there. Taking a robot from its owner should require saying so.

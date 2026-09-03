@@ -838,7 +838,11 @@ enum AccountCommand {
         /// — so `account status` picks up where this left off. Ctrl-C does the same thing.
         #[arg(long)]
         no_wait: bool,
-        /// Sign in even though this robot already belongs to an account.
+        /// Sign in even though this robot already belongs to an account, or is already
+        /// waiting for a code to be approved.
+        ///
+        /// The second is how to abandon a code nobody is going to approve: the login that was
+        /// waiting is dropped, and an approval that arrives for it afterwards is ignored.
         #[arg(long)]
         force: bool,
         #[arg(long)]

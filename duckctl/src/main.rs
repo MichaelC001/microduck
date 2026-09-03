@@ -913,7 +913,8 @@ enum Account {
         /// launch a browser on somebody's desktop.
         #[arg(long)]
         no_open: bool,
-        /// Sign in even though this robot already belongs to an account.
+        /// Sign in even though this robot already belongs to an account, or is already
+        /// waiting for a code to be approved.
         #[arg(long)]
         force: bool,
     },

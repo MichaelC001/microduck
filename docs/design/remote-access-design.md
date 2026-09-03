@@ -171,6 +171,20 @@ progress" is what `BUSY` says elsewhere and it would send that person looking in
 `account.status` carries the code, so a client that lost track of one rejoins it rather than
 starting another.
 
+**A refusal has to name a way through it, and `force` is that way here too.** A code nobody is
+going to approve — the usual case, somebody started a login and walked off — otherwise holds the
+robot for five minutes, and the only remedy was `logout`, which destroys a working credential to
+clear a pending one. `force` already means "replace what this robot belongs to"; replacing an
+*attempt* at it is the same permission in a smaller size.
+
+**What that costs is that an abandoned flow is still holding a live device code**, and Hugging
+Face will approve it if somebody gets round to it. The flow lives in a task that outlives the call
+which started it, so this is equally true of `logout`: sign a robot out with a code in the air and
+an approval a minute later would sign it back in on its own. Each flow therefore carries the
+generation it was started with and checks that it is still the current one — before the store is
+touched and again after, because the write awaits — so a superseded login keeps its code and
+drops its answer. That is also what makes `logout` able to promise what it says.
+
 ### 2.3 The OAuth client is Hugging Face's own — **closed**
 
 `huggingface_hub` ships a **first-party public device-code client**, `DEVICE_CODE_OAUTH_CLIENT_ID`

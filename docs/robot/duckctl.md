@@ -363,7 +363,8 @@ duckctl account login --no-open
 for the code and the URL without a browser — which is also what you get automatically when the
 output is not a terminal, so a script launches nothing.
 
-A robot already signed in refuses and names the account. `--force` replaces it.
+A robot already signed in refuses and names the account, and so does one still waiting for a code
+to be approved. `--force` replaces either — the abandoned code stops working.
 
 ## Policies and skills
 

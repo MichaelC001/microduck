@@ -500,6 +500,16 @@ pub struct Account {
     /// never across a network call — `status` is polled *while* a login is in flight, so
     /// anything that made it queue behind an HTTP round trip would make a wizard look stuck.
     pending: Mutex<Option<Pending>>,
+    /// Which login is the current one.
+    ///
+    /// A flow lives in a spawned task that outlives the call that started it, and two things can
+    /// happen to it while it waits: `--force` starts another, or `logout` says the robot belongs
+    /// to nobody. In both cases the old task is still holding a device code Hugging Face will
+    /// happily approve, and without this it would write that approval to the store — a robot
+    /// signed back in a minute after being signed out, or signed in as the account somebody just
+    /// replaced. Each flow carries the number it was started with and does nothing at all if it
+    /// is no longer the current one.
+    generation: std::sync::atomic::AtomicU64,
     /// Held for the whole of starting a login, which the one above cannot be.
     ///
     /// Two callers arriving together both read `pending` as empty, both ask Hugging Face for a
@@ -527,6 +537,7 @@ impl Account {
             store,
             endpoint,
             pending: Mutex::new(None),
+            generation: std::sync::atomic::AtomicU64::new(0),
             starting: Mutex::new(()),
             last_error: Mutex::new(None),
         }
@@ -553,13 +564,18 @@ impl Account {
 
         // One login at a time, and the gate has to hold across the round trip below rather than
         // only across the check — see [`Self::starting`] for what two of them leave behind.
-        // `try_lock`, so the second caller is told `Busy` now instead of queueing behind
-        // somebody else's twenty-second timeout and then starting a login nobody is waiting for.
+        // `try_lock`, so the second caller is told so now instead of queueing behind somebody
+        // else's twenty-second timeout and then starting a login nobody is waiting for.
         let _starting = self
             .starting
             .try_lock()
             .map_err(|_| Error::LoginInFlight)?;
-        {
+        // A code that is still good refuses a second login — **unless `force`**. Without that
+        // exception the only ways out of a code nobody is going to approve are waiting five
+        // minutes and `logout`, and `logout` throws away a working credential to clear a
+        // *pending* one, which is a remedy worse than the problem. `force` already means "replace
+        // what this robot belongs to"; replacing an attempt at it is the smaller version.
+        if !force {
             let pending = self.pending.lock().await;
             if let Some(pending) = pending.as_ref()
                 && pending.deadline > SystemTime::now()
@@ -577,6 +593,12 @@ impl Account {
             expires_in: code.expires_in,
             interval: code.interval,
         };
+        // Claimed before the old flow can be told it has been replaced, so there is no instant
+        // in which two tasks both believe they are current.
+        let generation = self
+            .generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
         *self.pending.lock().await = Some(Pending {
             login: login.clone(),
             deadline: SystemTime::now() + Duration::from_secs(code.expires_in),
@@ -591,12 +613,17 @@ impl Account {
         );
 
         let this = std::sync::Arc::clone(self);
-        tokio::spawn(async move { this.wait_for_approval(client, code).await });
+        tokio::spawn(async move { this.wait_for_approval(client, code, generation).await });
         Ok(login)
     }
 
     /// Poll Hugging Face until the code is approved, refused, or out of time.
-    async fn wait_for_approval(&self, client: reqwest::Client, code: DeviceCode) {
+    async fn wait_for_approval(
+        &self,
+        client: reqwest::Client,
+        code: DeviceCode,
+        generation: u64,
+    ) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(code.expires_in);
         let mut interval = Duration::from_secs(code.interval.max(1));
 
@@ -622,6 +649,18 @@ impl Account {
             }
         };
 
+        // Superseded, and therefore silent: a `--force` login replaced this one, or `logout`
+        // said the robot belongs to nobody. Either way an approval that arrives now is an answer
+        // to a question that has been withdrawn, and writing it would sign the robot into the
+        // account somebody just replaced or out of. Checked *before* the store is touched.
+        if !self.is_current(generation) {
+            tracing::info!(
+                user_code = %code.user_code,
+                "a login was superseded before it finished; dropping its result"
+            );
+            return;
+        }
+
         let result = match outcome {
             Err(why) => Err(why),
             Ok(token) => self
@@ -629,6 +668,14 @@ impl Account {
                 .await
                 .map_err(|e| e.to_string()),
         };
+
+        // And again after it, because `persist` awaits: a `logout` landing during the write is
+        // the same withdrawal, and the record it left behind has to go with it.
+        if !self.is_current(generation) {
+            let _ = self.store.clear();
+            tracing::info!("a login completed after being superseded; its token was discarded");
+            return;
+        }
 
         *self.pending.lock().await = None;
         match result {
@@ -642,6 +689,11 @@ impl Account {
                 *self.last_error.lock().await = Some(why);
             }
         }
+    }
+
+    /// Whether the flow started as `generation` is still the one this robot is waiting on.
+    fn is_current(&self, generation: u64) -> bool {
+        self.generation.load(std::sync::atomic::Ordering::SeqCst) == generation
     }
 
     /// Store a fresh token, and return the username it belongs to if the name could be had.
@@ -718,6 +770,10 @@ impl Account {
     /// it was there. `remote-access-design.md` §2.6 says why that is where the line is and what
     /// closing it would take.
     pub async fn logout(&self) -> Result<proto::AccountLogoutResult, Error> {
+        // Before the file goes, so a flow that approves during this call sees itself superseded
+        // rather than writing a token into a robot that has just been signed out.
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let was = self.store.clear()?;
         *self.pending.lock().await = None;
         *self.last_error.lock().await = None;
@@ -1245,6 +1301,120 @@ mod tests {
             1,
             "one device code asked for, so there is only one code to read"
         );
+    }
+
+    /// A whole fake Hugging Face: a device code, a token, and a name.
+    ///
+    /// `approve_after` is how many `authorization_pending` answers to give first; `0` approves on
+    /// the first poll, which is what the tests about *abandoning* a login want — the approval has
+    /// to land while the test is still watching.
+    async fn fake_hf_full(approve_after: usize) -> FakeHf {
+        use axum::routing::{get, post};
+
+        let records = Records::default();
+        let polls = std::sync::Arc::clone(&records.hits);
+        let app = axum::Router::new()
+            .route(
+                "/oauth/device",
+                post(|| async {
+                    (
+                        [("content-type", "application/json")],
+                        r#"{"device_code":"device-abc","user_code":"A6MY-0314",
+                            "verification_uri":"https://hf.co/oauth/device",
+                            "expires_in":60,"interval":1}"#,
+                    )
+                }),
+            )
+            .route(
+                "/oauth/token",
+                post(move || {
+                    let polls = std::sync::Arc::clone(&polls);
+                    async move {
+                        let n = polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let body = if n < approve_after {
+                            r#"{"error":"authorization_pending"}"#
+                        } else {
+                            r#"{"access_token":"approved","refresh_token":"refresh-1",
+                                "expires_in":2591999}"#
+                        };
+                        ([("content-type", "application/json")], body)
+                    }
+                }),
+            )
+            .route(
+                "/oauth/userinfo",
+                get(|| async {
+                    (
+                        [("content-type", "application/json")],
+                        r#"{"preferred_username":"PierreRouanet"}"#,
+                    )
+                }),
+            );
+        serve(app, records).await
+    }
+
+    /// `--force` abandons a code nobody is going to approve.
+    ///
+    /// Without this the only ways past a live code are waiting five minutes and `logout`, and
+    /// `logout` destroys a working credential to clear a *pending* one. The refusal has to name a
+    /// way through it, and this is that way.
+    #[tokio::test]
+    async fn force_replaces_a_login_that_is_still_waiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let hf = fake_hf_slow_device().await;
+        let account = std::sync::Arc::new(Account::with_endpoint(store_in(&dir), hf.base.clone()));
+
+        let first = account.login(false).await.expect("the first login starts");
+        assert_eq!(hf.hits(), 1);
+
+        let refused = account
+            .login(false)
+            .await
+            .expect_err("a live code refuses a second login");
+        assert!(matches!(refused, Error::LoginInFlight), "{refused:?}");
+        assert!(
+            refused.to_string().contains("--force"),
+            "and says how to get past itself: {refused}"
+        );
+
+        account.login(true).await.expect("`force` gets past it");
+        assert_eq!(hf.hits(), 2, "a new code was asked for");
+        let waiting = account.status().await.login.expect("one login is in flight");
+        assert_eq!(
+            waiting.user_code, first.user_code,
+            "this fake answers with one code, so what is pinned here is that `status` describes \
+             the current login and not a stale one"
+        );
+    }
+
+    /// An approval that lands after `logout` is dropped, not written.
+    ///
+    /// The flow lives in a task that outlives the call that started it, so signing out while a
+    /// code is live leaves somebody able to approve it a minute later. Writing that would sign
+    /// the robot back in on its own, which is the one thing `logout` has to be able to promise it
+    /// will not do.
+    #[tokio::test]
+    async fn a_login_approved_after_logout_is_discarded() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(&dir);
+        let hf = fake_hf_full(0).await;
+        let account =
+            std::sync::Arc::new(Account::with_endpoint(store.clone(), hf.base.clone()));
+
+        account.login(false).await.expect("a login starts");
+        account.logout().await.expect("and is signed out under it");
+
+        // The fake approves on the first poll, one second in. Well past that, and nothing has
+        // been written: the flow saw itself superseded before it touched the store.
+        tokio::time::sleep(Duration::from_millis(2_500)).await;
+        assert!(hf.hits() >= 1, "the abandoned flow did reach the token endpoint");
+        assert!(
+            store.load().is_none(),
+            "a robot signed out must stay signed out"
+        );
+        let status = account.status().await;
+        assert!(status.account.is_none());
+        assert!(status.login.is_none());
     }
 
     /// An approved token is not thrown away because `/oauth/userinfo` failed.

@@ -123,7 +123,10 @@ pub enum Error {
     /// both pointed at the same robot, and telling that person an *update* is in progress sends
     /// them looking in the wrong place. What they need is that a code is already out and where to
     /// read it.
-    #[error("a login is already waiting for approval — `account status` has the code")]
+    #[error(
+        "a login is already waiting for approval — `account status` has the code, or --force to \
+         start a new one"
+    )]
     LoginInFlight,
 
     /// `account.login` on a robot that already belongs to somebody, without `--force`.

@@ -792,6 +792,9 @@ A robot that is already signed in refuses, and names the account:
 sudo robotctl account login --force
 ```
 
+The same flag abandons a code that is still waiting for approval — the case where somebody started
+a login and walked away. The old code stops working; approving it after that does nothing.
+
 The token lasts thirty days and the robot renews it on its own. A robot switched off for longer
 than that comes back needing `login` again, which `account status` says in as many words.
 
