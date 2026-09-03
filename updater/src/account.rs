@@ -192,7 +192,7 @@ impl Store {
         // Written 0600 first and relaxed to 0640 after the group is set, so the file is never
         // group-readable while it is owned by root's default group.
         write_private(&self.path, &bytes)?;
-        if let Some(gid) = group_id(TOKEN_GROUP) {
+        if let Some(gid) = crate::unix::group_id(TOKEN_GROUP) {
             set_group(&self.path, gid)?;
             set_mode(&self.path, 0o640)?;
         } else {
@@ -677,6 +677,12 @@ impl Account {
     }
 
     /// Forget the account. A login in flight is abandoned with it.
+    ///
+    /// **Forgets rather than revokes.** The file goes, so the robot stops being able to prove it
+    /// belongs to anybody, which is what signing out is for. The token itself stays valid at
+    /// Hugging Face until it expires — up to thirty days — for anything that read the file while
+    /// it was there. `remote-access-design.md` §2.6 says why that is where the line is and what
+    /// closing it would take.
     pub async fn logout(&self) -> Result<proto::AccountLogoutResult, Error> {
         let was = self.store.clear()?;
         *self.pending.lock().await = None;
@@ -781,18 +787,6 @@ fn set_mode(path: &Path, mode: u32) -> Result<(), Error> {
         path: path.to_path_buf(),
         source: e,
     })
-}
-
-/// The gid of a group by name, or `None` if there is no such group.
-fn group_id(name: &str) -> Option<u32> {
-    let cname = std::ffi::CString::new(name).ok()?;
-    // SAFETY: `getgrnam` takes a NUL-terminated string and returns a pointer into a static
-    // buffer or NULL. We read the one field we need before anything else can call it again.
-    let entry = unsafe { libc::getgrnam(cname.as_ptr()) };
-    if entry.is_null() {
-        return None;
-    }
-    Some(unsafe { (*entry).gr_gid })
 }
 
 fn set_group(path: &Path, gid: u32) -> Result<(), Error> {
@@ -1032,7 +1026,29 @@ mod tests {
     /// A one-route stand-in for huggingface.co.
     struct FakeHf {
         base: String,
+        /// Every `grant_type` the token endpoint was asked for, in order. Empty for a fake that
+        /// only serves `/oauth/device`.
+        grants: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
         _task: tokio::task::JoinHandle<()>,
+    }
+
+    impl FakeHf {
+        fn grants(&self) -> Vec<String> {
+            self.grants.lock().unwrap().clone()
+        }
+    }
+
+    async fn serve(app: axum::Router, grants: std::sync::Arc<std::sync::Mutex<Vec<String>>>) -> FakeHf {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        FakeHf {
+            base,
+            grants,
+            _task: task,
+        }
     }
 
     async fn fake_hf(device_response: &'static str) -> FakeHf {
@@ -1042,11 +1058,147 @@ mod tests {
             "/oauth/device",
             post(move || async move { ([("content-type", "application/json")], device_response) }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        let task = tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
-        FakeHf { base, _task: task }
+        serve(app, Default::default()).await
+    }
+
+    /// A stand-in for the token endpoint alone, which is all a refresh touches.
+    ///
+    /// It records the `grant_type` it was asked for, because a refresh sent as a device-code
+    /// grant would be refused by Hugging Face and by nobody here.
+    async fn fake_hf_token(answer: &'static str) -> FakeHf {
+        use axum::routing::post;
+
+        let grants: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let seen = std::sync::Arc::clone(&grants);
+        let app = axum::Router::new().route(
+            "/oauth/token",
+            post(
+                move |axum::extract::Form(form): axum::extract::Form<
+                    std::collections::HashMap<String, String>,
+                >| {
+                    let seen = std::sync::Arc::clone(&seen);
+                    async move {
+                        seen.lock()
+                            .unwrap()
+                            .push(form.get("grant_type").cloned().unwrap_or_default());
+                        ([("content-type", "application/json")], answer)
+                    }
+                },
+            ),
+        );
+        serve(app, grants).await
+    }
+
+    /// A token near the end of its life is renewed, and **the rotated refresh token replaces the
+    /// one that was spent**.
+    ///
+    /// The rotation is the part worth a test rather than a comment: Hugging Face spends the old
+    /// refresh token on every refresh, so storing the one already on disk — the obvious mistake,
+    /// since the rest of the record is carried over — leaves a robot that renews exactly once and
+    /// then quietly stops being reachable. `remote-access-design.md` §2.7.
+    #[tokio::test]
+    async fn a_due_token_is_renewed_and_the_rotation_lands_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(&dir);
+        // Six days left: inside `REFRESH_WHEN_UNDER`, which is how a board with a marginal
+        // network gets a week of retries instead of one last day.
+        store
+            .save(&Stored {
+                expires_at: Some(now_secs() + 6 * 24 * 60 * 60),
+                ..token("spent")
+            })
+            .unwrap();
+
+        let hf = fake_hf_token(
+            r#"{"access_token":"renewed","refresh_token":"refresh-2","expires_in":2591999}"#,
+        )
+        .await;
+        let account = Account::with_endpoint(store.clone(), hf.base.clone());
+
+        assert!(
+            account.refresh_if_due().await.unwrap(),
+            "a token with six days left is due"
+        );
+
+        let stored = store.load().unwrap();
+        assert_eq!(stored.access_token, "renewed");
+        assert_eq!(
+            stored.refresh_token.as_deref(),
+            Some("refresh-2"),
+            "the answer's refresh token, not the one it was traded for"
+        );
+        assert_eq!(
+            stored.username.as_deref(),
+            Some("PierreRouanet"),
+            "kept rather than re-asked: a refresh cannot change who a token belongs to, and this              path runs unattended"
+        );
+        assert!(
+            stored.expires_in() > 29 * 24 * 60 * 60,
+            "the new expiry is absolute and thirty days out: {}",
+            stored.expires_in()
+        );
+        assert_eq!(
+            hf.grants(),
+            vec!["refresh_token".to_string()],
+            "one refresh, sent as a refresh"
+        );
+
+        // And now it is not due again, which is what stops `maintain` renewing on every tick.
+        assert!(!account.refresh_if_due().await.unwrap());
+        assert_eq!(hf.grants().len(), 1, "no second round trip");
+    }
+
+    /// A refresh Hugging Face refuses leaves the credential alone and says so in `status`.
+    ///
+    /// This is the visible half of the window §2.7 says cannot be closed: once the old refresh
+    /// token is spent, no ordering here can recover it, so what the code owes is (a) not making
+    /// it worse by writing a half-record and (b) telling somebody. `maintain` is what turns the
+    /// error into an answer a client can read, so it is driven here rather than trusted.
+    #[tokio::test]
+    async fn a_refused_refresh_is_left_alone_and_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(&dir);
+        store
+            .save(&Stored {
+                expires_at: Some(now_secs() + 60 * 60),
+                ..token("spent")
+            })
+            .unwrap();
+
+        let hf = fake_hf_token(
+            r#"{"error":"invalid_grant","error_description":"refresh token is expired"}"#,
+        )
+        .await;
+        let account = std::sync::Arc::new(Account::with_endpoint(store.clone(), hf.base.clone()));
+
+        let error = account
+            .refresh_if_due()
+            .await
+            .expect_err("a refused refresh is an error");
+        assert!(
+            error.to_string().contains("invalid_grant"),
+            "the reason has to survive to the surface: {error}"
+        );
+        assert_eq!(
+            store.load().unwrap().access_token,
+            "spent",
+            "the stored credential is untouched — an hour of access left is worth more than a              record half-replaced by a failed refresh"
+        );
+
+        let task = tokio::spawn(maintain(std::sync::Arc::clone(&account)));
+        let mut reported = None;
+        for _ in 0..200 {
+            if let Some(why) = account.status().await.last_error {
+                reported = Some(why);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        task.abort();
+        let reported = reported.expect("`maintain` must put the failure where a client can see it");
+        assert!(
+            reported.contains("invalid_grant"),
+            "`account.status` is where somebody asks why remote access stopped: {reported}"
+        );
     }
 }

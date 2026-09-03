@@ -1246,12 +1246,27 @@ impl FakeHub {
 
 /// Serve with the account pointed at a temp file and a fake hub.
 async fn serve_with_account(fx: &Harness, hub: &FakeHub) -> (PathBuf, tokio::task::JoinHandle<()>) {
+    serve_with_account_as(fx, hub, None).await
+}
+
+/// As [`serve_with_account`], with an owning uid the test process is not.
+///
+/// `None` means the ordinary case: the socket's owner is whoever ran the test, so mutating calls
+/// are authorised. `Some(uid)` is how a test asks what an *unlisted* peer sees, which for
+/// `account.*` is the whole point of one call being a read.
+async fn serve_with_account_as(
+    fx: &Harness,
+    hub: &FakeHub,
+    owner_uid: Option<u32>,
+) -> (PathBuf, tokio::task::JoinHandle<()>) {
     let token_path = fx.root.join("etc/robot/hf-token");
     std::fs::create_dir_all(token_path.parent().unwrap()).unwrap();
-    let server = Arc::new(
-        Server::new(fx.engine(true, Faults::none()))
-            .with_account_for_test(token_path.clone(), hub.base.clone()),
-    );
+    let engine = fx.engine(true, Faults::none());
+    let server = match owner_uid {
+        None => Server::new(engine),
+        Some(uid) => Server::with_policy_for_test(engine, uid, Vec::new(), Vec::new()),
+    };
+    let server = Arc::new(server.with_account_for_test(token_path.clone(), hub.base.clone()));
     let handle = fx.serve_with(server).await;
     (token_path, handle)
 }
@@ -1306,23 +1321,28 @@ async fn a_device_code_login_completes_without_the_client_waiting() {
     assert_eq!(pending["login"]["user_code"], "A6MY-0314");
     assert!(pending["account"].is_null(), "not signed in yet");
 
-    // 2. The daemon is doing the polling. `FakeHub` approves on the third ask, and the interval
-    // is five seconds, so this is the one place the test has to wait for real time.
-    let signed_in = loop {
+    // 2. The daemon is doing the polling. `FakeHub` approves on the third ask and answers with a
+    // one-second interval, so this is the one place the test has to wait for real time — a few
+    // seconds of it. Bounded rather than a bare loop: a login that never lands should fail here
+    // saying so, not hang until whatever is running the suite gives up on it.
+    let mut signed_in = None;
+    for _ in 0..100 {
         tokio::time::sleep(Duration::from_millis(200)).await;
         let status = watcher
             .call(method::ACCOUNT_STATUS, serde_json::json!({}))
             .await
             .result
             .unwrap();
-        if !status["account"].is_null() {
-            break status;
-        }
         assert!(
             status["last_error"].is_null(),
             "the login failed: {status:?}"
         );
-    };
+        if !status["account"].is_null() {
+            signed_in = Some(status);
+            break;
+        }
+    }
+    let signed_in = signed_in.expect("the login never completed");
 
     assert_eq!(signed_in["account"]["username"], "PierreRouanet");
     assert!(
@@ -1409,15 +1429,18 @@ async fn a_second_login_needs_force() {
 
 /// `account.status` is a read, so it answers without the privilege the other two need.
 ///
-/// The gate is `Call::is_mutating`, which this test exists to pin from the outside: a support
-/// engineer has to be able to ask which account a robot thinks it belongs to.
+/// The gate is `Call::is_mutating`, and this drives it from the outside against a server whose
+/// owning uid the test process is not: `login` and `logout` are refused, and `status` still
+/// answers. Both halves matter — a support engineer has to be able to ask which account a robot
+/// thinks it belongs to, and nobody who merely reached the socket may rebind it.
 #[tokio::test]
 async fn status_is_not_a_privileged_call() {
     let fx = Harness::new();
     let hub = FakeHub::start(0).await;
-    let (_token_path, _server) = serve_with_account(&fx, &hub).await;
+    // Owner uid set to something the test process is not, and no allowances — the shape
+    // `an_unlisted_peer_cannot_mutate` uses for the update calls.
+    let (token_path, _server) = serve_with_account_as(&fx, &hub, Some(u32::MAX)).await;
 
-    // A server whose owning uid is nobody's, so every mutating call is denied.
     assert!(
         !proto::Call::AccountStatus.is_mutating(),
         "account.status must never require change authority"
@@ -1430,6 +1453,27 @@ async fn status_is_not_a_privileged_call() {
 
     let mut client = Client::connect(&fx.socket).await;
     client.hello().await;
+
+    for (method, params) in [
+        (method::ACCOUNT_LOGIN, serde_json::json!({})),
+        (method::ACCOUNT_LOGOUT, serde_json::json!({})),
+    ] {
+        let error = client
+            .call(method, params)
+            .await
+            .error
+            .unwrap_or_else(|| panic!("{method} should be denied"));
+        assert_eq!(
+            error.code,
+            proto::code::PERMISSION_DENIED,
+            "{method}: {error:?}"
+        );
+    }
+    assert!(
+        !token_path.exists(),
+        "a denied login must not have reached Hugging Face, let alone stored anything"
+    );
+
     let status = client
         .call(method::ACCOUNT_STATUS, serde_json::json!({}))
         .await;

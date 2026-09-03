@@ -182,7 +182,9 @@ fn permits(call: &proto::Call) -> bool {
         // - **It is visible.** `account.status` names the account, from any transport, without
         //   authorisation. A robot signed in to a stranger is a question anybody can ask.
         // - **It is revocable**, by `account.logout` here or on the robot, and by revoking the
-        //   grant on Hugging Face — which no robot-side gate could offer.
+        //   grant on Hugging Face — which no robot-side gate could offer. `logout` forgets the
+        //   credential rather than revoking it, so the token stays live at HF until it expires;
+        //   `remote-access-design.md` §2.6 is exact about that.
         //
         // What it is *not* is a reason to route `policy.fetch` after all: that one reaches the
         // network to put a stranger's weights in charge of fifteen servos, where this reaches it

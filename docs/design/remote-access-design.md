@@ -272,6 +272,16 @@ Three things make that acceptable rather than merely permitted:
 - **It is revocable** — `account.logout` from anywhere, and revoking the grant on Hugging Face,
   which no robot-side gate could offer.
 
+  Worth being exact about the first one, because it is weaker than it sounds: **`logout` deletes
+  the robot's copy and revokes nothing.** The robot stops being a producer, which is the effect
+  somebody signing out is after — but the access token it held stays valid at Hugging Face until
+  it expires, up to thirty days, for anything that already read the file. The credential is
+  `0640 root:robot`, so "anything" means root or `mediad` on that board; a stolen board is the
+  case that matters, and for that the answer is the account's connected-apps page on hf.co, not a
+  call here. Sending a revocation from the robot is a candidate for §9 and deliberately not in
+  this slice: it needs the endpoint checked against the first-party client rather than assumed,
+  and a `logout` that failed because the network was down must still forget the token locally.
+
 **One consequence that lives in another file, and it found a bug.** `account.login` and
 `account.logout` are `Call::is_mutating`, which is what `updaterd` authorises against a peer's
 uid, so `mediad` had to be added to `allow_users` in `deploy/updater.toml` alongside `btd`. That
@@ -568,6 +578,7 @@ Five slices, and the first two are independently useful and need no client:
 |---|---|
 | §2.4 the scope breadth | one public device-code client in the `pollen-robotics` HF org with `openid profile read-repos`, created by somebody with org admin. Not blocking — a scope change is a re-login — and it should not ship without it |
 | §5 where the client is served | follows the shape of §3, and is the decision that actually couples us to a service |
+| §2.6 `logout` revokes nothing | whether Hugging Face accepts a revocation for the first-party device-code client, checked rather than assumed. Not blocking — signing out stops the robot being reachable, and a stolen board is answered on hf.co — but it is the difference between "forgotten" and "revoked" |
 
 Closed since this page was written: the OAuth client (§2.3 — Hugging Face ships one), whether the
 token expires (§2.7 — thirty days, with a rotating refresh token), which rendezvous to use (§4 —
