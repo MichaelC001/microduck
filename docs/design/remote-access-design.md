@@ -166,8 +166,10 @@ answers, each of which is a decision nobody has to make now:
 callers arriving together — a console page and a phone, which is a normal thing to happen during
 setup — would otherwise both be handed a code, and the store would keep whichever approval landed
 last while somebody read the other code and watched it do nothing. The second caller gets
-`BUSY` while the first is in flight; `account.status` carries the code, so a client that lost
-track of one rejoins it rather than starting another.
+`BUSY` while the first is in flight — with its own message, because "another update is already in
+progress" is what `BUSY` says elsewhere and it would send that person looking in the wrong place.
+`account.status` carries the code, so a client that lost track of one rejoins it rather than
+starting another.
 
 ### 2.3 The OAuth client is Hugging Face's own — **closed**
 

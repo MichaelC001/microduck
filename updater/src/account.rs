@@ -555,13 +555,16 @@ impl Account {
         // only across the check — see [`Self::starting`] for what two of them leave behind.
         // `try_lock`, so the second caller is told `Busy` now instead of queueing behind
         // somebody else's twenty-second timeout and then starting a login nobody is waiting for.
-        let _starting = self.starting.try_lock().map_err(|_| Error::Busy)?;
+        let _starting = self
+            .starting
+            .try_lock()
+            .map_err(|_| Error::LoginInFlight)?;
         {
             let pending = self.pending.lock().await;
             if let Some(pending) = pending.as_ref()
                 && pending.deadline > SystemTime::now()
             {
-                return Err(Error::Busy);
+                return Err(Error::LoginInFlight);
             }
         }
 
@@ -1229,8 +1232,13 @@ mod tests {
             .find_map(|r| r.as_ref().err())
             .expect("the other is refused");
         assert!(
-            matches!(refusal, Error::Busy),
+            matches!(refusal, Error::LoginInFlight),
             "and refused as busy, which is a state that passes: {refusal:?}"
+        );
+        assert_eq!(refusal.code(), crate::proto::code::BUSY, "retryable");
+        assert!(
+            refusal.to_string().contains("account status"),
+            "and it says where the code that already exists can be read: {refusal}"
         );
         assert_eq!(
             hf.hits(),
