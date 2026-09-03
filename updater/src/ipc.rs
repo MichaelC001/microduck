@@ -263,15 +263,6 @@ impl Server {
     /// therefore inherit the bypass and lose the protection: exactly the wrong half of
     /// each. It also needs the same engine mutex and progress plumbing as a
     /// client-triggered update.
-    /// Keep the account token from expiring under a robot that is simply left on.
-    ///
-    /// Separate from [`Self::spawn_periodic_checks`] because it is unconditional: that one is
-    /// off unless a `check_interval` is configured, and a robot with update checks disabled
-    /// still has an account that stops working after thirty days.
-    pub fn spawn_account_maintenance(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(crate::account::maintain(Arc::clone(&self.account)))
-    }
-
     pub fn spawn_periodic_checks(
         self: &Arc<Self>,
         interval: Duration,
@@ -288,6 +279,15 @@ impl Server {
                 tokio::time::sleep(interval).await;
             }
         })
+    }
+
+    /// Keep the account token from expiring under a robot that is simply left on.
+    ///
+    /// Separate from [`Self::spawn_periodic_checks`] because it is unconditional: that one is
+    /// off unless a `check_interval` is configured, and a robot with update checks disabled
+    /// still has an account that stops working after thirty days.
+    pub fn spawn_account_maintenance(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(crate::account::maintain(Arc::clone(&self.account)))
     }
 
     /// One pass of the scheduler. Exposed so tests can drive it without waiting for

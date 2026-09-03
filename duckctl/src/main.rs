@@ -902,12 +902,6 @@ enum Pad {
     },
 }
 
-/// The policy commands, named as `robotctl policy` names them.
-///
-/// Same words in the same order as on the robot, for the reason [`Update`] gives. What is missing
-/// against `robotctl` is the Hub: `policy.check`, `policy.install` and `policy.search` are not
-/// served over this transport — they reach the network on the robot's behalf and write to the
-/// eMMC — so `load` here takes a path to a file already on the robot, never `org/repo`.
 /// `duckctl account …` — the account half of `robotctl account`, over the radio.
 #[derive(Subcommand, Debug)]
 enum Account {
@@ -929,6 +923,12 @@ enum Account {
     Logout,
 }
 
+/// The policy commands, named as `robotctl policy` names them.
+///
+/// Same words in the same order as on the robot, for the reason [`Update`] gives. What is missing
+/// against `robotctl` is the Hub: `policy.check`, `policy.install` and `policy.search` are not
+/// served over this transport — they reach the network on the robot's behalf and write to the
+/// eMMC — so `load` here takes a path to a file already on the robot, never `org/repo`.
 #[derive(Subcommand)]
 enum Policy {
     /// What each slot is running, from where, and which skills this robot has.
@@ -2097,9 +2097,9 @@ fn progress_line(params: &serde_json::Value) -> String {
 /// browser for `duckctl open`. So it opens — after printing, so a failure to open leaves the code
 /// on screen rather than an error where the instructions should have been.
 ///
-/// It opens `verification_uri_complete`, which carries `?user_code=` and saves typing the code at
-/// all. Hugging Face preserves that parameter across its own login redirect, so it survives a
-/// browser that is not signed in yet.
+/// It opens `verification_uri_complete`, which for Hugging Face is the plain device page: they
+/// send no complete URI and their page ignores a `?user_code=` query, so what opening buys is the
+/// navigation and not the typing. The code above it is still the part that matters.
 fn account_note(command: &Command, reply: &serde_json::Value) -> Option<String> {
     use std::io::IsTerminal;
 
@@ -2413,7 +2413,9 @@ mod tests {
             "result": {
                 "user_code": "A6MY-0314",
                 "verification_uri": "https://hf.co/oauth/device",
-                "verification_uri_complete": "https://hf.co/oauth/device?user_code=A6MY-0314",
+                // The plain URI, which is what the robot sends for Hugging Face: no complete
+                // one comes back and their page prefills nothing from a query.
+                "verification_uri_complete": "https://hf.co/oauth/device",
                 "expires_in": 300,
                 "interval": 5
             }

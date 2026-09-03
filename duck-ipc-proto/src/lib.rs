@@ -2289,12 +2289,18 @@ pub struct AccountLoginResult {
     pub user_code: String,
     /// Where they type it.
     pub verification_uri: String,
-    /// The same page with the code already in the query string.
+    /// RFC 8628's "page that needs no code typed into it", when a server sends one.
     ///
-    /// Hugging Face does not send this, so the robot synthesises it the way `huggingface_hub`
-    /// does, and a client should still **lead with the code and never open a browser by itself**.
-    /// The mini's app learned this the expensive way: auto-switching to Safari hid the code before
-    /// the user could read it, and the page asks them to type it anyway.
+    /// **Hugging Face does not, and today this is `verification_uri` unchanged.** An earlier
+    /// version of the robot appended `?user_code=`; HF's device page ignores the parameter and
+    /// prefills nothing, so that URL read as a promise the page then broke. The field stays
+    /// because it is the protocol's — a server that starts sending a real one is used with no
+    /// wire change — which means a client must treat it as "somewhere to send them", not as
+    /// "the code is handled".
+    ///
+    /// So whatever this says, a client **leads with the code and never opens a browser by
+    /// itself**. The mini's app learned that the expensive way: auto-switching to Safari hid the
+    /// code before the user could read it, and the page asks them to type it anyway.
     pub verification_uri_complete: String,
     /// How long the code is good for. In [`AccountStatusResult`] this is what is *left*.
     pub expires_in: u64,

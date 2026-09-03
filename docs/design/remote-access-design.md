@@ -156,6 +156,19 @@ answers, each of which is a decision nobody has to make now:
   The alternative was decoding the `id_token`, which is a JWT parser and a JWKS fetch for the same
   string.
 
+  **It is the last call and the least important one, so it cannot be allowed to fail the login.**
+  By the time it runs, somebody has typed a code into a phone; discarding the token because a
+  proxy answered 502 would make them do the whole flow again for a label. So the record is stored
+  with no name, `account.status` answers `unknown` rather than "signed out", and the next
+  `maintain` pass fills it in — the network that failed is the one this board is expected to have.
+
+**One login at a time, and the guard covers the round trip rather than the check before it.** Two
+callers arriving together — a console page and a phone, which is a normal thing to happen during
+setup — would otherwise both be handed a code, and the store would keep whichever approval landed
+last while somebody read the other code and watched it do nothing. The second caller gets
+`BUSY` while the first is in flight; `account.status` carries the code, so a client that lost
+track of one rejoins it rather than starting another.
+
 ### 2.3 The OAuth client is Hugging Face's own — **closed**
 
 `huggingface_hub` ships a **first-party public device-code client**, `DEVICE_CODE_OAUTH_CLIENT_ID`

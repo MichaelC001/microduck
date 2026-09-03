@@ -496,8 +496,18 @@ pub struct Account {
     /// mutating a variable the whole process shares.
     endpoint: String,
     /// `Mutex` rather than a channel because there is at most one login at a time and both
-    /// `login` and `status` need to see it; the lock is held for a field read.
+    /// `login` and `status` need to see it; the lock is held for a field read, and deliberately
+    /// never across a network call — `status` is polled *while* a login is in flight, so
+    /// anything that made it queue behind an HTTP round trip would make a wizard look stuck.
     pending: Mutex<Option<Pending>>,
+    /// Held for the whole of starting a login, which the one above cannot be.
+    ///
+    /// Two callers arriving together both read `pending` as empty, both ask Hugging Face for a
+    /// code, and both spawn a poller: the store then holds whichever approval landed last, which
+    /// is neither predictable nor explicable to whoever was reading the other code. The window is
+    /// the round trip to `/oauth/device`, so the guard has to cover it — and it is its own lock
+    /// rather than `pending` because `status` must not wait on that round trip.
+    starting: Mutex<()>,
     last_error: Mutex<Option<String>>,
 }
 
@@ -517,6 +527,7 @@ impl Account {
             store,
             endpoint,
             pending: Mutex::new(None),
+            starting: Mutex::new(()),
             last_error: Mutex::new(None),
         }
     }
@@ -539,8 +550,12 @@ impl Account {
             let who = stored.username.unwrap_or_else(|| "another account".into());
             return Err(Error::AlreadySignedIn(who));
         }
-        // One login at a time. A second one would race the first's write and leave whichever
-        // finished last, which is not a thing a caller can predict or a user can understand.
+
+        // One login at a time, and the gate has to hold across the round trip below rather than
+        // only across the check — see [`Self::starting`] for what two of them leave behind.
+        // `try_lock`, so the second caller is told `Busy` now instead of queueing behind
+        // somebody else's twenty-second timeout and then starting a login nobody is waiting for.
+        let _starting = self.starting.try_lock().map_err(|_| Error::Busy)?;
         {
             let pending = self.pending.lock().await;
             if let Some(pending) = pending.as_ref()
@@ -615,6 +630,7 @@ impl Account {
         *self.pending.lock().await = None;
         match result {
             Ok(username) => {
+                let username = username.unwrap_or_else(|| "an account it cannot name yet".into());
                 tracing::info!(%username, "this robot now belongs to a Hugging Face account");
                 *self.last_error.lock().await = None;
             }
@@ -625,21 +641,36 @@ impl Account {
         }
     }
 
-    /// Store a fresh token, and return the username it belongs to.
+    /// Store a fresh token, and return the username it belongs to if the name could be had.
     ///
     /// The username is asked for *before* the write and stored with it, so `status` never needs
     /// the network — and a robot that is offline still knows who it belongs to.
+    ///
+    /// **A failure to read the name must not lose the token.** By this point somebody has
+    /// approved a code on their phone; throwing the credential away because `/oauth/userinfo`
+    /// answered a 502 would make them do the whole flow again for a field that is a label. So
+    /// the name is optional: the record lands either way, `status` says `unknown` until it is
+    /// known, and [`maintain`] fills it in within six hours — see [`Self::name_if_unknown`].
     async fn persist(
         &self,
         client: &reqwest::Client,
         token: TokenResponse,
-    ) -> Result<String, Error> {
-        let username = userinfo(client, &self.endpoint, &token.access_token).await?;
+    ) -> Result<Option<String>, Error> {
+        let username = match userinfo(client, &self.endpoint, &token.access_token).await {
+            Ok(username) => Some(username),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "signed in, but could not read the account name; storing the token anyway"
+                );
+                None
+            }
+        };
         self.store.save(&Stored {
             access_token: token.access_token,
             refresh_token: token.refresh_token,
             expires_at: token.expires_in.map(|s| now_secs() + s as i64),
-            username: Some(username.clone()),
+            username: username.clone(),
         })?;
         Ok(username)
     }
@@ -719,6 +750,28 @@ impl Account {
         })?;
         Ok(true)
     }
+
+    /// Ask who the token belongs to, when the stored record cannot say.
+    ///
+    /// Only ever the case after a login whose `/oauth/userinfo` call failed — [`Self::persist`]
+    /// keeps the token in that case rather than losing it over a label. Left alone,
+    /// `account.status` would answer `unknown` until somebody signed in again; this is what makes
+    /// it answer properly on the next [`maintain`] pass instead. Returns `true` when it wrote a
+    /// name.
+    pub async fn name_if_unknown(&self) -> Result<bool, Error> {
+        let Some(stored) = self.store.load() else {
+            return Ok(false);
+        };
+        if stored.username.is_some() {
+            return Ok(false);
+        }
+        let username = userinfo(&http::client()?, &self.endpoint, &stored.access_token).await?;
+        self.store.save(&Stored {
+            username: Some(username),
+            ..stored
+        })?;
+        Ok(true)
+    }
 }
 
 /// Keep the token fresh for as long as this process runs.
@@ -738,6 +791,15 @@ pub async fn maintain(account: std::sync::Arc<Account>) {
                 tracing::warn!(%why, "could not renew the account token");
                 *account.last_error.lock().await = Some(why);
             }
+        }
+        // A missing name is cosmetic, so its failure stays in the journal rather than going to
+        // `last_error`: that field answers "why did remote access stop", and this did not stop
+        // it. Nothing happens here at all on the overwhelmingly common path — the name is only
+        // absent after a login that could not reach `/oauth/userinfo`.
+        match account.name_if_unknown().await {
+            Ok(true) => tracing::info!("filled in the account name a login could not read"),
+            Ok(false) => {}
+            Err(e) => tracing::debug!(error = %e, "still cannot read the account name"),
         }
         tokio::time::sleep(MAINTAIN_INTERVAL).await;
     }
@@ -1027,8 +1089,11 @@ mod tests {
     struct FakeHf {
         base: String,
         /// Every `grant_type` the token endpoint was asked for, in order. Empty for a fake that
-        /// only serves `/oauth/device`.
+        /// does not serve `/oauth/token`.
         grants: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        /// How many times the route under test was asked, for the tests where *once* is the
+        /// property rather than the answer.
+        hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         _task: tokio::task::JoinHandle<()>,
     }
 
@@ -1036,9 +1101,19 @@ mod tests {
         fn grants(&self) -> Vec<String> {
             self.grants.lock().unwrap().clone()
         }
+
+        fn hits(&self) -> usize {
+            self.hits.load(std::sync::atomic::Ordering::SeqCst)
+        }
     }
 
-    async fn serve(app: axum::Router, grants: std::sync::Arc<std::sync::Mutex<Vec<String>>>) -> FakeHf {
+    #[derive(Default)]
+    struct Records {
+        grants: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    async fn serve(app: axum::Router, records: Records) -> FakeHf {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let task = tokio::spawn(async move {
@@ -1046,7 +1121,8 @@ mod tests {
         });
         FakeHf {
             base,
-            grants,
+            grants: records.grants,
+            hits: records.hits,
             _task: task,
         }
     }
@@ -1058,7 +1134,7 @@ mod tests {
             "/oauth/device",
             post(move || async move { ([("content-type", "application/json")], device_response) }),
         );
-        serve(app, Default::default()).await
+        serve(app, Records::default()).await
     }
 
     /// A stand-in for the token endpoint alone, which is all a refresh touches.
@@ -1068,8 +1144,8 @@ mod tests {
     async fn fake_hf_token(answer: &'static str) -> FakeHf {
         use axum::routing::post;
 
-        let grants: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
-        let seen = std::sync::Arc::clone(&grants);
+        let records = Records::default();
+        let seen = std::sync::Arc::clone(&records.grants);
         let app = axum::Router::new().route(
             "/oauth/token",
             post(
@@ -1086,7 +1162,132 @@ mod tests {
                 },
             ),
         );
-        serve(app, grants).await
+        serve(app, records).await
+    }
+
+    /// A stand-in for `/oauth/userinfo` alone, answering with whatever status is asked for.
+    async fn fake_hf_userinfo(answer: &'static str, status: u16) -> FakeHf {
+        use axum::routing::get;
+
+        let code = axum::http::StatusCode::from_u16(status).unwrap();
+        let app = axum::Router::new().route(
+            "/oauth/userinfo",
+            get(move || async move { (code, [("content-type", "application/json")], answer) }),
+        );
+        serve(app, Records::default()).await
+    }
+
+    /// A device endpoint that takes its time, and counts how often it was asked.
+    ///
+    /// The delay is the point: the window two logins race for is exactly this round trip, so a
+    /// fake that answered instantly would leave the test passing for the wrong reason.
+    async fn fake_hf_slow_device() -> FakeHf {
+        use axum::routing::post;
+
+        let records = Records::default();
+        let hits = std::sync::Arc::clone(&records.hits);
+        let app = axum::Router::new().route(
+            "/oauth/device",
+            post(move || {
+                let hits = std::sync::Arc::clone(&hits);
+                async move {
+                    hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    (
+                        [("content-type", "application/json")],
+                        r#"{"device_code":"device-abc","user_code":"A6MY-0314",
+                            "verification_uri":"https://hf.co/oauth/device",
+                            "expires_in":60,"interval":1}"#,
+                    )
+                }
+            }),
+        );
+        serve(app, records).await
+    }
+
+    /// Two logins arriving together: one starts, the other is told the robot is busy.
+    ///
+    /// The guard has to cover the round trip to `/oauth/device`, not just the check before it —
+    /// two codes handed out means two pollers, and the store then holds whichever approval landed
+    /// last while somebody stares at the other code wondering why it did nothing.
+    #[tokio::test]
+    async fn two_logins_at_once_do_not_both_reach_hugging_face() {
+        let dir = tempfile::tempdir().unwrap();
+        let hf = fake_hf_slow_device().await;
+        let account = std::sync::Arc::new(Account::with_endpoint(store_in(&dir), hf.base.clone()));
+
+        let (first, second) = tokio::join!(account.login(false), account.login(false));
+
+        let outcomes = [first, second];
+        assert_eq!(
+            outcomes.iter().filter(|r| r.is_ok()).count(),
+            1,
+            "exactly one login starts: {outcomes:?}"
+        );
+        let refusal = outcomes
+            .iter()
+            .find_map(|r| r.as_ref().err())
+            .expect("the other is refused");
+        assert!(
+            matches!(refusal, Error::Busy),
+            "and refused as busy, which is a state that passes: {refusal:?}"
+        );
+        assert_eq!(
+            hf.hits(),
+            1,
+            "one device code asked for, so there is only one code to read"
+        );
+    }
+
+    /// An approved token is not thrown away because `/oauth/userinfo` failed.
+    ///
+    /// By the time this runs somebody has typed a code into a phone. Losing the credential over
+    /// the *label* would make them do all of it again, and on the board this is for — one whose
+    /// network is the reason the call failed — quite possibly twice. So the name is optional, and
+    /// the next `maintain` pass is what fills it in.
+    #[tokio::test]
+    async fn an_approved_token_survives_a_userinfo_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(&dir);
+        let approved = || TokenResponse {
+            access_token: "approved".into(),
+            refresh_token: Some("refresh-1".into()),
+            expires_in: Some(2_591_999),
+        };
+
+        let broken = fake_hf_userinfo("<html>502 Bad Gateway</html>", 502).await;
+        let account = Account::with_endpoint(store.clone(), broken.base.clone());
+        let named = account
+            .persist(&http::client().unwrap(), approved())
+            .await
+            .expect("a name that cannot be read is not a failed login");
+        assert!(named.is_none());
+
+        let stored = store.load().expect("the credential is on disk regardless");
+        assert_eq!(stored.access_token, "approved");
+        assert_eq!(stored.refresh_token.as_deref(), Some("refresh-1"));
+        assert!(stored.username.is_none(), "the name is what is missing");
+        assert_eq!(
+            account.status().await.account.unwrap().username,
+            "unknown",
+            "a client is told the robot belongs to somebody it cannot name, not that it is \
+             signed out"
+        );
+
+        // And the next pass names it, without touching the credential.
+        let working = fake_hf_userinfo(r#"{"preferred_username":"PierreRouanet"}"#, 200).await;
+        let account = Account::with_endpoint(store.clone(), working.base.clone());
+        assert!(account.name_if_unknown().await.unwrap());
+        let stored = store.load().unwrap();
+        assert_eq!(stored.username.as_deref(), Some("PierreRouanet"));
+        assert_eq!(
+            stored.access_token, "approved",
+            "the backfill writes the name and nothing else"
+        );
+        assert!(
+            !account.name_if_unknown().await.unwrap(),
+            "and asks nobody once it knows — this runs every six hours forever"
+        );
     }
 
     /// A token near the end of its life is renewed, and **the rotated refresh token replaces the
