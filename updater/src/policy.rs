@@ -569,6 +569,80 @@ mod tests {
         assert!(root.join("releases/from-a-tool").exists());
     }
 
+    /// A revision directory, with an mtime old enough to order it.
+    fn revision(dir: &Path, name: &str, age_s: u64) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::create_dir_all(&path).expect("mkdir");
+        std::fs::write(path.join("policy.onnx"), name).expect("policy");
+        let when = std::time::SystemTime::now() - std::time::Duration::from_secs(age_s);
+        std::fs::File::open(&path)
+            .and_then(|f| f.set_times(std::fs::FileTimes::new().set_modified(when)))
+            .expect("mtime");
+        path
+    }
+
+    /// **The library was the one directory here that nothing tidied.** Every `policy load
+    /// <org/repo>` left ~800 KB behind for good, and `policy.fetch` is served over both radio
+    /// transports — so filling a robot's eMMC took no more than a loop.
+    #[test]
+    fn old_revisions_of_a_repo_are_pruned_to_the_new_one_and_its_predecessor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("someone/a-gait");
+        for (name, age) in [("main", 0), ("v3", 10), ("v2", 20), ("v1", 30)] {
+            revision(&repo, name, age);
+        }
+
+        prune_library(&repo, "main", Some(&[]));
+
+        let mut left: Vec<String> = std::fs::read_dir(&repo)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            vec!["main".to_string(), "v3".to_string()],
+            "the one just fetched and the one before it"
+        );
+    }
+
+    /// **A revision the robot is running is kept however old it is.** Slots and skills both: a
+    /// gait fetched last month and left in the walk slot is exactly what a prune must not take,
+    /// and so is the bow somebody put on a button.
+    #[test]
+    fn a_revision_the_robot_is_using_is_never_pruned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("someone/a-gait");
+        let old = revision(&repo, "v1", 300);
+        for (name, age) in [("main", 0), ("v3", 10), ("v2", 20)] {
+            revision(&repo, name, age);
+        }
+
+        let in_use = vec![old.join("policy.onnx").display().to_string()];
+        prune_library(&repo, "main", Some(&in_use));
+
+        assert!(old.exists(), "the gait the robot is running");
+        assert!(repo.join("v3").exists(), "and the predecessor");
+        assert!(!repo.join("v2").exists(), "but not the rest");
+    }
+
+    /// **A robot that did not answer prunes nothing.** Silence is not "using none of them" —
+    /// it is a `robotd` that is down, which is the one state where deleting the policy it is
+    /// about to come back up on would be unrecoverable.
+    #[test]
+    fn nothing_is_pruned_when_the_robot_did_not_say() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("someone/a-gait");
+        for (name, age) in [("main", 0), ("v3", 10), ("v2", 20), ("v1", 30)] {
+            revision(&repo, name, age);
+        }
+
+        prune_library(&repo, "main", None);
+
+        assert_eq!(std::fs::read_dir(&repo).unwrap().count(), 4);
+    }
+
     fn here() -> Expectations {
         Expectations::here(Some(1))
     }
@@ -1026,6 +1100,7 @@ pub async fn fetch(
     revision: Option<&str>,
     file: Option<&str>,
     expected: Expectations,
+    in_use: Option<&[String]>,
 ) -> Result<crate::proto::PolicyFetchResult, Error> {
     // A repo is `org/name`, and nothing else. Checked before it is pasted into a URL and before
     // any of it becomes a directory name.
@@ -1066,7 +1141,19 @@ pub async fn fetch(
             }
             file.to_owned()
         }
-        None => sole_policy(&tree(&client, repo, revision).await?, repo)?,
+        // The listing's path, checked the same way a caller-supplied name is: a `.onnx` under a
+        // subdirectory is a repo layout this cannot install, and saying so beats an ENOENT from
+        // a staging path whose parent was never created.
+        None => {
+            let file = sole_policy(&tree(&client, repo, revision).await?, repo)?;
+            if file.contains('/') {
+                return Err(Error::Network(format!(
+                    "{repo}'s only policy is {file}, which is not at the top of the repo — \
+                     name it with `<repo>:<file>` if that is really the one"
+                )));
+            }
+            file
+        }
     };
 
     let dir = library.join(org).join(name).join(revision);
@@ -1091,6 +1178,8 @@ pub async fn fetch(
         path: path.clone(),
         source: e,
     })?;
+
+    prune_library(&library.join(org).join(name), revision, in_use);
 
     let commit = commit_of(&client, repo, revision).await;
     let record = format!(
@@ -1120,13 +1209,82 @@ pub async fn fetch(
     })
 }
 
-/// An RFC-3339 timestamp without pulling in a date library for one line.
+/// Seconds since the epoch, in the `@<secs>` form `date -d` and `systemd-analyze` both read.
+///
+/// Not RFC-3339, deliberately: rendering one means a date library or a hand-rolled civil-calendar
+/// conversion, for a field nothing parses. The seeder writes a real timestamp because `date` is
+/// already there; this is the same fact in the form that costs nothing.
 fn now_utc() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     format!("@{secs}")
+}
+
+/// How many revisions of one repo the library keeps.
+///
+/// **The library is the one directory here that nothing tidied.** Every `policy load <org/repo>`
+/// leaves ~800 KB behind for good, and both the command and `policy.fetch` behind it are served
+/// over BLE and WebRTC — where §4 of `remote-webrtc.md` says any LAN peer inherits them. A robot
+/// whose eMMC fills up stops being a robot, and nothing about trying gaits should be able to do
+/// that.
+///
+/// Two, matching the official sets: the one just fetched and the one before it, so going back to
+/// the revision you just left is still a local operation.
+const LIBRARY_REVISIONS_KEPT: usize = 2;
+
+/// Drop older revisions of the repo just fetched, keeping what the robot is using.
+///
+/// **`in_use` is the whole safety of this**, and `None` means "could not ask" rather than
+/// "nothing" — a silent `robotd` is exactly the robot whose gait must not be deleted while it is
+/// down. The caller passes what `robot.policies` and `robot.skills` answered, so a policy filling
+/// a slot or answering to a name is kept however old it is.
+///
+/// Per repo rather than across the library: a person trying two gaits alternately is not asking
+/// to lose the third one they fetched last week from somewhere else.
+///
+/// Best effort, like [`prune`]. A revision that will not delete is disk space, not a failed
+/// fetch, and undoing a good fetch over it would be the wrong trade.
+fn prune_library(repo_dir: &Path, keep: &str, in_use: Option<&[String]>) {
+    let Some(in_use) = in_use else {
+        tracing::debug!(
+            dir = %repo_dir.display(),
+            "not pruning the policy library: the robot did not say what it is using"
+        );
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(repo_dir) else {
+        return;
+    };
+    // Newest first, by the mtime the fetch left on the directory.
+    let mut revisions: Vec<(std::time::SystemTime, std::path::PathBuf, String)> = entries
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let modified = e.metadata().ok()?.modified().ok()?;
+            Some((modified, e.path(), name))
+        })
+        .collect();
+    revisions.sort_by_key(|(modified, _, _)| std::cmp::Reverse(*modified));
+
+    let mut kept = 0;
+    for (_, path, name) in revisions {
+        let used = in_use
+            .iter()
+            .any(|p| std::path::Path::new(p).starts_with(&path));
+        if name == keep || used {
+            continue;
+        }
+        kept += 1;
+        if kept < LIBRARY_REVISIONS_KEPT {
+            continue;
+        }
+        if let Err(e) = std::fs::remove_dir_all(&path) {
+            tracing::warn!(revision = %name, error = %e, "could not remove an old policy");
+        }
+    }
 }
 
 /// Hub models matching a query.

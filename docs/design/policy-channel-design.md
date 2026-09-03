@@ -244,7 +244,12 @@ directory and never into a component's install dir, which keeps that invariant l
 where it is load-bearing.
 
 The library lives at `/var/lib/robot/policies/`, outside every release directory, per
-[`updater-design.md`](updater-design.md) §5.7 rule 1.
+[`updater-design.md`](updater-design.md) §5.7 rule 1. It keeps two revisions per repo — the one
+just fetched and the one before it, the rule §9.1 uses for official sets — because nothing else
+tidies it and both `policy.fetch` and the command behind it are served over both radio
+transports. A revision the robot is *using*, in a slot or as a skill, is kept however old it is;
+a robot that does not answer prunes nothing at all, since silence is a `robotd` that is down
+rather than one using none of them.
 
 ## 9. Leaving the artifact
 
