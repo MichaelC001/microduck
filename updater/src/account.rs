@@ -566,10 +566,7 @@ impl Account {
         // only across the check — see [`Self::starting`] for what two of them leave behind.
         // `try_lock`, so the second caller is told so now instead of queueing behind somebody
         // else's twenty-second timeout and then starting a login nobody is waiting for.
-        let _starting = self
-            .starting
-            .try_lock()
-            .map_err(|_| Error::LoginInFlight)?;
+        let _starting = self.starting.try_lock().map_err(|_| Error::LoginInFlight)?;
         // A code that is still good refuses a second login — **unless `force`**. Without that
         // exception the only ways out of a code nobody is going to approve are waiting five
         // minutes and `logout`, and `logout` throws away a working credential to clear a
@@ -618,12 +615,7 @@ impl Account {
     }
 
     /// Poll Hugging Face until the code is approved, refused, or out of time.
-    async fn wait_for_approval(
-        &self,
-        client: reqwest::Client,
-        code: DeviceCode,
-        generation: u64,
-    ) {
+    async fn wait_for_approval(&self, client: reqwest::Client, code: DeviceCode, generation: u64) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(code.expires_in);
         let mut interval = Duration::from_secs(code.interval.max(1));
 
@@ -1379,7 +1371,11 @@ mod tests {
 
         account.login(true).await.expect("`force` gets past it");
         assert_eq!(hf.hits(), 2, "a new code was asked for");
-        let waiting = account.status().await.login.expect("one login is in flight");
+        let waiting = account
+            .status()
+            .await
+            .login
+            .expect("one login is in flight");
         assert_eq!(
             waiting.user_code, first.user_code,
             "this fake answers with one code, so what is pinned here is that `status` describes \
@@ -1398,8 +1394,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = store_in(&dir);
         let hf = fake_hf_full(0).await;
-        let account =
-            std::sync::Arc::new(Account::with_endpoint(store.clone(), hf.base.clone()));
+        let account = std::sync::Arc::new(Account::with_endpoint(store.clone(), hf.base.clone()));
 
         account.login(false).await.expect("a login starts");
         account.logout().await.expect("and is signed out under it");
@@ -1407,7 +1402,10 @@ mod tests {
         // The fake approves on the first poll, one second in. Well past that, and nothing has
         // been written: the flow saw itself superseded before it touched the store.
         tokio::time::sleep(Duration::from_millis(2_500)).await;
-        assert!(hf.hits() >= 1, "the abandoned flow did reach the token endpoint");
+        assert!(
+            hf.hits() >= 1,
+            "the abandoned flow did reach the token endpoint"
+        );
         assert!(
             store.load().is_none(),
             "a robot signed out must stay signed out"
