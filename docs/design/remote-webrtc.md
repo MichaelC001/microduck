@@ -178,7 +178,7 @@ defaults are in [`media-bringup.md`](../project/media-bringup.md).
 ```text
                               ┌─ queue ─ mpph264enc ─ h264parse ─ webrtcsink
 capture ─ NV12 ─ capsfilter ─ tee
-                              └─ queue(leaky, 1) ─ appsink ─ latest frame
+                              └─ queue(leaky, 1) ─ appsink ─ a frame on request
 ```
 
 §5.3 wants a frame on demand for a server-side program — "it wants a frame every second or two plus
@@ -189,8 +189,21 @@ taking them off the encoded branch would mean decoding what was just encoded.
 NV12 throughout, because that is what the rkisp path emits and what `mpph264enc` accepts, so
 nothing converts anywhere. Each branch has its own `queue` — a `tee` without them runs both from
 one thread, so a slow reader would stall the video track — and the raw one is leaky and one buffer
-deep, which is the last-value-wins, non-blocking snapshot `architecture.md` §2 asks for. A stalled
-reader costs frames, never the encoder.
+deep, which is the *latest* snapshot `architecture.md` §2 asks for rather than a queue of stale
+ones. A stalled reader costs frames, never the encoder.
+
+**A frame is copied out of the appsink only when a reader has asked for one.** The readers on this
+branch want two frames a second between them — auto-exposure meters one every 500 ms, the duck
+detector looks twice a second when it is enabled at all — and a frame is 1.84 MB at 720p30.
+Capturing all thirty was 55 MB/s of memcpy and a 1.8 MB allocation thirty times a second, from
+boot, on every robot, for frames nobody read. Every buffer still reaches the appsink and is dropped
+there unread; the cost on a frame nobody wants is a relaxed load.
+
+The request is answered by the *next* capture rather than by the last one delivered. Handing back
+whatever was lying around would be cheaper again and would put the reader's own polling period into
+the measurement — an exposure loop steering on luma from half a second ago is a loop that hunts. A
+reader blocks until its frame lands, bounded by a timeout, and a camera that has stopped reaches
+the same "no frame" path it always did.
 
 The branch exists from the start rather than being added when something reads it: inserting a tee
 into a live pipeline is a materially harder problem than having one that was always there.
