@@ -115,6 +115,18 @@ pub trait RobotClient: Send + Sync {
     /// worth reporting rather than presenting as a success it has not acted on. A reboot fixes it
     /// either way, so this is never a reason to fail an install.
     async fn reload_policies(&self, timeout: Duration) -> bool;
+
+    /// Every policy file the robot is currently pointed at — slots and skills both.
+    ///
+    /// `None` when it could not be asked, which is not the same as "none in use" and must never
+    /// be read as one: it is what stops the library prune deleting the gait a silent robot is
+    /// about to come back up on.
+    ///
+    /// Defaults to `None` for the same reason — a client that cannot answer this question causes
+    /// nothing to be deleted, which is the failure this wants.
+    async fn policy_paths(&self, _timeout: Duration) -> Option<Vec<String>> {
+        None
+    }
 }
 
 /// Talks to `robotd` over its unix socket.
@@ -233,6 +245,34 @@ impl RobotClient for SocketRobotClient {
             .is_some_and(|result| result.accepted)
     }
 
+    async fn policy_paths(&self, timeout: Duration) -> Option<Vec<String>> {
+        let policies: crate::proto::PoliciesResult = serde_json::from_value(
+            self.ask(&crate::proto::Call::RobotPolicies, timeout)
+                .await?,
+        )
+        .ok()?;
+        // The skills too: a fetched policy can fill a slot or answer to a name, and a prune that
+        // only looked at slots would delete the bow somebody put on a button.
+        let skills: Option<crate::proto::SkillsResult> =
+            match self.ask(&crate::proto::Call::RobotSkills, timeout).await {
+                Some(value) => Some(serde_json::from_value(value).ok()?),
+                None => None,
+            };
+        Some(
+            policies
+                .slots
+                .into_iter()
+                .filter_map(|slot| slot.path)
+                .chain(
+                    skills
+                        .into_iter()
+                        .flat_map(|s| s.skills)
+                        .filter_map(|skill| skill.path),
+                )
+                .collect(),
+        )
+    }
+
     async fn remote_session_active(&self, timeout: Duration) -> bool {
         // Defaults to false when unknown: this check is a courtesy and must never be
         // the reason a recovery update is refused.
@@ -265,6 +305,10 @@ impl RobotClient for AbsentRobot {
 
     async fn reload_policies(&self, _timeout: Duration) -> bool {
         false
+    }
+
+    async fn policy_paths(&self, _timeout: Duration) -> Option<Vec<String>> {
+        None
     }
 
     async fn remote_session_active(&self, _timeout: Duration) -> bool {

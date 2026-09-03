@@ -1311,12 +1311,16 @@ impl Engine {
         file: Option<&str>,
     ) -> Result<crate::proto::PolicyFetchResult, Error> {
         let model_api = self.robot.model_api(ROBOT_QUERY_TIMEOUT).await;
+        // What the robot is pointed at, so the prune that follows the fetch cannot take a gait
+        // out from under it. `None` — a robot that did not answer — prunes nothing at all.
+        let in_use = self.robot.policy_paths(ROBOT_QUERY_TIMEOUT).await;
         crate::policy::fetch(
             std::path::Path::new(crate::policy::LIBRARY_ROOT),
             repo,
             revision,
             file,
             crate::policy::Expectations::here(model_api),
+            in_use.as_deref(),
         )
         .await
     }

@@ -27,6 +27,10 @@ pub const POLICY_ROOT: &str = "/opt/robot/policies";
 /// The provenance record the seeder writes beside a set.
 const SOURCE_FILE: &str = ".source";
 
+/// What a set says about itself, installed beside the policies it describes. `robotd` reads it
+/// from `<current>/` to know which of them are skills.
+const MANIFEST_FILE: &str = "manifest.json";
+
 /// Sets installed from here are named for their revision, and the prefix marks them as *ours* —
 /// the seeder uses the same one, and both refuse to disturb a `current` that has neither.
 const SET_PREFIX: &str = "seed-";
@@ -68,12 +72,13 @@ pub fn installed(root: &Path) -> Option<Source> {
     Source::parse(&text)
 }
 
-/// Every `.onnx` in the installed set — the list a replacement has to cover.
+/// Every `.onnx` in the installed set — the fallback download list.
 ///
-/// Read from disk rather than hardcoded here, because the daemon that knows which files a slot
-/// can want is `robotd`, and the set on the board is the closest thing this process has to that
-/// list. A repo that has gained a policy since is handled by [`fetch_set`], which takes whatever
-/// the revision offers.
+/// **Second choice.** [`set_files`] asks the revision what it contains, which is the only list
+/// that can grow; this one can only ever re-fetch what the board already has, so a revision that
+/// added a tenth policy would install nine and the tag would have been for nothing. It is here
+/// for a revision tagged before the manifest existed, and goes when every tagged set carries one
+/// — the same rule, and the same wording, as `seed-policies.sh`'s `FALLBACK_FILES`.
 fn installed_files(root: &Path) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(root.join("current")) else {
         return Vec::new();
@@ -170,6 +175,52 @@ pub async fn check(root: &Path) -> crate::proto::PolicyCheckResult {
     result
 }
 
+/// What a revision says it contains, and the manifest bytes to install beside it.
+///
+/// Empty when the revision has no `manifest.json`, or one nothing can be read out of — which is
+/// a fact about an older tag rather than a failure, so the caller falls back rather than
+/// refusing. The bytes are returned verbatim rather than re-serialised: `robotd` reads fields
+/// this crate has no type for, and a round trip through the subset understood here would drop
+/// them.
+async fn set_files(
+    client: &reqwest::Client,
+    repo: &str,
+    version: &str,
+) -> (Vec<String>, Option<Vec<u8>>) {
+    let url = format!("https://huggingface.co/{repo}/resolve/{version}/{MANIFEST_FILE}");
+    let Ok(bytes) = http::get_bytes(client, &url, None).await else {
+        return (Vec::new(), None);
+    };
+    let files = files_in_manifest(&bytes);
+    match files.is_empty() {
+        true => (files, None),
+        false => (files, Some(bytes)),
+    }
+}
+
+/// The `file` of every policy a manifest lists, and nothing that is not a plain file name.
+///
+/// The manifest is somebody else's document — the repo is configurable, and a community set is
+/// anyone's — so a `file` naming `../../etc/anything` would otherwise choose the directory it
+/// lands in. `seed-policies.sh` applies the same rule to the same field.
+fn files_in_manifest(bytes: &[u8]) -> Vec<String> {
+    let Ok(manifest) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return Vec::new();
+    };
+    manifest
+        .get("policies")
+        .and_then(|p| p.as_array())
+        .map(|policies| {
+            policies
+                .iter()
+                .filter_map(|p| p.get("file")?.as_str())
+                .filter(|file| !file.contains(['/', '\\']) && !file.starts_with('.'))
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Download one revision of a repo into `root`, and point `current` at it.
 ///
 /// Nothing partial goes live: the files land in a staging directory and the symlink moves only
@@ -206,11 +257,17 @@ pub async fn install(
         return Ok((version, None));
     }
 
-    let files = installed_files(root);
+    let (files, manifest) = set_files(&client, &source.repo, &version).await;
+    let files = match files.is_empty() {
+        false => files,
+        true => installed_files(root),
+    };
     if files.is_empty() {
-        return Err(Error::Network(
-            "the installed set has no .onnx files, so there is no list to fetch".into(),
-        ));
+        return Err(Error::Network(format!(
+            "{}@{version} lists no policies, and the installed set has no .onnx files to \
+             replace — there is nothing to fetch",
+            source.repo
+        )));
     }
 
     let staging = root.join("releases").join(".staging-install");
@@ -238,6 +295,19 @@ pub async fn install(
                 // like a resume of something that was never coherent.
                 let _ = std::fs::remove_dir_all(&staging);
             })?;
+    }
+
+    // **The manifest is installed with the set, not just read to build the list.** `robotd`
+    // reads `<current>/manifest.json` to know which policies are skills and how each one is
+    // tuned; a set installed without it falls back to the three names this build was compiled
+    // with. So an update that fetched only the `.onnx` files would quietly undo every skill the
+    // set declares — the exact coupling the manifest exists to remove, reintroduced by the
+    // command whose whole job is moving between revisions.
+    if let Some(manifest) = &manifest {
+        std::fs::write(staging.join(MANIFEST_FILE), manifest).map_err(|e| Error::Io {
+            path: staging.join(MANIFEST_FILE),
+            source: e,
+        })?;
     }
 
     let recorded = Source {
@@ -381,7 +451,57 @@ mod tests {
         assert!(!root.join("releases/seed-v1/releases").exists());
     }
 
-    /// The fetch list comes from what is on the board, so a set is replaced file for file.
+    /// **The download list comes from the revision being installed**, which is the only list
+    /// that can contain a policy the board has never seen. Taking it from the installed set
+    /// instead would make a tenth policy unreachable by `policy update` — installable only by a
+    /// daemon release, which is what the whole channel exists to stop.
+    #[test]
+    fn the_download_list_is_what_the_revision_says_it_has() {
+        let manifest = serde_json::json!({
+            "schema_version": 1,
+            "policies": [
+                { "file": "alpha_walking.onnx", "kind": "perpetual" },
+                { "file": "polite_bow.onnx", "kind": "episodic", "duration_s": 1.0 },
+            ]
+        });
+        assert_eq!(
+            files_in_manifest(&serde_json::to_vec(&manifest).unwrap()),
+            vec![
+                "alpha_walking.onnx".to_string(),
+                "polite_bow.onnx".to_string()
+            ]
+        );
+    }
+
+    /// The manifest is somebody else's document and its `file` is pasted into a path. A name
+    /// that climbs out of the staging directory is dropped rather than fetched.
+    #[test]
+    fn a_manifest_file_name_cannot_leave_the_staging_directory() {
+        let manifest = serde_json::json!({
+            "policies": [
+                { "file": "../../etc/systemd/system/robotd.service" },
+                { "file": "sub/dir/policy.onnx" },
+                { "file": ".source" },
+                { "file": "good.onnx" },
+            ]
+        });
+        assert_eq!(
+            files_in_manifest(&serde_json::to_vec(&manifest).unwrap()),
+            vec!["good.onnx".to_string()]
+        );
+    }
+
+    /// A revision tagged before the manifest existed says nothing, which is a fact about the tag
+    /// rather than a failure — `install` falls back to what the board holds.
+    #[test]
+    fn a_revision_without_a_manifest_says_nothing() {
+        assert!(files_in_manifest(b"not json at all").is_empty());
+        assert!(files_in_manifest(b"{}").is_empty());
+        assert!(files_in_manifest(br#"{"policies": []}"#).is_empty());
+    }
+
+    /// The fallback list is what is on the board, so a revision with no manifest still replaces
+    /// a set file for file. The `.source` record is not one of them.
     #[test]
     fn the_fetch_list_is_what_the_installed_set_holds() {
         let tmp = tempfile::tempdir().unwrap();
@@ -447,6 +567,80 @@ mod tests {
 
         assert!(root.join("releases/seed-v1").exists());
         assert!(root.join("releases/from-a-tool").exists());
+    }
+
+    /// A revision directory, with an mtime old enough to order it.
+    fn revision(dir: &Path, name: &str, age_s: u64) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::create_dir_all(&path).expect("mkdir");
+        std::fs::write(path.join("policy.onnx"), name).expect("policy");
+        let when = std::time::SystemTime::now() - std::time::Duration::from_secs(age_s);
+        std::fs::File::open(&path)
+            .and_then(|f| f.set_times(std::fs::FileTimes::new().set_modified(when)))
+            .expect("mtime");
+        path
+    }
+
+    /// **The library was the one directory here that nothing tidied.** Every `policy load
+    /// <org/repo>` left ~800 KB behind for good, and `policy.fetch` is served over both radio
+    /// transports — so filling a robot's eMMC took no more than a loop.
+    #[test]
+    fn old_revisions_of_a_repo_are_pruned_to_the_new_one_and_its_predecessor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("someone/a-gait");
+        for (name, age) in [("main", 0), ("v3", 10), ("v2", 20), ("v1", 30)] {
+            revision(&repo, name, age);
+        }
+
+        prune_library(&repo, "main", Some(&[]));
+
+        let mut left: Vec<String> = std::fs::read_dir(&repo)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            vec!["main".to_string(), "v3".to_string()],
+            "the one just fetched and the one before it"
+        );
+    }
+
+    /// **A revision the robot is running is kept however old it is.** Slots and skills both: a
+    /// gait fetched last month and left in the walk slot is exactly what a prune must not take,
+    /// and so is the bow somebody put on a button.
+    #[test]
+    fn a_revision_the_robot_is_using_is_never_pruned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("someone/a-gait");
+        let old = revision(&repo, "v1", 300);
+        for (name, age) in [("main", 0), ("v3", 10), ("v2", 20)] {
+            revision(&repo, name, age);
+        }
+
+        let in_use = vec![old.join("policy.onnx").display().to_string()];
+        prune_library(&repo, "main", Some(&in_use));
+
+        assert!(old.exists(), "the gait the robot is running");
+        assert!(repo.join("v3").exists(), "and the predecessor");
+        assert!(!repo.join("v2").exists(), "but not the rest");
+    }
+
+    /// **A robot that did not answer prunes nothing.** Silence is not "using none of them" —
+    /// it is a `robotd` that is down, which is the one state where deleting the policy it is
+    /// about to come back up on would be unrecoverable.
+    #[test]
+    fn nothing_is_pruned_when_the_robot_did_not_say() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("someone/a-gait");
+        for (name, age) in [("main", 0), ("v3", 10), ("v2", 20), ("v1", 30)] {
+            revision(&repo, name, age);
+        }
+
+        prune_library(&repo, "main", None);
+
+        assert_eq!(std::fs::read_dir(&repo).unwrap().count(), 4);
     }
 
     fn here() -> Expectations {
@@ -906,6 +1100,7 @@ pub async fn fetch(
     revision: Option<&str>,
     file: Option<&str>,
     expected: Expectations,
+    in_use: Option<&[String]>,
 ) -> Result<crate::proto::PolicyFetchResult, Error> {
     // A repo is `org/name`, and nothing else. Checked before it is pasted into a URL and before
     // any of it becomes a directory name.
@@ -946,7 +1141,19 @@ pub async fn fetch(
             }
             file.to_owned()
         }
-        None => sole_policy(&tree(&client, repo, revision).await?, repo)?,
+        // The listing's path, checked the same way a caller-supplied name is: a `.onnx` under a
+        // subdirectory is a repo layout this cannot install, and saying so beats an ENOENT from
+        // a staging path whose parent was never created.
+        None => {
+            let file = sole_policy(&tree(&client, repo, revision).await?, repo)?;
+            if file.contains('/') {
+                return Err(Error::Network(format!(
+                    "{repo}'s only policy is {file}, which is not at the top of the repo — \
+                     name it with `<repo>:<file>` if that is really the one"
+                )));
+            }
+            file
+        }
     };
 
     let dir = library.join(org).join(name).join(revision);
@@ -971,6 +1178,8 @@ pub async fn fetch(
         path: path.clone(),
         source: e,
     })?;
+
+    prune_library(&library.join(org).join(name), revision, in_use);
 
     let commit = commit_of(&client, repo, revision).await;
     let record = format!(
@@ -1000,13 +1209,82 @@ pub async fn fetch(
     })
 }
 
-/// An RFC-3339 timestamp without pulling in a date library for one line.
+/// Seconds since the epoch, in the `@<secs>` form `date -d` and `systemd-analyze` both read.
+///
+/// Not RFC-3339, deliberately: rendering one means a date library or a hand-rolled civil-calendar
+/// conversion, for a field nothing parses. The seeder writes a real timestamp because `date` is
+/// already there; this is the same fact in the form that costs nothing.
 fn now_utc() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     format!("@{secs}")
+}
+
+/// How many revisions of one repo the library keeps.
+///
+/// **The library is the one directory here that nothing tidied.** Every `policy load <org/repo>`
+/// leaves ~800 KB behind for good, and both the command and `policy.fetch` behind it are served
+/// over BLE and WebRTC — where §4 of `remote-webrtc.md` says any LAN peer inherits them. A robot
+/// whose eMMC fills up stops being a robot, and nothing about trying gaits should be able to do
+/// that.
+///
+/// Two, matching the official sets: the one just fetched and the one before it, so going back to
+/// the revision you just left is still a local operation.
+const LIBRARY_REVISIONS_KEPT: usize = 2;
+
+/// Drop older revisions of the repo just fetched, keeping what the robot is using.
+///
+/// **`in_use` is the whole safety of this**, and `None` means "could not ask" rather than
+/// "nothing" — a silent `robotd` is exactly the robot whose gait must not be deleted while it is
+/// down. The caller passes what `robot.policies` and `robot.skills` answered, so a policy filling
+/// a slot or answering to a name is kept however old it is.
+///
+/// Per repo rather than across the library: a person trying two gaits alternately is not asking
+/// to lose the third one they fetched last week from somewhere else.
+///
+/// Best effort, like [`prune`]. A revision that will not delete is disk space, not a failed
+/// fetch, and undoing a good fetch over it would be the wrong trade.
+fn prune_library(repo_dir: &Path, keep: &str, in_use: Option<&[String]>) {
+    let Some(in_use) = in_use else {
+        tracing::debug!(
+            dir = %repo_dir.display(),
+            "not pruning the policy library: the robot did not say what it is using"
+        );
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(repo_dir) else {
+        return;
+    };
+    // Newest first, by the mtime the fetch left on the directory.
+    let mut revisions: Vec<(std::time::SystemTime, std::path::PathBuf, String)> = entries
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let modified = e.metadata().ok()?.modified().ok()?;
+            Some((modified, e.path(), name))
+        })
+        .collect();
+    revisions.sort_by_key(|(modified, _, _)| std::cmp::Reverse(*modified));
+
+    let mut kept = 0;
+    for (_, path, name) in revisions {
+        let used = in_use
+            .iter()
+            .any(|p| std::path::Path::new(p).starts_with(&path));
+        if name == keep || used {
+            continue;
+        }
+        kept += 1;
+        if kept < LIBRARY_REVISIONS_KEPT {
+            continue;
+        }
+        if let Err(e) = std::fs::remove_dir_all(&path) {
+            tracing::warn!(revision = %name, error = %e, "could not remove an old policy");
+        }
+    }
 }
 
 /// Hub models matching a query.

@@ -84,6 +84,14 @@ disturbing a comment. So:
 - `policy reset <slot>` removes the key, then reloads live;
 - `policy reset` removes all seven — "put it back the way it came".
 
+**`robotd` writes the key, not the caller.** `robot.loadPolicy` records the slot in
+`robotd.toml` before it queues the swap, so the durability above is a property of the *method*
+rather than of the command that happens to call it. It was the other way round at first —
+`robotctl` wrote the file and the daemon changed only its own memory — which quietly gave a
+phone the ephemeral mode this section rejects, under the same name. The writer lives in
+`robotd_params::edit`, beside the schema it validates against, and every writer takes a lock on
+the file for its whole read-modify-write: four processes edit it now, counting the daemon.
+
 That is the whole persistence model, and it is not new machinery. A load survives a reboot,
 which is what [`updater-design.md`](updater-design.md) §5.7 already requires: "active model
 selection" is a **user preference**, kept in a config file the updater never overwrites and
@@ -229,8 +237,8 @@ Two new methods on `robotd`: `robot.loadPolicy` (slot + source, answered like `r
 accepted, refused with a reason, or a no-op) and `robot.policies` (what each slot runs, with
 origin and version). One new namespace on `updaterd`, `policy.*`, for the fetch.
 
-`API_VERSION` goes 16 → 17. `robotctl` and `btd` ship in the same artifact as `robotd`, so they
-move together; a client pinned to v16 gets `METHOD_NOT_FOUND` naming the method, which is the
+`API_VERSION` goes 17 → 18. `robotctl` and `btd` ship in the same artifact as `robotd`, so they
+move together; a client pinned to v17 gets `METHOD_NOT_FOUND` naming the method, which is the
 designed skew behaviour and not a handshake refusal
 ([`duck-ipc-proto/src/lib.rs`](../../duck-ipc-proto/src/lib.rs), `API_VERSION`).
 
@@ -244,7 +252,12 @@ directory and never into a component's install dir, which keeps that invariant l
 where it is load-bearing.
 
 The library lives at `/var/lib/robot/policies/`, outside every release directory, per
-[`updater-design.md`](updater-design.md) §5.7 rule 1.
+[`updater-design.md`](updater-design.md) §5.7 rule 1. It keeps two revisions per repo — the one
+just fetched and the one before it, the rule §9.1 uses for official sets — because nothing else
+tidies it and both `policy.fetch` and the command behind it are served over both radio
+transports. A revision the robot is *using*, in a slot or as a skill, is kept however old it is;
+a robot that does not answer prunes nothing at all, since silence is a `robotd` that is down
+rather than one using none of them.
 
 ## 9. Leaving the artifact
 
@@ -451,113 +464,29 @@ daemon release rather than a tag:
 - `robotd-params` knew which policies were one-shot skills and how long each ran. It now takes
   them from the manifest, falling back the same way.
 
-The field-by-field contract is `docs/policy-manifest.md` (schema 2); this section is the reasoning.
-Three kinds, and `kind` says who ends the policy:
+**And `policy.install` installs the manifest with the set**, from the same two rules. It took its
+download list from what was already on the board at first, which made the tenth policy a tag the
+seeder honoured and `robotctl policy update` could not — installable only by a daemon release,
+which is what this whole channel exists to stop. It also left the new set without a
+`manifest.json`, so `robotd` fell back to the three skill names it was compiled with and every
+per-skill number the set declared was quietly lost by the command whose only job is moving
+between revisions. The revision's own manifest is the list now, and the file is written into the
+set beside the policies it describes; the board's own `.onnx` names remain the fallback for a
+revision that has no manifest. A `file` that is not a plain name is dropped rather than fetched,
+in the script and in the daemon both — it is somebody else's document, and it chooses a path.
 
-| `kind` | means | a skill? |
-| --- | --- | --- |
-| `perpetual` | runs until told otherwise — a gait, or a hold a person has to end | no |
-| `episodic` | runs for `duration_s` and returns itself to a safe pose | **yes**, on a constant command |
-| `scripted` | episodic, but interruptible — the daemon can change its command mid-flight | no |
+**The field-by-field contract is [`../policy-manifest.md`](../policy-manifest.md)** — the two
+axes, every field, what each one changes on the robot. It is not repeated here, and this section
+is only the reasoning for the mechanism existing at all.
 
-What the daemon *feeds* a policy is a separate axis, `command.encoding`, and it decides what an
-episodic entry becomes. On a constant command (the default, `idle` on the way back) an episodic
-policy is a **skill**: kicks, roulade, every community one-shot so far. On a `phase` command it is
-the **ground pick** — the daemon writes `[cos 2πφ, sin 2πφ, 0]` with φ advancing over `period_s`
-and hands back at `end_phase`; the entry's numbers become that mode's ground-pick defaults, and it
-is not a skill, because a generic one-shot would feed it zeros. The `posture_flag` encoding is
-the sit↔stand: `scripted`, because dropping the flag mid-descent is a legitimate thing to do,
-with `unwind_s` the length of the rise and `ramp_s` how long the seat takes to settle.
-
-`mode` tags a policy as one drive mode's — absent means walking — which is how the roller crouch
-is the ground pick of roller mode rather than a second one for walking. `name` defaults to the
-file's stem, so only a policy whose role differs from its training run needs one:
-`ball_kick_left.onnx` answers to `kick_left`, and `roulade.onnx` says nothing.
+The one thing worth restating, because it is what the mechanism is *for*: `kind` and
+`command.encoding` are two axes, and an episodic policy becomes a skill only on a constant
+command. A `phase` or `posture_flag` entry contributes timing to an arm the daemon drives instead
+— which is how a retrained ground pick with a longer cycle is a tag rather than a daemon release.
 
 **The per-policy fields are the same ones a single-policy repo uses**, plus `file`. That is what
 makes the ask to a community publisher "add these fields" rather than "adopt our format", and it
 means one reader understands both shapes.
-
-### 9.4 What the set's manifest says, and adding to it
-
-The file at the root of `pollen-robotics/microduck-policies`, in full. Shown here rather than
-checked in: a copy in this repository would be a second source of truth for something that
-versions on the Hub, and a test over the copy would pass while a board downloaded something else.
-
-```json
-{
-  "schema_version": 2,
-  "model_api": 1,
-  "obs_len": 61,
-  "action_len": 14,
-  "robot": { "model": "microduck", "hw_rev": 1, "servos": "xl330", "control_hz": 50 },
-  "description": "The policy set a microduck ships with: walking, standing, and the one-shots its buttons run.",
-  "policies": [
-    { "file": "alpha_walking.onnx", "kind": "perpetual" },
-    { "file": "alpha_stand.onnx",   "kind": "perpetual" },
-    { "file": "roller.onnx",        "kind": "perpetual", "mode": "roller", "action_scale": 0.8 },
-
-    { "file": "alpha_sitstand.onnx", "name": "sitstand", "kind": "scripted",
-      "command": { "encoding": "posture_flag", "slot": "twist.vx", "sit": 1.0, "stand": 0.0, "idle": [0.0, 0.0, 0.0] },
-      "ramp_s": 2.0, "unwind_s": 1.0 },
-
-    { "file": "alpha_ground_pick.onnx", "name": "ground_pick", "kind": "episodic", "duration_s": 2.8,
-      "command": { "encoding": "phase", "slots": "twist.vx,twist.vy", "period_s": 4.0, "end_phase": 0.7 } },
-
-    { "file": "roller_crouch.onnx", "name": "crouch", "kind": "episodic", "duration_s": 3.5, "mode": "roller", "action_scale": 0.8,
-      "command": { "encoding": "phase", "slots": "twist.vx,twist.vy", "period_s": 5.0, "end_phase": 0.7 } },
-
-    { "file": "roulade.onnx",         "kind": "episodic", "duration_s": 1.0, "chain": true },
-    { "file": "ball_kick_left.onnx",  "name": "kick_left",  "kind": "episodic", "duration_s": 0.5 },
-    { "file": "ball_kick_right.onnx", "name": "kick_right", "kind": "episodic", "duration_s": 0.5 }
-  ]
-}
-```
-
-Read that against what a robot does with it. The nine `file` entries are the download list, so
-the seeder fetches exactly these. The three `episodic` entries on a constant command become
-skills — which reproduces the built-in three exactly, and is the check that the manifest is
-*right* rather than merely plausible. `ball_kick_left.onnx` carries a `name` because its role
-differs from its training run; `roulade.onnx` does not, because the file's stem is already the
-name.
-
-The two `phase` entries are the ground pick of each mode, and their numbers are what the daemon
-used to carry as literals: a 4 s cycle for the pick, and — the correction this shape paid for —
-a **5 s** cycle for the crouch, which is what `Mjlab-RollerCrouch` trains on and not the 3 s the
-roller preset had inherited from the prototype. `duration_s` is `period_s × end_phase`, written
-out so a reader need not multiply. `[policy] ground_pick_period` and `ground_pick_action_scale`
-still override the set's numbers, because the config file is the list of a person's decisions.
-
-The `scripted` sitstand is recorded, not turned into a skill: it is driven by the sit toggle, the
-shutdown sit and the seated-boot rise, through a flag the daemon flips. Its `unwind_s` is how long
-the rise runs on the sitstand network before the gait takes over (the daemon's `RISE_SECS`, now
-the set's to say), and `ramp_s` how long the seat takes to settle — the shutdown sit waits twice
-that before cutting torque, which is the prototype's four seconds over its 2 s glide.
-
-`action_scale` on a perpetual entry (`roller.onnx`) is recorded and not read: the gait's scale
-resolves per mode from `[policy]`, and the manifest has no way to say which perpetual is the
-walking slot and which the standing one.
-
-**Adding a policy to the set** is then four steps and no daemon release:
-
-1. Upload the `.onnx` to the repo.
-2. Add an entry to `manifest.json`. `kind` and `command.encoding` decide what happens next:
-   `episodic` with a `duration_s` on a constant command becomes a skill a robot can be asked for
-   by name; `episodic` on a `phase` command is a mode's ground pick and sets its timing;
-   `perpetual` is a gait, which needs a slot pointed at it; `scripted` is recorded, and the
-   daemon's own arm for it reads its timing.
-3. Tag the revision — `hf repos tag create pollen-robotics/microduck-policies v4`.
-4. On a robot: `robotctl policy update`.
-
-A new episodic policy is then `robotctl robot do <name>` and can go on a button, with nothing
-edited and nothing rebuilt. `[workspace.metadata.policies]` in the root `Cargo.toml` decides
-which tag a *freshly provisioned* board installs, and bumping that does need a release — the pin
-is a floor, not a ceiling.
-
-**One guard is on the board, because it cannot be anywhere else.** A set entry may not answer to
-`ground_pick` or `sit_toggle`: those have their own arm of the cascade, and a second network
-behind either name would be fed an all-zero command it was never trained on. Nothing in this
-repository can check a file that lives on the Hub, so the check runs where the file is read.
 
 ## 10. Skills: what a robot can be asked to do
 
@@ -681,6 +610,44 @@ name beside it, and sends that name; `robotd` decides whether the robot has such
 answers with the list it does have when it does not. Checking belongs where the answer is, which
 is why `robotctl pad bind` asks the robot and refuses a typo with the real list.
 
+### 10.4 Reaching it from a phone
+
+`robot.do`, `robot.policies`, `robot.loadPolicy` and `robot.reloadPolicies` are served over
+**both** BLE and WebRTC. What changed is not the safety of any of it — the shape gate, the joint
+clamps and the fall reflex are the same whoever asked — but that a client now exists, which is
+what every one of these refusals said it was waiting for.
+
+**A skill is not teleop.** `robot.do` spent a while grouped with `robot.move` and friends under
+BLE's transport argument — a 20-byte notification budget and a link that does not exist for the
+first ~73 s of a boot. That argument is about a *stream*: fifty small updates a second. A skill is
+one request, and it needs no control link at all, because the deadman zeroes the twist by itself
+and a robot with nothing driving it stands still and bows.
+
+**BLE is the transport that best meets the watching condition**, which is what most refusals here
+turn on. Its radio reaches about ten metres, so whoever tapped the button is in the room with the
+robot by construction — and the bond is PIN-checked with `encrypt_authenticated_write`. WebRTC
+answers the same condition differently: the peer is watching the video, which is the argument
+that already permits `robot.init` and `robot.shutdown`, and covers a gait better than it covers
+standing up, because the peer is looking at the thing the gait is about to move.
+
+The asymmetry worth remembering is the other way round from the intuition. **BLE is
+authenticated; WebRTC is not** — §4 of `remote-webrtc.md` means any LAN peer inherits whatever is
+opened, where BLE carries the same call from a PIN-bonded caller within ten metres. That is a
+reason to sharpen §4, not a reason to withhold the call from the transport that can show somebody
+the result.
+
+**A gait chosen from a phone is the gait the robot boots into.** `robot.loadPolicy` writes the
+slot key itself, so §3's persistence model belongs to the *method* rather than to the command
+that calls it. It did not at first — `robotctl` wrote the file and the daemon changed only its
+own memory — which meant the same two words meant different things depending on who asked, and
+gave remote callers the ephemeral "try it until reboot" mode §3 considered and **rejected**. The
+undo is the same call with no path, which is reachable from the same phone.
+
+**`robot.policies` carries the skill list**, and that is the piece that makes the rest usable. A
+client cannot offer a bow without knowing the robot has one, and which skills exist is config now
+— nothing to compile in. The names were already in `robot.subscribe`'s acknowledgement, but that
+is a 50 Hz stream answering a question asked once, and BLE deliberately does not route it.
+
 ## 11. What the official set currently is
 
 Recorded here because it lives nowhere else in this repository now that the files do not, and
@@ -742,12 +709,17 @@ its meaning for the things that genuinely are models and not control policies, s
 | One-shot skills are config, not code | Kicks and roulade were the same arm with different numbers; a community one is a fifth set (§10) |
 | `kind` says who ends a policy, not how long | An episodic one returns itself; a perpetual one needs the daemon to drive it back; a scripted one is episodic but interruptible (§9.3, §10.1) |
 | `command.encoding` says what the daemon feeds it | Constant → a skill; `phase` → the ground pick; `posture_flag` → the sit↔stand. Only the first is loadable as a one-shot (§9.3) |
-| The set carries its own timing | The pick's cycle and cutoff, the rise and the seat's settle are properties of the trained network, not literals in a build; `[policy]` keys still win (§9.4) |
+| The set carries its own timing | The pick's cycle and cutoff, the rise and the seat's settle are properties of the trained network, not literals in a build; `[policy]` keys still win (§9.3) |
 | Skills leave walk, stand, sitstand and ground_pick alone | The fallback pair, one driven internally, one phase-driven — none is a generic one-shot (§10.2) |
 | Buttons are config; Start and Select are not | The button that stops a robot is the one worth not being able to lose (§10.3) |
 | `robot.do` is not teleop, so BLE may carry it | One request, not a stream; and it needs no control link, the deadman zeroes the twist (§10.4) |
 | Loading a policy is served on both transports | Every refusal said it was waiting for a client; there is one (§10.4) |
-| Installing from the Hub is not | It reaches the network and writes the eMMC, where loading points at a file already there (§15) |
+| The daemon writes the slot key, not the caller | Otherwise the same two words mean different things depending on who asked (§3, §10.4) |
+| Every writer of `robotd.toml` takes a lock | Four processes edit it, and two staging at once is one writer's half renamed into place (§3) |
+| Installing from the Hub is served too | The uid gate authorises `btd`'s credentials, not the phone's, exactly as it already does for `update.apply` (§10.4) |
+| A set's manifest is installed with it | Otherwise `policy update` drops every skill the set declares and the list can never grow (§9.3) |
+| The library keeps two revisions per repo | Nothing else tidied it, and fetching is served over both radio transports (§8) |
+| …but never one the robot is using, and nothing at all if it did not answer | Silence is a `robotd` that is down, not one using none of them (§8) |
 | The seeder never replaces an installed set | Otherwise a daemon update silently reverts a gait chosen with `policy update` (§9) |
 | Origin is the org in the path | Honest without a lookup, and a label rather than a boundary (§9.2) |
 | The manifest can refuse but never bless | It is a stranger's claim; the shape gate is the check (§9.2) |
@@ -768,88 +740,7 @@ its meaning for the things that genuinely are models and not control policies, s
   tag.
 - **Signing community policies**, and any curated-org scheme that would require it.
 
-### 10.4 Reaching it from a phone
-
-`robot.do`, `robot.policies`, `robot.loadPolicy` and `robot.reloadPolicies` are served over
-**both** BLE and WebRTC. What changed is not the safety of any of it — the shape gate, the joint
-clamps and the fall reflex are the same whoever asked — but that a client now exists, which is
-what every one of these refusals said it was waiting for.
-
-**A skill is not teleop.** `robot.do` spent a while grouped with `robot.move` and friends under
-BLE's transport argument — a 20-byte notification budget and a link that does not exist for the
-first ~73 s of a boot. That argument is about a *stream*: fifty small updates a second. A skill is
-one request, and it needs no control link at all, because the deadman zeroes the twist by itself
-and a robot with nothing driving it stands still and bows.
-
-**BLE is the transport that best meets the watching condition**, which is what most refusals here
-turn on. Its radio reaches about ten metres, so whoever tapped the button is in the room with the
-robot by construction — and the bond is PIN-checked with `encrypt_authenticated_write`. WebRTC
-answers the same condition differently: the peer is watching the video, which is the argument
-that already permits `robot.init` and `robot.shutdown`, and covers a gait better than it covers
-standing up, because the peer is looking at the thing the gait is about to move.
-
-The asymmetry worth remembering is the other way round from the intuition. **BLE is
-authenticated; WebRTC is not** — §4 of `remote-webrtc.md` means any LAN peer inherits whatever is
-opened, where BLE carries the same call from a PIN-bonded caller within ten metres. That is a
-reason to sharpen §4, not a reason to withhold the call from the transport that can show somebody
-the result.
-
-**What limits the damage either way is that `robot.loadPolicy` does not persist.** §3 above
-describes the persistence model as a property of `policy load` — the *command* — and that is
-exactly right: `robotctl` writes `robotd.toml` and then calls the method. The method itself
-mutates `robotd`'s in-memory params and reloads. So a gait chosen from a phone is gone at the
-next restart or `robot.reloadPolicies`, which is the ephemeral "try it until reboot" mode §3
-considered and **rejected** — arrived at here by accident rather than by decision. §15 has it as
-open, because remote and local answering differently to the same words is a trap however the
-question is settled.
-
-**`robot.policies` carries the skill list**, and that is the piece that makes the rest usable. A
-client cannot offer a bow without knowing the robot has one, and which skills exist is config now
-— nothing to compile in. The names were already in `robot.subscribe`'s acknowledgement, but that
-is a 50 Hz stream answering a question asked once, and BLE deliberately does not route it.
-
 ## 15. Open
-
-- **`robot.loadPolicy` does not persist, and `policy load` does.** Same words, different
-  durability: the command writes `robotd.toml` and the method does not, so a gait chosen from a
-  phone is gone at the next restart. §3 rejected an ephemeral mode deliberately and this is one
-  arrived at by accident. Either the method should write the file — which makes the wire the
-  single path and removes `robotctl`'s duplicate half — or remote should say plainly that it is
-  a trial. The first is more work and more consistent; the second is a defensible thing for a
-  phone to do, but only if it is said.
-
-  It also decides where the **pad bindings** can live, below: `padd` re-reads `[pad]` every
-  second, so a `pad.bind` that did not write the file would be reverted within a second. There
-  is no live-only option there, which means whichever daemon serves it needs the lossless writer
-  that today only `robotctl` has.
-
-- ~~Installing from the Hub is still local-only~~ — all four are served on both transports now.
-  The reads (`policy.check`, `policy.search`) change nothing and sit beside the `update.check`
-  both transports already carry. The mutations (`policy.install`, `policy.fetch`) are named one
-  by one in `btd`'s `only_these_mutating_calls_are_reachable_over_ble`, which is the list that
-  makes adding one have to say why.
-
-  The uid gate turned out not to be the obstacle it looked like. `policy.install` is
-  `is_mutating`, and `updaterd` authorises that against the *peer's* credentials — which are
-  `btd`'s, not the phone's, exactly as they already are for `update.apply`. The transport is the
-  gate there, not the credential.
-
-  Adding a **skill** is reachable too, as of `robot.skills` / `robot.setSkill` /
-  `robot.removeSkill`. That was the last thing here only a terminal on the robot could do:
-  `[[policy.skill]]` is a repeating table, so `robotctl policy add` wrote it directly and there
-  was no method to route. `robotd` writes the file and reloads itself, so one call is the whole
-  operation — a client that had to remember `robot.reloadPolicies` and forgot would leave a robot
-  whose config and behaviour disagree until the next restart.
-
-- ~~The pad bindings have no wire surface at all~~ — `pad.bindings` and `pad.bind` are served
-  over both transports. `robotd` answers them, not `configd`, which owns the rest of `pad.*`:
-  checking a name against the skills this robot has is worth more than a tidy namespace, and
-  routing is per method throughout anyway. §10.3 has the detail.
-
-  `pad.bind` is the first call on either radio transport that **writes the config file**, and it
-  has to be — `padd` re-reads `[pad]` every second, so a binding held in memory would be reverted
-  before the caller let go of the phone. Which makes it, not `robot.loadPolicy`, the durable
-  remote change: worth remembering when §4 of `remote-webrtc.md` is revisited.
 
 - **A running skill has no fall reflex** for its whole duration (§10.2). Fine for a half-second
   kick; a skill configured to hold for ten seconds is ten seconds without one.

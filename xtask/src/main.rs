@@ -1336,6 +1336,43 @@ mod tests {
         );
     }
 
+    /// **A manifest entry that is not a file name is ignored, not fetched.** The repo this
+    /// downloads from is an environment variable, and `${staging}/${name}` would otherwise let a
+    /// `file` naming `../../etc/…` choose where a download lands. `files_in_manifest` in
+    /// `updater::policy` applies the same rule to the same field, for the same reason.
+    #[test]
+    fn a_manifest_file_name_that_climbs_out_is_ignored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hub = tmp.path().join("hub");
+        let root = tmp.path().join("policies");
+        fake_hub(&hub, "hub");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let escape = "../../escaped.onnx";
+        std::fs::write(
+            hub.join("manifest.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "policies": [
+                    { "file": "alpha_walking.onnx", "kind": "perpetual" },
+                    { "file": escape },
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        // Reachable if the seeder asks for it, so the test can tell "refused" from "404".
+        std::fs::write(hub.join("escaped.onnx"), "escaped").unwrap();
+
+        let (link, content) = seed(&root, "v1", Some(&hub));
+        assert_eq!(link.as_deref(), Some("releases/seed-v1"));
+        assert_eq!(content.as_deref(), Some("hub-alpha_walking.onnx"));
+        assert!(
+            !root.join("escaped.onnx").exists() && !tmp.path().join("escaped.onnx").exists(),
+            "nothing was written outside the set"
+        );
+    }
+
     /// **The pinned set already installed means no network at all.** This runs inside every
     /// update, and re-downloading seven megabytes each time to arrive at the same bytes would be
     /// both slow and a way to spend the hook's timeout budget on nothing.

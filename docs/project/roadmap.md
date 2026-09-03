@@ -266,7 +266,7 @@ reload` exists, and `xtask sign` signs any directory of artifacts.
 
 1. **The local loop, no network.** `robot.loadPolicy` plus the home-pose reload, and `robotctl
    policy list` / `load` / `reset`. Delivers "try a policy without editing the toml" end to end,
-   touches no Hub and no publishing decisions. `API_VERSION` 16 → 17.
+   touches no Hub and no publishing decisions. `API_VERSION` 17 → 18.
 2. **Official policies leave the artifact.** *Done.* `robotd` reads
    `/opt/robot/policies/current`, which `scripts/seed-policies.sh` fills by downloading the
    pinned set from `pollen-robotics/microduck-policies` — the arrangement `setup-board.sh`

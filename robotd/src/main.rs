@@ -545,6 +545,16 @@ struct RobotState {
     /// Why the policy is not loaded, if it is not. Set once at startup; the loop keeps
     /// running and holds the pose, so a broken bundle is a rollback rather than a crash.
     policy_error: ArcSwapOption<String>,
+    /// Why the last policy change failed, when it named no slot to blame it on.
+    ///
+    /// **Not [`RobotState::policy_error`]**, and the difference is the health verdict.
+    /// That one is the release's own policy failing to load, which is unhealthy and rolls the
+    /// release back. This is somebody's *change* failing — a reload after a skill was added, a
+    /// whole-robot reset — where the robot is still running the policy it had, so it is degraded
+    /// and a rollback would fix nothing.
+    ///
+    /// A change to one slot is reported on that slot instead, which says more.
+    policy_change_error: ArcSwapOption<String>,
     /// Which policy files this process is running, as file names. `None` when the policy is
     /// disabled.
     ///
@@ -644,6 +654,7 @@ impl RobotState {
             state_tx: tokio::sync::broadcast::Sender::new(STATE_BUFFER),
             chorale_tx: tokio::sync::broadcast::Sender::new(8),
             policy_error: ArcSwapOption::empty(),
+            policy_change_error: ArcSwapOption::empty(),
             policies: ArcSwap::from_pointee(PolicyNames::of(&params.policy.resolved())),
             policy_slots: ArcSwap::from_pointee(slot_report(
                 &params.policy,
@@ -748,6 +759,13 @@ impl RobotState {
                 "using the default policy where an override would not load — {}",
                 fell_back.collect::<Vec<_>>().join("; ")
             ));
+        }
+
+        // A reload or a reset that would not build. Same verdict and the same reasoning as the
+        // slots above: the robot kept the policy it had, so it walks, and no release the update
+        // gate could revert to would change the outcome.
+        if let Some(reason) = self.policy_change_error.load_full() {
+            return degraded(format!("the last policy change did not take — {reason}"));
         }
 
         let errors = self.consecutive_errors.load(Ordering::Relaxed);
@@ -2443,6 +2461,7 @@ async fn control_loop<T: RobotIo>(
                         }
                     }
                     state.policy_error.store(None);
+                    state.policy_change_error.store(None);
                     state.policies.store(Arc::new(PolicyNames::of(&cfg)));
                     state.policy_slots.store(Arc::new(slot_report(
                         &policy_params,
@@ -2469,13 +2488,24 @@ async fn control_loop<T: RobotIo>(
                     // what `robot.policies` shows the caller polling for an outcome, and what
                     // makes health degraded until the slot is loaded or reset. It does not
                     // make the robot unhealthy — nothing about the release is wrong.
-                    if let intents::PolicyChange::Slot { slot, .. } = change {
-                        slot_errors.set(slot, e);
-                        state.policy_slots.store(Arc::new(slot_report(
-                            &policy_params,
-                            &policy_cfg,
-                            &slot_errors,
-                        )));
+                    match change {
+                        intents::PolicyChange::Slot { slot, .. } => {
+                            slot_errors.set(slot, e);
+                            state.policy_slots.store(Arc::new(slot_report(
+                                &policy_params,
+                                &policy_cfg,
+                                &slot_errors,
+                            )));
+                        }
+                        // A reload or a whole-robot reset names no slot to hang this on, and
+                        // without somewhere to put it the failure was a log line on the robot
+                        // and silence on the wire — while `robot.setSkill` answered "accepted"
+                        // and triggered exactly this reload. Degraded, not unhealthy: the robot
+                        // is still running what it had, so there is nothing for a rollback to
+                        // repair.
+                        intents::PolicyChange::Reload | intents::PolicyChange::ResetAll => {
+                            state.policy_change_error.store(Some(Arc::new(e)));
+                        }
                     }
                 }
             }
@@ -3430,19 +3460,15 @@ fn set_skill_request(
             "a skill needs a name; it is what `robot.do` asks for",
         );
     }
-    // The two the daemon drives itself. A table entry answering to either would shadow it with a
-    // network fed an all-zero command it was never trained on.
-    if matches!(p.name.as_str(), "ground_pick" | "sit_toggle") {
+    // The two the daemon drives itself. Checked here so the refusal arrives before the file is
+    // read and the answer names the caller's own request; `edit::set_skill` refuses the same
+    // names for whoever comes the other way, which is the writer `robotctl policy add` uses.
+    if params::DAEMON_OWNED_SKILLS.contains(&p.name.as_str()) {
         return proto::IntentResult::refused(format!(
             "{} is driven by the robot itself and cannot be a table entry",
             p.name
         ));
     }
-
-    let mut model = match params::edit::Model::load(&state.config_path) {
-        Ok(model) => model,
-        Err(e) => return proto::IntentResult::refused(e),
-    };
 
     // An existing entry supplies whatever this call leaves out, so a client may send one field.
     let existing = params::Params::load(&state.config_path, false)
@@ -3472,13 +3498,27 @@ fn set_skill_request(
         Some(path) => Some(std::path::PathBuf::from(path)),
         None => existing.as_ref().and_then(|s| s.path.clone()),
     };
-    // A path that is not there is a slot that will report degraded at every restart. Cheap to
-    // catch now, and the caller can still be wrong about the *contents* — that is the loader's.
+    // **Through the same gate `robot.loadPolicy` puts a slot's file through**, and for a sharper
+    // reason here: a skill is not one of `Slot::ALL`, so the startup check that drops an
+    // unloadable *slot* override never looks at it. Without this, a skill pointed at something
+    // that is not a policy is accepted, the reload it triggers fails building the controller,
+    // the robot keeps what it had, and the only trace is a log line — the caller is told the
+    // skill was added and finds out by pressing the button.
     if let Some(path) = &path
         && !params::is_none_sentinel(path)
-        && !path.exists()
     {
-        return proto::IntentResult::refused(format!("no such file: {}", path.display()));
+        if !path.exists() {
+            return proto::IntentResult::refused(format!("no such file: {}", path.display()));
+        }
+        // Only when the error is about the *file*. A board with no ONNX runtime cannot validate
+        // anything, and refusing a config edit on those grounds would send somebody to replace a
+        // policy that is fine — the same distinction `drop_unloadable_overrides` draws at
+        // startup, and what `PolicyError::path` exists for.
+        if let Err(e) = duck_control::policy::validate(path)
+            && e.path().is_some()
+        {
+            return proto::IntentResult::refused(e.to_string());
+        }
     }
 
     let skill = params::SkillDef {
@@ -3511,10 +3551,7 @@ fn set_skill_request(
         },
     };
 
-    if let Err(e) = model.set_skill(&skill) {
-        return proto::IntentResult::refused(e);
-    }
-    if let Err(e) = model.save() {
+    if let Err(e) = params::edit::set_skill(&state.config_path, &skill) {
         return proto::IntentResult::refused(e);
     }
     intents.request_policy_change(intents::PolicyChange::Reload);
@@ -3530,19 +3567,12 @@ fn remove_skill_request(
     state: &RobotState,
     intents: &Intents,
 ) -> proto::IntentResult {
-    let mut model = match params::edit::Model::load(&state.config_path) {
-        Ok(model) => model,
-        Err(e) => return proto::IntentResult::refused(e),
-    };
-    match model.remove_skill(&p.name) {
+    match params::edit::remove_skill(&state.config_path, &p.name) {
         Ok(false) => {
             proto::IntentResult::already(format!("no configured skill called {:?}", p.name))
         }
         Err(e) => proto::IntentResult::refused(e),
         Ok(true) => {
-            if let Err(e) = model.save() {
-                return proto::IntentResult::refused(e);
-            }
             intents.request_policy_change(intents::PolicyChange::Reload);
             proto::IntentResult::accepted()
         }
@@ -3708,11 +3738,36 @@ fn load_policy_request(
         }
     };
 
+    // **Written down before it is asked for.** A slot is a config key and nothing else, so a
+    // load the file does not record is one the next restart undoes — which is the ephemeral
+    // "try it until reboot" mode §3 of the policy-channel design considered and rejected. It
+    // was that mode by accident for as long as `robotctl` wrote the file and the method did
+    // not, which made `policy load` and `robot.loadPolicy` the same words with different
+    // durability depending on who asked.
+    //
+    // Before the request rather than after, because the write is the half that can still
+    // refuse: a file this daemon cannot write is a refusal the caller can act on, where a
+    // robot that swapped and then failed to record it is a surprise saved up for the next boot.
+    let slots = match slot {
+        Some(slot) => vec![slot],
+        None => Slot::ALL.to_vec(),
+    };
+    let recorded = match params::edit::set_slots(&state.config_path, &slots, path.as_deref()) {
+        Ok(recorded) => recorded,
+        Err(e) => return proto::IntentResult::refused(e),
+    };
+
     // Last, because it is the only check that needs the file to have been resolved and found
     // valid: "already running this" is a claim about a policy that exists.
     if let Some(reason) = already_loaded(state, slot, path.as_deref()) {
-        tracing::info!(reason, "policy load: nothing to do");
-        return proto::IntentResult::already(reason);
+        tracing::info!(reason, recorded, "policy load: nothing to do");
+        // A robot already running it whose file said otherwise is not a robot with nothing to
+        // do — the file has just stopped disagreeing, and the caller is the only one who can
+        // see that this is why their next reboot will behave differently.
+        return proto::IntentResult::already(match recorded {
+            true => format!("{reason}; {} now says so too", state.config_path.display()),
+            false => reason,
+        });
     }
 
     intents.request_policy_change(match slot {
@@ -3953,6 +4008,10 @@ fn dispatch(
                 enabled: state.policy_enabled,
                 slots: state.policy_slots.load().as_ref().clone(),
                 skills: state.policies.load().skills.clone(),
+                change_error: state
+                    .policy_change_error
+                    .load_full()
+                    .map(|e| e.as_ref().clone()),
             },
         ),
 
@@ -6373,6 +6432,45 @@ mod tests {
         assert!(intents.take_policy_change().is_none(), "nothing was queued");
     }
 
+    /// **`robot.loadPolicy` writes the file.** A slot is a config key and nothing else, so a
+    /// swap nothing records is one the next restart undoes — which made the method and
+    /// `robotctl policy load` the same words with different durability depending on who asked.
+    ///
+    /// A reset is the half testable without a runtime: it takes the same path and skips only the
+    /// shape gate. It also covers the case worth being sure about, where the loop has nothing to
+    /// do and the *file* does — a hand-edited override nobody restarted into is reconciled here,
+    /// and the caller is told, because it is the only visible sign that the next boot changed.
+    #[test]
+    fn a_reset_clears_the_config_key_even_when_the_loop_has_nothing_to_do() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("robotd.toml");
+        std::fs::write(&config, "[policy]\nwalk = \"/srv/never-loaded.onnx\"\n").expect("write");
+
+        let s = RobotState::new(&Params::default(), &config, false, false);
+        let intents = Arc::new(Intents::new());
+
+        let result: proto::IntentResult = dispatch(
+            &s,
+            &intents,
+            proto::Id::Number(1),
+            &proto::Call::RobotLoadPolicy(proto::LoadPolicyParams {
+                slot: Some("walk".into()),
+                path: None,
+            }),
+        )
+        .result_as()
+        .unwrap();
+
+        assert!(result.accepted);
+        let written = std::fs::read_to_string(&config).expect("read");
+        assert!(!written.contains("never-loaded"), "{written}");
+        let reason = result.reason.expect("the loop had nothing to do");
+        assert!(
+            reason.contains("robotd.toml"),
+            "it says the file moved: {reason}"
+        );
+    }
+
     /// `robotd`'s working directory is not the caller's, so a relative path names a different
     /// file at each end. Refused rather than resolved against whatever the daemon happens to be
     /// sitting in.
@@ -6437,12 +6535,12 @@ mod tests {
     /// standing network must not be selectable by command magnitude.
     #[test]
     fn a_slot_can_be_switched_off_by_name() {
-        let s = RobotState::new(
-            &Params::default(),
-            std::path::Path::new("/test/robotd.toml"),
-            false,
-            false,
-        );
+        // A real file, because an accepted load is recorded in one before it is queued.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("robotd.toml");
+        std::fs::write(&config, "[policy]\n").expect("write");
+
+        let s = RobotState::new(&Params::default(), &config, false, false);
         let intents = Arc::new(Intents::new());
 
         let result: proto::IntentResult = dispatch(
@@ -6464,6 +6562,11 @@ mod tests {
                 slot: Slot::Stand,
                 path: Some(PathBuf::from("none"))
             })
+        );
+        let written = std::fs::read_to_string(&config).expect("read");
+        assert!(
+            written.contains("stand = \"none\""),
+            "the sentinel is recorded, or the next boot undoes it: {written}"
         );
     }
 

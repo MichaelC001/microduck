@@ -19,7 +19,7 @@ contract.
 | `kind` | means | becomes |
 | --- | --- | --- |
 | `episodic` | runs for `duration_s` and returns itself to a safe pose | a skill, if its command is constant |
-| `perpetual` | holds until told otherwise — a gait, or a pose a person has to end | a slot's gait, or a skill with `--hold` and an unwind |
+| `perpetual` | runs until told otherwise — a gait, or a pose a person has to end | a slot's gait (`policy load`); or, with `unwind_s`, a skill with `--hold` |
 | `scripted` | episodic but interruptible: the daemon can change its command mid-flight | recorded; the daemon's own arm reads its timing |
 
 **`command.encoding` says what the daemon feeds it.**
@@ -56,6 +56,7 @@ a policy only on a claim that is present and wrong.
 | `unwind_s` | float | skills, sitstand | seconds driving `command.idle` before handing back; for the sit↔stand, the rise |
 | `ramp_s` | float | sitstand | seconds the seat takes to settle; the shutdown sit waits twice this |
 | `mode` | str | set | `walk` (default) or `roller`; which mode's ground pick a phase entry is |
+| `slot` | str | display | for a perpetual gait: the slot it is for (`walk`, `stand`, …), so `policy load <slot> <repo>` is the install line |
 | `entry_pose` | str | display | the pose the policy expects to start from, e.g. `standing` |
 | `command.encoding` | str | skills | see above |
 | `command.idle` | [3] | skills | the twist that means "stop doing the thing" |
@@ -103,6 +104,14 @@ The same fields, once per entry, under `policies`, plus `file`. The live copy is
 `https://huggingface.co/pollen-robotics/microduck-policies/blob/main/manifest.json`; the set's
 `phase` entries set each mode's ground-pick timing and its `scripted` entry the sit↔stand's,
 which is how a retrained pick with a longer cycle is a tag rather than a daemon release.
+
+Every `file` is a plain file name — no directory, no leading dot. A set whose manifest names one
+with a path in it has that entry skipped, by the seeder and by `robotctl policy update` both.
+
+The manifest is installed **into the set**, so `/opt/robot/policies/current/manifest.json` is
+what `robotd` reads for the skills. It is also the download list: adding a policy is an entry
+here and a tag, and both the first seed of a board and every `policy update` after it take the
+list from the revision they are installing.
 
 ## Changes from schema 1
 

@@ -313,11 +313,18 @@ Three things make that acceptable rather than merely permitted:
 
 **One consequence that lives in another file, and it found a bug.** `account.login` and
 `account.logout` are `Call::is_mutating`, which is what `updaterd` authorises against a peer's
-uid, so `mediad` had to be added to `allow_users` in `deploy/updater.toml` alongside `btd`. That
-grants `mediad` exactly what its route table permits and nothing more — but the two files now have
-to agree, so `mediad::route`'s `only_these_mutating_calls_are_reachable_over_webrtc` names every
-mutating method that transport may carry, and routing a new one has to change that list on
-purpose. `btd` has had the same test since BLE could apply an update.
+uid, so `mediad` had to be added to `allow_users` in `deploy/updater.toml` alongside `btd`.
+
+**Be exact about what that grants, because it is more than the account.** `allow_users` is a
+gate on the *caller*, not on the method: `updaterd` now performs any mutating call `mediad` makes,
+`update.apply` included. What stops a remote peer applying an update is `mediad`'s own route
+table, which refuses to relay it — so that table is not one narrowing among several, it is the
+only one, on the process most exposed to a stranger's traffic. `btd` has had exactly this shape
+since BLE could apply an update, and the same answer: the boundary is a named list with a test,
+`mediad::route`'s `only_these_mutating_calls_are_reachable_over_webrtc`, so routing a new mutating
+method has to change that list on purpose and say why. A per-method gate in `updaterd` is what
+would make it two layers rather than one; it is not built, and this is the note that says the
+choice was made rather than missed.
 
 Writing it down immediately turned up two methods nobody had noticed were broken:
 **`policy.install` and `policy.fetch` were routed to WebRTC while `mediad` was not in

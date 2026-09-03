@@ -396,7 +396,7 @@ new skill. The ground pick and the sit↔stand are the two, and getting one of t
 is the one mistake here worth being careful about.
 
 The manifest in full, every field, and what each one changes on the robot:
-[`../design/policy-channel-design.md`](../design/policy-channel-design.md) §9.4.
+[`../policy-manifest.md`](../policy-manifest.md).
 
 The shape a policy has to have and what else is checked at load are in
 [`../design/robotd-design.md`](../design/robotd-design.md) §2.3; where policies come from, what

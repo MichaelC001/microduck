@@ -133,6 +133,15 @@ if [ -z "$POLICY_FILES" ]; then
 fi
 
 for name in $POLICY_FILES; do
+    # A plain file name, or nothing. The manifest is fetched from a repo this script's caller
+    # can point anywhere, and `${staging}/${name}` would otherwise let one naming `../../etc/…`
+    # choose where the download lands. `updater::policy::files_in_manifest` applies the same rule
+    # to the same field.
+    case "$name" in
+        */*|*\\*|.*)
+            echo "seed-policies: ignoring ${name} — a policy is a file name" >&2
+            continue ;;
+    esac
     # shellcheck disable=SC2086  # CURL_OPTS is a deliberate word list
     if ! curl $CURL_OPTS -o "${staging}/${name}" "${POLICY_BASE_URL}/${name}"; then
         echo "seed-policies: could not fetch ${name} from ${POLICY_BASE_URL}" >&2

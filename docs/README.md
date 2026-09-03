@@ -3,6 +3,10 @@
 The [README](../README.md) is the front door — what a microduck is, and where to go. If you have
 one in front of you and want to drive it, start at the [cheat sheet](robot/cheatsheet.md).
 
+It is also where a **publisher** starts: [`policy-manifest.md`](policy-manifest.md) is the
+contract for a `manifest.json` beside a microduck `.onnx`, and it owns every field. The design
+docs give the reasoning and point at it.
+
 ## `robot/` — you have a robot
 
 | | |
@@ -54,6 +58,7 @@ Dated records rather than reference. They describe a moment, and go stale on pur
 | [`update-over-ble.md`](project/update-over-ble.md) | Driving the update path from a phone: what it turned up, and what rollback over a radio was decided on. |
 | [`media-bringup.md`](project/media-bringup.md) | What a Radxa Zero 3W does about video: the VPU, what MPP needs, and the two plugins that have to be built. |
 | [`pad-minimal-pairing.md`](project/pad-minimal-pairing.md) | The smallest board configuration a gamepad will bond under, found by taking one away at a time. |
+| [`idle-cpu.md`](project/idle-cpu.md) | What the daemons do when nobody is asking them to: four things that stopped, two that were measured and left alone, and what still wants a board. |
 
 ## `ideas/` — not designed yet
 

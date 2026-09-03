@@ -162,7 +162,7 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// [`code::METHOD_NOT_FOUND`] naming it, which is the designed skew behaviour rather than a
 /// handshake refusal.
 ///
-/// # v22 — `account.*`
+/// # v23 — `account.*`
 ///
 /// A robot can belong to a Hugging Face account, which is the thing that has to be true before it
 /// can be reached from outside its own LAN: the robot's relay proves to a rendezvous service that
@@ -183,7 +183,7 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// comes back to. A login that reported success by holding the connection open would work on a
 /// laptop and fail on the device it is for.
 ///
-/// # v21 — `robot.skills`, `robot.setSkill`, `robot.removeSkill`
+/// # v22 — `robot.skills`, `robot.setSkill`, `robot.removeSkill`
 ///
 /// The last thing in the policy path a terminal on the robot could reach and nothing else could.
 /// `[[policy.skill]]` is a repeating table, so `robotctl policy add` wrote it directly — there
@@ -203,7 +203,7 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// both, and `policies.skills` alone omitted two of the five the pad ships bound to — the same
 /// trap `do_names` exists to close on the robot side.
 ///
-/// # v20 — `pad.bindings`, `pad.bind`
+/// # v21 — `pad.bindings`, `pad.bind`
 ///
 /// Which button runs which skill stops being a thing only somebody at a keyboard on the robot can
 /// change. `robotctl pad bind` edited the config file directly, so unlike every other command it
@@ -221,7 +221,7 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// memory would be reverted before the caller let go of the phone. That also means it needs no
 /// reload and no restart.
 ///
-/// # v19 — `robot.policies` carries the skills
+/// # v20 — `robot.policies` carries the skills
 ///
 /// One field, and it is what makes any of this usable from something that is not `robotctl`:
 /// which one-shot skills a robot has is config now, so a client cannot assume a list and cannot
@@ -235,7 +235,7 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// say" rather than "this robot has no skills" — the same distinction `unavailable` draws for
 /// the gait.
 ///
-/// # v18 — `policy.*` and `robot.reloadPolicies`
+/// # v19 — `policy.*` and `robot.reloadPolicies`
 ///
 /// The official policy set stops needing a daemon release to change. `policy.check` asks the Hub
 /// what revisions exist against the one installed, `policy.install` fetches one, and
@@ -247,7 +247,7 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// `update.*`, and it is there rather than in `robotd` because it needs a network stack, and not
 /// in `robotctl` because that must not link one. See `docs/design/policy-channel-design.md` §8.
 ///
-/// # v17 — `robot.policies`, `robot.loadPolicy`
+/// # v18 — `robot.policies`, `robot.loadPolicy`
 ///
 /// Which `.onnx` fills a slot stops being a restart-only decision: a policy can be swapped into
 /// one slot while the robot runs, and dropped again, without editing a file by hand. Additive as
@@ -255,10 +255,25 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// another shape, so nothing an older client reads changes meaning — the policy names in the
 /// `robot.subscribe` acknowledgement could already change mid-session as of v15.
 ///
+/// **`robot.loadPolicy` persists.** A slot is `[policy] <slot>` in `robotd.toml` and nothing
+/// else, so the daemon writes the key before it queues the swap and a gait chosen over the wire
+/// is the gait the robot boots into. Worth stating on the wire rather than only in the daemon,
+/// because it is the difference between a call a client offers as "try this" and one it offers
+/// as "use this" — and the undo is the same method with no path, not a restart.
+///
 /// An older `robotd` answers either with [`code::METHOD_NOT_FOUND`] naming the method, which is
 /// the designed skew behaviour and not a handshake refusal. See
 /// `docs/design/policy-channel-design.md` §8.
-pub const API_VERSION: u32 = 22;
+///
+/// # v17 — a unit state that can say "crash loop"
+///
+/// [`UnitState`] gains `Restarting` and `Failed`, which `system.services` can now answer with.
+/// Not additive in the way a new method is: an older client deserialising a `Vec<ServiceUnit>`
+/// rejects a member it has no variant for, and `robotctl` reads that reply with `.ok()` — so an
+/// older `robotctl` against this `configd` prints no `units` block at all rather than a wrong one.
+/// Both come out of the same release and an apply restarts both, so the skew lasts as long as the
+/// update does; a board left mid-update sees a missing block, not a lie.
+pub const API_VERSION: u32 = 23;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -2127,6 +2142,18 @@ pub struct PoliciesResult {
     /// show what is loaded.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skills: Vec<String>,
+    /// Why the last policy change failed, when it was not a change to one slot.
+    ///
+    /// **A slot's failure is reported on the slot**; this is for the two that name none — a
+    /// reload and a whole-robot reset — where the answer would otherwise be a log line on the
+    /// robot and silence on the wire. `robot.setSkill` accepts and then triggers a reload, so
+    /// without this a client is told a skill was added and discovers it was not by pressing the
+    /// button.
+    ///
+    /// Cleared by the next change that succeeds. The robot is running the policy it had
+    /// throughout — a failed change swaps nothing — so this is *degraded*, never unhealthy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_error: Option<String>,
 }
 
 /// One policy slot's state, for [`PoliciesResult`].
@@ -3500,15 +3527,35 @@ pub struct Pad {
 
 /// Whether one of the robot's units is running, as systemd sees it.
 ///
-/// Named for the unit rather than for `padd`, which is where it started: the same four answers are
-/// what [`ServiceUnit`] needs about every daemon. The wire form is unchanged by that rename — these
+/// Named for the unit rather than for `padd`, which is where it started: the same answers are what
+/// [`ServiceUnit`] needs about every daemon. The wire form is unchanged by that rename — these
 /// serialise as their own names, not as the type's.
+///
+/// **`Restarting` and `Failed` are here because folding them into their neighbours made a robot
+/// with an unplugged camera report a healthy one.** `mediad` exits when it cannot build a pipeline
+/// and `Restart=always` brings it back five seconds later, forever; systemd calls that
+/// `ActiveState=activating`, `SubState=auto-restart`. Read as `Active` — which is what happened,
+/// for `padd`'s good reason about a daemon still connecting at boot — it printed as a running
+/// daemon, and because systemd deletes `RuntimeDirectory=` on every stop there was no
+/// [`Identity`] to name a build either. The whole of a crash loop reached the operator as
+/// `active · build unknown (old)`: the one explanation that could not be true, since every daemon
+/// in this workspace has published its identity since the commit that introduced it.
+///
+/// `Failed` splits out for the smaller version of the same complaint: it read as `Inactive`, which
+/// is also what a deliberate `systemctl stop` reads as, and those are not the same news.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UnitState {
     /// Running. With a connected pad, the robot is drivable.
     Active,
-    /// The unit exists and is not running. Someone stopped it, or it is failed.
+    /// Between processes: it exited and systemd is starting it again. Once for an ordinary restart,
+    /// or every `RestartSec=` for a daemon that cannot start at all — this state cannot tell those
+    /// apart, and nothing that reads it should pretend otherwise.
+    Restarting,
+    /// It could not start, and systemd has stopped trying.
+    Failed,
+    /// The unit exists and is not running, because something stopped it. A robot whose owner has no
+    /// gamepad and disabled `padd` is the ordinary case, which is why this is not a fault.
     Inactive,
     /// No such unit on this board — a release older than the one that added it.
     Absent,

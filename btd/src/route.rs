@@ -263,22 +263,23 @@ fn permits(call: &proto::Call) -> bool {
         // controller that was running, so the failure mode is "nothing happened", not "gaitless
         // robot on the floor".
         //
-        // **This method does not persist**, and that is worth knowing before relying on it.
-        // `robotd` mutates its own in-memory params and reloads; writing `robotd.toml` is
-        // `robotctl`'s half of `policy load`, not the daemon's. So a gait chosen from a phone is
-        // gone at the next restart or `robot.reloadPolicies` — which is the ephemeral "try it
-        // until reboot" mode `policy-channel-design.md` §3 considered and rejected for the local
-        // path, arrived at here by accident rather than by decision. §15 has it as open.
+        // **This method persists.** `robotd` writes the slot key into `robotd.toml` before it
+        // queues the swap, so a gait chosen from a phone is the gait the robot boots into. It
+        // used to be `robotctl`'s half alone, which made the command and the method the same
+        // words with different durability depending on who asked — the ephemeral "try it until
+        // reboot" mode `policy-channel-design.md` §3 rejected, arrived at by accident.
+        //
+        // So this is a durable remote change, like `pad.bind` below, and belongs on the
+        // PIN-bonded transport for that reason as much as for the watching one. Undoing it is
+        // `robot.loadPolicy` with no path, which is reachable from the same phone.
         RobotLoadPolicy(_) => true,
 
         // Which button runs which skill, and changing one. **This is the transport those exist
         // for**: `robotctl pad bind` is for whoever is holding the robot, and a phone that can
         // already ask for a skill is the obvious place to decide which button asks for it.
         //
-        // `pad.bind` writes the config file, so unlike `robot.loadPolicy` above it *does*
-        // persist — `padd` re-reads `[pad]` every second and would otherwise revert it. So this
-        // is the durable one of the pair, which is another reason it belongs on the transport
-        // that is PIN-bonded rather than only on the one that is not.
+        // `pad.bind` writes the config file, and has to: `padd` re-reads `[pad]` every second,
+        // so a binding held in memory would be reverted before the caller let go of the phone.
         //
         // A name is checked against the skills this robot has before anything is written, so the
         // failure mode is a refusal naming them rather than a button that does nothing.
@@ -344,7 +345,7 @@ fn permits(call: &proto::Call) -> bool {
         // The code the flow produces has to be *read by a person*, so the reply carrying it is
         // the point: this call sends about eighty bytes back, well inside what framing chunks,
         // and needs no link at all while the user is off approving it — see
-        // `duck_ipc_proto::API_VERSION`'s v21 note on why `login` answers with a code and not
+        // `duck_ipc_proto::API_VERSION`'s v23 note on why `login` answers with a code and not
         // with a token. That is what makes an iPhone dropping the GATT link mid-flow a
         // non-event rather than a lost login.
         AccountLogin(_) | AccountStatus | AccountLogout => true,
