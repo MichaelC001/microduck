@@ -2721,6 +2721,12 @@ fn swap_settled(
     slots: &[Slot],
     path: Option<&Path>,
 ) -> Option<Result<(), String>> {
+    // A whole-robot reset names no slot, so a failure has nowhere per-slot to appear. Without
+    // this the command polls until it times out and reports nothing at all, which reads as a
+    // slow robot rather than a change that did not take.
+    if let Some(error) = &policies.change_error {
+        return Some(Err(error.clone()));
+    }
     for slot in slots {
         let Some(state) = policies.slots.iter().find(|s| s.slot == slot.as_str()) else {
             return Some(Err(format!("{slot} is not a slot this robot reports")));
@@ -3438,6 +3444,11 @@ fn render_policies(
             "policies are OFF ([policy] enabled = false) — the loop runs and holds its pose.\n\
              What follows is what would load."
         );
+    }
+    // Above the table, because it is about the whole robot rather than a row of it: the last
+    // reload or reset did not build, and what is listed below is what kept running instead.
+    if let Some(error) = &policies.change_error {
+        let _ = writeln!(out, "the last policy change did not take: {error}");
     }
 
     let width = policies
@@ -4503,7 +4514,21 @@ mod tests {
             enabled: true,
             slots,
             skills: Vec::new(),
+            change_error: None,
         }
+    }
+
+    /// **A reset that would not build must end the wait.** It names no slot, so there is no
+    /// per-slot error to notice, and the command polled to its timeout and then said nothing —
+    /// a change that did not take, reported as a robot that was slow to answer.
+    #[test]
+    fn a_change_that_did_not_take_ends_the_wait() {
+        let mut policies = policies_of(vec![slot_state(Slot::Walk, None, false)]);
+        policies.change_error = Some("the onnxruntime dylib is not on this board".into());
+        assert_eq!(
+            swap_settled(&policies, &Slot::ALL, None),
+            Some(Err("the onnxruntime dylib is not on this board".into()))
+        );
     }
 
     /// **A skill somebody just added has to be visible in the command they will look in.**

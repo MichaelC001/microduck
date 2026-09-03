@@ -545,6 +545,16 @@ struct RobotState {
     /// Why the policy is not loaded, if it is not. Set once at startup; the loop keeps
     /// running and holds the pose, so a broken bundle is a rollback rather than a crash.
     policy_error: ArcSwapOption<String>,
+    /// Why the last policy change failed, when it named no slot to blame it on.
+    ///
+    /// **Not [`RobotState::policy_error`]**, and the difference is the health verdict.
+    /// That one is the release's own policy failing to load, which is unhealthy and rolls the
+    /// release back. This is somebody's *change* failing — a reload after a skill was added, a
+    /// whole-robot reset — where the robot is still running the policy it had, so it is degraded
+    /// and a rollback would fix nothing.
+    ///
+    /// A change to one slot is reported on that slot instead, which says more.
+    policy_change_error: ArcSwapOption<String>,
     /// Which policy files this process is running, as file names. `None` when the policy is
     /// disabled.
     ///
@@ -644,6 +654,7 @@ impl RobotState {
             state_tx: tokio::sync::broadcast::Sender::new(STATE_BUFFER),
             chorale_tx: tokio::sync::broadcast::Sender::new(8),
             policy_error: ArcSwapOption::empty(),
+            policy_change_error: ArcSwapOption::empty(),
             policies: ArcSwap::from_pointee(PolicyNames::of(&params.policy.resolved())),
             policy_slots: ArcSwap::from_pointee(slot_report(
                 &params.policy,
@@ -748,6 +759,13 @@ impl RobotState {
                 "using the default policy where an override would not load — {}",
                 fell_back.collect::<Vec<_>>().join("; ")
             ));
+        }
+
+        // A reload or a reset that would not build. Same verdict and the same reasoning as the
+        // slots above: the robot kept the policy it had, so it walks, and no release the update
+        // gate could revert to would change the outcome.
+        if let Some(reason) = self.policy_change_error.load_full() {
+            return degraded(format!("the last policy change did not take — {reason}"));
         }
 
         let errors = self.consecutive_errors.load(Ordering::Relaxed);
@@ -2443,6 +2461,7 @@ async fn control_loop<T: RobotIo>(
                         }
                     }
                     state.policy_error.store(None);
+                    state.policy_change_error.store(None);
                     state.policies.store(Arc::new(PolicyNames::of(&cfg)));
                     state.policy_slots.store(Arc::new(slot_report(
                         &policy_params,
@@ -2469,13 +2488,24 @@ async fn control_loop<T: RobotIo>(
                     // what `robot.policies` shows the caller polling for an outcome, and what
                     // makes health degraded until the slot is loaded or reset. It does not
                     // make the robot unhealthy — nothing about the release is wrong.
-                    if let intents::PolicyChange::Slot { slot, .. } = change {
-                        slot_errors.set(slot, e);
-                        state.policy_slots.store(Arc::new(slot_report(
-                            &policy_params,
-                            &policy_cfg,
-                            &slot_errors,
-                        )));
+                    match change {
+                        intents::PolicyChange::Slot { slot, .. } => {
+                            slot_errors.set(slot, e);
+                            state.policy_slots.store(Arc::new(slot_report(
+                                &policy_params,
+                                &policy_cfg,
+                                &slot_errors,
+                            )));
+                        }
+                        // A reload or a whole-robot reset names no slot to hang this on, and
+                        // without somewhere to put it the failure was a log line on the robot
+                        // and silence on the wire — while `robot.setSkill` answered "accepted"
+                        // and triggered exactly this reload. Degraded, not unhealthy: the robot
+                        // is still running what it had, so there is nothing for a rollback to
+                        // repair.
+                        intents::PolicyChange::Reload | intents::PolicyChange::ResetAll => {
+                            state.policy_change_error.store(Some(Arc::new(e)));
+                        }
                     }
                 }
             }
@@ -3468,13 +3498,27 @@ fn set_skill_request(
         Some(path) => Some(std::path::PathBuf::from(path)),
         None => existing.as_ref().and_then(|s| s.path.clone()),
     };
-    // A path that is not there is a slot that will report degraded at every restart. Cheap to
-    // catch now, and the caller can still be wrong about the *contents* — that is the loader's.
+    // **Through the same gate `robot.loadPolicy` puts a slot's file through**, and for a sharper
+    // reason here: a skill is not one of `Slot::ALL`, so the startup check that drops an
+    // unloadable *slot* override never looks at it. Without this, a skill pointed at something
+    // that is not a policy is accepted, the reload it triggers fails building the controller,
+    // the robot keeps what it had, and the only trace is a log line — the caller is told the
+    // skill was added and finds out by pressing the button.
     if let Some(path) = &path
         && !params::is_none_sentinel(path)
-        && !path.exists()
     {
-        return proto::IntentResult::refused(format!("no such file: {}", path.display()));
+        if !path.exists() {
+            return proto::IntentResult::refused(format!("no such file: {}", path.display()));
+        }
+        // Only when the error is about the *file*. A board with no ONNX runtime cannot validate
+        // anything, and refusing a config edit on those grounds would send somebody to replace a
+        // policy that is fine — the same distinction `drop_unloadable_overrides` draws at
+        // startup, and what `PolicyError::path` exists for.
+        if let Err(e) = duck_control::policy::validate(path)
+            && e.path().is_some()
+        {
+            return proto::IntentResult::refused(e.to_string());
+        }
     }
 
     let skill = params::SkillDef {
@@ -3939,6 +3983,10 @@ fn dispatch(
                 enabled: state.policy_enabled,
                 slots: state.policy_slots.load().as_ref().clone(),
                 skills: state.policies.load().skills.clone(),
+                change_error: state
+                    .policy_change_error
+                    .load_full()
+                    .map(|e| e.as_ref().clone()),
             },
         ),
 

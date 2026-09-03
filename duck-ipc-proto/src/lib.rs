@@ -2058,6 +2058,18 @@ pub struct PoliciesResult {
     /// show what is loaded.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skills: Vec<String>,
+    /// Why the last policy change failed, when it was not a change to one slot.
+    ///
+    /// **A slot's failure is reported on the slot**; this is for the two that name none — a
+    /// reload and a whole-robot reset — where the answer would otherwise be a log line on the
+    /// robot and silence on the wire. `robot.setSkill` accepts and then triggers a reload, so
+    /// without this a client is told a skill was added and discovers it was not by pressing the
+    /// button.
+    ///
+    /// Cleared by the next change that succeeds. The robot is running the policy it had
+    /// throughout — a failed change swaps nothing — so this is *degraded*, never unhealthy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_error: Option<String>,
 }
 
 /// One policy slot's state, for [`PoliciesResult`].
