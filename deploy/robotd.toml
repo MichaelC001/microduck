@@ -279,6 +279,10 @@ mode = "walk"
 # coo wore thin — so this is an opt-in. The model ships in the release
 # (models/pet_detect.onnx); thresholds are the classifier's hysteresis (enter above, leave
 # below).
+#
+# The mic is read whenever [audio] is on, but the classifier only runs on audio that stands
+# out from the room: in a quiet one this costs nothing beyond the envelope the ambient-sound
+# watcher is measuring anyway.
 # pet_detect = true
 # pet_model = ".../current/models/pet_detect.onnx"
 # pet_enter_threshold = 0.95

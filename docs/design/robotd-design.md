@@ -66,7 +66,7 @@ deliberately:
 
 ```text
    ┌──────────┐   robot.move / robot.head      ┌─────────────────────┐
-   │  padd    │───(notifications, 50 Hz)──────►│                     │
+   │  padd    │──(notifications, ≤50 Hz)──────►│                     │
    │ gamepad  │   robot.stop / robot.enable    │                     │
    └──────────┘───(requests, answered)────────►│                     │
                                                │   /run/robotd.sock  │

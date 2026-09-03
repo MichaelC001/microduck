@@ -229,8 +229,8 @@ Two new methods on `robotd`: `robot.loadPolicy` (slot + source, answered like `r
 accepted, refused with a reason, or a no-op) and `robot.policies` (what each slot runs, with
 origin and version). One new namespace on `updaterd`, `policy.*`, for the fetch.
 
-`API_VERSION` goes 16 → 17. `robotctl` and `btd` ship in the same artifact as `robotd`, so they
-move together; a client pinned to v16 gets `METHOD_NOT_FOUND` naming the method, which is the
+`API_VERSION` goes 17 → 18. `robotctl` and `btd` ship in the same artifact as `robotd`, so they
+move together; a client pinned to v17 gets `METHOD_NOT_FOUND` naming the method, which is the
 designed skew behaviour and not a handshake refusal
 ([`duck-ipc-proto/src/lib.rs`](../../duck-ipc-proto/src/lib.rs), `API_VERSION`).
 
