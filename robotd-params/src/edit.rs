@@ -615,6 +615,44 @@ pub fn bind_pad(path: &Path, button: &str, skill: &str) -> Result<(), String> {
     model.save()
 }
 
+/// Record which file a policy slot runs — or clear the key, which is what a reset is.
+///
+/// **The daemon's half of `robot.loadPolicy`.** A slot is `[policy] <slot>` in the config file
+/// and nothing else, so a load that did not write here would be gone at the next restart; the
+/// method persists, and this is where. `robotctl policy load` used to write it from the other
+/// end, which made the same words mean different things depending on who asked.
+///
+/// `Ok(true)` when the file changed. `Ok(false)` is a request the file already said — worth
+/// telling apart, because a slot the loop is already running *and* the file already names is a
+/// command with nothing left to do.
+///
+/// Every slot is written in one document and one save, so a whole-robot reset cannot leave four
+/// keys cleared and three not.
+pub fn set_slots(path: &Path, slots: &[crate::Slot], to: Option<&Path>) -> Result<bool, String> {
+    let mut model = Model::load(path)?;
+    let before = model.rendered();
+    let value = match to {
+        Some(path) => path.display().to_string(),
+        None => "unset".to_owned(),
+    };
+    for slot in slots {
+        let key = slot.config_key();
+        let entry = REGISTRY
+            .iter()
+            .find(|e| e.key == key)
+            .ok_or_else(|| format!("{key} is not a key robotd knows"))?;
+        model
+            .edit(entry, &value)
+            .map_err(|e| format!("{key}: {e}"))?;
+    }
+    // The rendered document rather than the keys: it is what `save` would write, so it cannot
+    // disagree with itself about whether writing would change anything.
+    if model.rendered() == before {
+        return Ok(false);
+    }
+    model.save().map(|()| true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1208,5 +1246,108 @@ mod tests {
             "[policy]\n",
             "and nothing was written"
         );
+    }
+
+    /// Every slot has to resolve to a key `robotd` will actually read. A key this invented
+    /// would be written, parsed as unknown, and silently ignored — a load that reported success
+    /// and did nothing at the next boot.
+    #[test]
+    fn every_slot_resolves_to_a_key_robotd_reads() {
+        for slot in crate::Slot::ALL {
+            let key = slot.config_key();
+            assert!(
+                REGISTRY.iter().any(|e| e.key == key),
+                "{key} is not a key robotd knows"
+            );
+        }
+    }
+
+    /// **The config half of `robot.loadPolicy`, end to end.** Load writes the key, reset removes
+    /// it, and the comments around them survive both — the file belongs to the operator, and a
+    /// daemon that reformatted it on every gait experiment would not be one anybody trusted with
+    /// the file at all.
+    #[test]
+    fn load_writes_the_key_and_reset_removes_it_without_touching_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("robotd.toml");
+        std::fs::write(
+            &config,
+            "# hand-written, and it stays that way\n[policy]\n# which gait\nmode = \"walk\"\n",
+        )
+        .expect("write");
+
+        let mine = Path::new("/srv/mine.onnx");
+        assert_eq!(
+            set_slots(&config, &[crate::Slot::Walk], Some(mine)),
+            Ok(true)
+        );
+        let written = std::fs::read_to_string(&config).expect("read");
+        assert!(written.contains("walk = \"/srv/mine.onnx\""), "{written}");
+        assert!(written.contains("# hand-written"), "{written}");
+        assert!(written.contains("# which gait"), "{written}");
+
+        assert_eq!(set_slots(&config, &[crate::Slot::Walk], None), Ok(true));
+        let cleared = std::fs::read_to_string(&config).expect("read");
+        assert!(!cleared.contains("/srv/mine.onnx"), "{cleared}");
+        assert!(
+            cleared.contains("mode = \"walk\""),
+            "reset touches one key: {cleared}"
+        );
+        assert!(cleared.contains("# hand-written"), "{cleared}");
+    }
+
+    /// Reset must clear an override rather than write today's default in its place. Pinning the
+    /// release's own path into config would survive the release, and the next update would find
+    /// a robot configured to run a file that no longer exists.
+    #[test]
+    fn reset_clears_the_key_rather_than_writing_the_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("robotd.toml");
+        std::fs::write(&config, "[policy]\nwalk = \"/srv/mine.onnx\"\n").expect("write");
+
+        assert_eq!(set_slots(&config, &crate::Slot::ALL, None), Ok(true));
+        let cleared = std::fs::read_to_string(&config).expect("read");
+        assert!(!cleared.contains("walk ="), "{cleared}");
+        assert!(
+            !cleared.contains("alpha_walking"),
+            "no default is pinned: {cleared}"
+        );
+    }
+
+    /// **Resetting a slot nobody touched writes nothing**, and loading the file already
+    /// configured is the same non-event. `false` is what lets the caller tell a request that
+    /// reconciled a stale file from one that found nothing to reconcile.
+    #[test]
+    fn a_request_the_file_already_says_writes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("robotd.toml");
+        std::fs::write(&config, "[policy]\nmode = \"walk\"\n").expect("write");
+        assert_eq!(set_slots(&config, &crate::Slot::ALL, None), Ok(false));
+        assert_eq!(set_slots(&config, &[crate::Slot::Walk], None), Ok(false));
+
+        std::fs::write(&config, "[policy]\nwalk = \"/srv/mine.onnx\"\n").expect("write");
+        assert_eq!(
+            set_slots(
+                &config,
+                &[crate::Slot::Walk],
+                Some(Path::new("/srv/mine.onnx"))
+            ),
+            Ok(false)
+        );
+    }
+
+    /// A reset is still worth writing when the *file* disagrees with the robot. The loop can say
+    /// "nothing to do" about what it is running while a hand-edited config still names an
+    /// override nobody restarted into, and reconciling the two is why the write comes before the
+    /// already-running check rather than after it.
+    #[test]
+    fn a_stale_config_key_is_still_worth_writing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("robotd.toml");
+        std::fs::write(&config, "[policy]\nwalk = \"/srv/never-loaded.onnx\"\n").expect("write");
+
+        assert_eq!(set_slots(&config, &[crate::Slot::Walk], None), Ok(true));
+        let cleared = std::fs::read_to_string(&config).expect("read");
+        assert!(!cleared.contains("never-loaded"), "{cleared}");
     }
 }

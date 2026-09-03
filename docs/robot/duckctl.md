@@ -369,6 +369,10 @@ duckctl policy reset walk
 One slot at a time, because the wire call takes one — resetting all seven is
 `robotctl policy reset` on the robot. The path is on the *robot*, and must be absolute.
 
+A load from here **survives a reboot**, exactly as `robotctl policy load` on the robot does: the
+daemon writes the slot into `robotd.toml` before it swaps. `duckctl policy reset <slot>` is the
+undo.
+
 Re-read every slot from the config file, for when something else changed it:
 
 ```bash

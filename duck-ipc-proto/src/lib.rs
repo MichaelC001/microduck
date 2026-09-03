@@ -234,6 +234,12 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// another shape, so nothing an older client reads changes meaning — the policy names in the
 /// `robot.subscribe` acknowledgement could already change mid-session as of v15.
 ///
+/// **`robot.loadPolicy` persists.** A slot is `[policy] <slot>` in `robotd.toml` and nothing
+/// else, so the daemon writes the key before it queues the swap and a gait chosen over the wire
+/// is the gait the robot boots into. Worth stating on the wire rather than only in the daemon,
+/// because it is the difference between a call a client offers as "try this" and one it offers
+/// as "use this" — and the undo is the same method with no path, not a restart.
+///
 /// An older `robotd` answers either with [`code::METHOD_NOT_FOUND`] naming the method, which is
 /// the designed skew behaviour and not a handshake refusal. See
 /// `docs/design/policy-channel-design.md` §8.

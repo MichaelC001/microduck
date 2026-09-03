@@ -115,20 +115,20 @@ fn permits(call: &proto::Call) -> bool {
         // within ten metres. Worth remembering when §4 is revisited; not a reason to withhold
         // the call from the transport that can actually show somebody the result.
         //
-        // What limits the damage either way is that the method does not persist: `robotd` changes
-        // its in-memory params and reloads, and writing the file is `robotctl`'s half of
-        // `policy load`. A gait chosen here is gone at the next restart.
+        // And it does persist: `robotd` writes the slot key before it queues the swap, so a
+        // gait chosen here is the one the robot boots into. That makes §4 weigh more, not less
+        // — the same weight it already carries for `pad.bind` below — and it is why the undo is
+        // the same call with no path rather than a restart.
         RobotLoadPolicy(_) => true,
 
         // Which button runs which skill, and changing one. A peer that can already ask for a
         // skill has an obvious use for deciding which button asks for it, and the page showing
         // the robot is a reasonable place to do that from.
         //
-        // §4 applies as it does to everything else here, and with more weight than for
-        // `robot.loadPolicy`: this one writes the config file, because `padd` re-reads `[pad]`
-        // every second and a binding held in memory would be reverted. So a LAN peer changes
-        // something that outlives the session. Named rather than hidden; the answer is
-        // authorisation on this transport, not a smaller surface.
+        // §4 applies as it does to everything else here: this writes the config file, because
+        // `padd` re-reads `[pad]` every second and a binding held in memory would be reverted.
+        // So a LAN peer changes something that outlives the session. Named rather than hidden;
+        // the answer is authorisation on this transport, not a smaller surface.
         PadBindings | PadBind(_) => true,
 
         // The skill table. With `policy.fetch` above, this is what makes the whole path reachable

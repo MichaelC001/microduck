@@ -3738,11 +3738,36 @@ fn load_policy_request(
         }
     };
 
+    // **Written down before it is asked for.** A slot is a config key and nothing else, so a
+    // load the file does not record is one the next restart undoes — which is the ephemeral
+    // "try it until reboot" mode §3 of the policy-channel design considered and rejected. It
+    // was that mode by accident for as long as `robotctl` wrote the file and the method did
+    // not, which made `policy load` and `robot.loadPolicy` the same words with different
+    // durability depending on who asked.
+    //
+    // Before the request rather than after, because the write is the half that can still
+    // refuse: a file this daemon cannot write is a refusal the caller can act on, where a
+    // robot that swapped and then failed to record it is a surprise saved up for the next boot.
+    let slots = match slot {
+        Some(slot) => vec![slot],
+        None => Slot::ALL.to_vec(),
+    };
+    let recorded = match params::edit::set_slots(&state.config_path, &slots, path.as_deref()) {
+        Ok(recorded) => recorded,
+        Err(e) => return proto::IntentResult::refused(e),
+    };
+
     // Last, because it is the only check that needs the file to have been resolved and found
     // valid: "already running this" is a claim about a policy that exists.
     if let Some(reason) = already_loaded(state, slot, path.as_deref()) {
-        tracing::info!(reason, "policy load: nothing to do");
-        return proto::IntentResult::already(reason);
+        tracing::info!(reason, recorded, "policy load: nothing to do");
+        // A robot already running it whose file said otherwise is not a robot with nothing to
+        // do — the file has just stopped disagreeing, and the caller is the only one who can
+        // see that this is why their next reboot will behave differently.
+        return proto::IntentResult::already(match recorded {
+            true => format!("{reason}; {} now says so too", state.config_path.display()),
+            false => reason,
+        });
     }
 
     intents.request_policy_change(match slot {
@@ -6407,6 +6432,45 @@ mod tests {
         assert!(intents.take_policy_change().is_none(), "nothing was queued");
     }
 
+    /// **`robot.loadPolicy` writes the file.** A slot is a config key and nothing else, so a
+    /// swap nothing records is one the next restart undoes — which made the method and
+    /// `robotctl policy load` the same words with different durability depending on who asked.
+    ///
+    /// A reset is the half testable without a runtime: it takes the same path and skips only the
+    /// shape gate. It also covers the case worth being sure about, where the loop has nothing to
+    /// do and the *file* does — a hand-edited override nobody restarted into is reconciled here,
+    /// and the caller is told, because it is the only visible sign that the next boot changed.
+    #[test]
+    fn a_reset_clears_the_config_key_even_when_the_loop_has_nothing_to_do() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("robotd.toml");
+        std::fs::write(&config, "[policy]\nwalk = \"/srv/never-loaded.onnx\"\n").expect("write");
+
+        let s = RobotState::new(&Params::default(), &config, false, false);
+        let intents = Arc::new(Intents::new());
+
+        let result: proto::IntentResult = dispatch(
+            &s,
+            &intents,
+            proto::Id::Number(1),
+            &proto::Call::RobotLoadPolicy(proto::LoadPolicyParams {
+                slot: Some("walk".into()),
+                path: None,
+            }),
+        )
+        .result_as()
+        .unwrap();
+
+        assert!(result.accepted);
+        let written = std::fs::read_to_string(&config).expect("read");
+        assert!(!written.contains("never-loaded"), "{written}");
+        let reason = result.reason.expect("the loop had nothing to do");
+        assert!(
+            reason.contains("robotd.toml"),
+            "it says the file moved: {reason}"
+        );
+    }
+
     /// `robotd`'s working directory is not the caller's, so a relative path names a different
     /// file at each end. Refused rather than resolved against whatever the daemon happens to be
     /// sitting in.
@@ -6471,12 +6535,12 @@ mod tests {
     /// standing network must not be selectable by command magnitude.
     #[test]
     fn a_slot_can_be_switched_off_by_name() {
-        let s = RobotState::new(
-            &Params::default(),
-            std::path::Path::new("/test/robotd.toml"),
-            false,
-            false,
-        );
+        // A real file, because an accepted load is recorded in one before it is queued.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("robotd.toml");
+        std::fs::write(&config, "[policy]\n").expect("write");
+
+        let s = RobotState::new(&Params::default(), &config, false, false);
         let intents = Arc::new(Intents::new());
 
         let result: proto::IntentResult = dispatch(
@@ -6498,6 +6562,11 @@ mod tests {
                 slot: Slot::Stand,
                 path: Some(PathBuf::from("none"))
             })
+        );
+        let written = std::fs::read_to_string(&config).expect("read");
+        assert!(
+            written.contains("stand = \"none\""),
+            "the sentinel is recorded, or the next boot undoes it: {written}"
         );
     }
 

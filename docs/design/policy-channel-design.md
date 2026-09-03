@@ -84,6 +84,14 @@ disturbing a comment. So:
 - `policy reset <slot>` removes the key, then reloads live;
 - `policy reset` removes all seven — "put it back the way it came".
 
+**`robotd` writes the key, not the caller.** `robot.loadPolicy` records the slot in
+`robotd.toml` before it queues the swap, so the durability above is a property of the *method*
+rather than of the command that happens to call it. It was the other way round at first —
+`robotctl` wrote the file and the daemon changed only its own memory — which quietly gave a
+phone the ephemeral mode this section rejects, under the same name. The writer lives in
+`robotd_params::edit`, beside the schema it validates against, and every writer takes a lock on
+the file for its whole read-modify-write: four processes edit it now, counting the daemon.
+
 That is the whole persistence model, and it is not new machinery. A load survives a reboot,
 which is what [`updater-design.md`](updater-design.md) §5.7 already requires: "active model
 selection" is a **user preference**, kept in a config file the updater never overwrites and
@@ -602,6 +610,44 @@ name beside it, and sends that name; `robotd` decides whether the robot has such
 answers with the list it does have when it does not. Checking belongs where the answer is, which
 is why `robotctl pad bind` asks the robot and refuses a typo with the real list.
 
+### 10.4 Reaching it from a phone
+
+`robot.do`, `robot.policies`, `robot.loadPolicy` and `robot.reloadPolicies` are served over
+**both** BLE and WebRTC. What changed is not the safety of any of it — the shape gate, the joint
+clamps and the fall reflex are the same whoever asked — but that a client now exists, which is
+what every one of these refusals said it was waiting for.
+
+**A skill is not teleop.** `robot.do` spent a while grouped with `robot.move` and friends under
+BLE's transport argument — a 20-byte notification budget and a link that does not exist for the
+first ~73 s of a boot. That argument is about a *stream*: fifty small updates a second. A skill is
+one request, and it needs no control link at all, because the deadman zeroes the twist by itself
+and a robot with nothing driving it stands still and bows.
+
+**BLE is the transport that best meets the watching condition**, which is what most refusals here
+turn on. Its radio reaches about ten metres, so whoever tapped the button is in the room with the
+robot by construction — and the bond is PIN-checked with `encrypt_authenticated_write`. WebRTC
+answers the same condition differently: the peer is watching the video, which is the argument
+that already permits `robot.init` and `robot.shutdown`, and covers a gait better than it covers
+standing up, because the peer is looking at the thing the gait is about to move.
+
+The asymmetry worth remembering is the other way round from the intuition. **BLE is
+authenticated; WebRTC is not** — §4 of `remote-webrtc.md` means any LAN peer inherits whatever is
+opened, where BLE carries the same call from a PIN-bonded caller within ten metres. That is a
+reason to sharpen §4, not a reason to withhold the call from the transport that can show somebody
+the result.
+
+**A gait chosen from a phone is the gait the robot boots into.** `robot.loadPolicy` writes the
+slot key itself, so §3's persistence model belongs to the *method* rather than to the command
+that calls it. It did not at first — `robotctl` wrote the file and the daemon changed only its
+own memory — which meant the same two words meant different things depending on who asked, and
+gave remote callers the ephemeral "try it until reboot" mode §3 considered and **rejected**. The
+undo is the same call with no path, which is reachable from the same phone.
+
+**`robot.policies` carries the skill list**, and that is the piece that makes the rest usable. A
+client cannot offer a bow without knowing the robot has one, and which skills exist is config now
+— nothing to compile in. The names were already in `robot.subscribe`'s acknowledgement, but that
+is a 50 Hz stream answering a question asked once, and BLE deliberately does not route it.
+
 ## 11. What the official set currently is
 
 Recorded here because it lives nowhere else in this repository now that the files do not, and
@@ -668,7 +714,12 @@ its meaning for the things that genuinely are models and not control policies, s
 | Buttons are config; Start and Select are not | The button that stops a robot is the one worth not being able to lose (§10.3) |
 | `robot.do` is not teleop, so BLE may carry it | One request, not a stream; and it needs no control link, the deadman zeroes the twist (§10.4) |
 | Loading a policy is served on both transports | Every refusal said it was waiting for a client; there is one (§10.4) |
-| Installing from the Hub is not | It reaches the network and writes the eMMC, where loading points at a file already there (§15) |
+| The daemon writes the slot key, not the caller | Otherwise the same two words mean different things depending on who asked (§3, §10.4) |
+| Every writer of `robotd.toml` takes a lock | Four processes edit it, and two staging at once is one writer's half renamed into place (§3) |
+| Installing from the Hub is served too | The uid gate authorises `btd`'s credentials, not the phone's, exactly as it already does for `update.apply` (§10.4) |
+| A set's manifest is installed with it | Otherwise `policy update` drops every skill the set declares and the list can never grow (§9.3) |
+| The library keeps two revisions per repo | Nothing else tidied it, and fetching is served over both radio transports (§8) |
+| …but never one the robot is using, and nothing at all if it did not answer | Silence is a `robotd` that is down, not one using none of them (§8) |
 | The seeder never replaces an installed set | Otherwise a daemon update silently reverts a gait chosen with `policy update` (§9) |
 | Origin is the org in the path | Honest without a lookup, and a label rather than a boundary (§9.2) |
 | The manifest can refuse but never bless | It is a stranger's claim; the shape gate is the check (§9.2) |
@@ -689,88 +740,7 @@ its meaning for the things that genuinely are models and not control policies, s
   tag.
 - **Signing community policies**, and any curated-org scheme that would require it.
 
-### 10.4 Reaching it from a phone
-
-`robot.do`, `robot.policies`, `robot.loadPolicy` and `robot.reloadPolicies` are served over
-**both** BLE and WebRTC. What changed is not the safety of any of it — the shape gate, the joint
-clamps and the fall reflex are the same whoever asked — but that a client now exists, which is
-what every one of these refusals said it was waiting for.
-
-**A skill is not teleop.** `robot.do` spent a while grouped with `robot.move` and friends under
-BLE's transport argument — a 20-byte notification budget and a link that does not exist for the
-first ~73 s of a boot. That argument is about a *stream*: fifty small updates a second. A skill is
-one request, and it needs no control link at all, because the deadman zeroes the twist by itself
-and a robot with nothing driving it stands still and bows.
-
-**BLE is the transport that best meets the watching condition**, which is what most refusals here
-turn on. Its radio reaches about ten metres, so whoever tapped the button is in the room with the
-robot by construction — and the bond is PIN-checked with `encrypt_authenticated_write`. WebRTC
-answers the same condition differently: the peer is watching the video, which is the argument
-that already permits `robot.init` and `robot.shutdown`, and covers a gait better than it covers
-standing up, because the peer is looking at the thing the gait is about to move.
-
-The asymmetry worth remembering is the other way round from the intuition. **BLE is
-authenticated; WebRTC is not** — §4 of `remote-webrtc.md` means any LAN peer inherits whatever is
-opened, where BLE carries the same call from a PIN-bonded caller within ten metres. That is a
-reason to sharpen §4, not a reason to withhold the call from the transport that can show somebody
-the result.
-
-**What limits the damage either way is that `robot.loadPolicy` does not persist.** §3 above
-describes the persistence model as a property of `policy load` — the *command* — and that is
-exactly right: `robotctl` writes `robotd.toml` and then calls the method. The method itself
-mutates `robotd`'s in-memory params and reloads. So a gait chosen from a phone is gone at the
-next restart or `robot.reloadPolicies`, which is the ephemeral "try it until reboot" mode §3
-considered and **rejected** — arrived at here by accident rather than by decision. §15 has it as
-open, because remote and local answering differently to the same words is a trap however the
-question is settled.
-
-**`robot.policies` carries the skill list**, and that is the piece that makes the rest usable. A
-client cannot offer a bow without knowing the robot has one, and which skills exist is config now
-— nothing to compile in. The names were already in `robot.subscribe`'s acknowledgement, but that
-is a 50 Hz stream answering a question asked once, and BLE deliberately does not route it.
-
 ## 15. Open
-
-- **`robot.loadPolicy` does not persist, and `policy load` does.** Same words, different
-  durability: the command writes `robotd.toml` and the method does not, so a gait chosen from a
-  phone is gone at the next restart. §3 rejected an ephemeral mode deliberately and this is one
-  arrived at by accident. Either the method should write the file — which makes the wire the
-  single path and removes `robotctl`'s duplicate half — or remote should say plainly that it is
-  a trial. The first is more work and more consistent; the second is a defensible thing for a
-  phone to do, but only if it is said.
-
-  It also decides where the **pad bindings** can live, below: `padd` re-reads `[pad]` every
-  second, so a `pad.bind` that did not write the file would be reverted within a second. There
-  is no live-only option there, which means whichever daemon serves it needs the lossless writer
-  that today only `robotctl` has.
-
-- ~~Installing from the Hub is still local-only~~ — all four are served on both transports now.
-  The reads (`policy.check`, `policy.search`) change nothing and sit beside the `update.check`
-  both transports already carry. The mutations (`policy.install`, `policy.fetch`) are named one
-  by one in `btd`'s `only_these_mutating_calls_are_reachable_over_ble`, which is the list that
-  makes adding one have to say why.
-
-  The uid gate turned out not to be the obstacle it looked like. `policy.install` is
-  `is_mutating`, and `updaterd` authorises that against the *peer's* credentials — which are
-  `btd`'s, not the phone's, exactly as they already are for `update.apply`. The transport is the
-  gate there, not the credential.
-
-  Adding a **skill** is reachable too, as of `robot.skills` / `robot.setSkill` /
-  `robot.removeSkill`. That was the last thing here only a terminal on the robot could do:
-  `[[policy.skill]]` is a repeating table, so `robotctl policy add` wrote it directly and there
-  was no method to route. `robotd` writes the file and reloads itself, so one call is the whole
-  operation — a client that had to remember `robot.reloadPolicies` and forgot would leave a robot
-  whose config and behaviour disagree until the next restart.
-
-- ~~The pad bindings have no wire surface at all~~ — `pad.bindings` and `pad.bind` are served
-  over both transports. `robotd` answers them, not `configd`, which owns the rest of `pad.*`:
-  checking a name against the skills this robot has is worth more than a tidy namespace, and
-  routing is per method throughout anyway. §10.3 has the detail.
-
-  `pad.bind` is the first call on either radio transport that **writes the config file**, and it
-  has to be — `padd` re-reads `[pad]` every second, so a binding held in memory would be reverted
-  before the caller let go of the phone. Which makes it, not `robot.loadPolicy`, the durable
-  remote change: worth remembering when §4 of `remote-webrtc.md` is revisited.
 
 - **A running skill has no fall reflex** for its whole duration (§10.2). Fine for a half-second
   kick; a skill configured to hold for ten seconds is ten seconds without one.
