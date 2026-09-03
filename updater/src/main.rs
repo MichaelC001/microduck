@@ -824,6 +824,9 @@ mod tests {
             async fn remote_session_active(&self, _: std::time::Duration) -> bool {
                 false
             }
+            async fn reload_policies(&self, _: std::time::Duration) -> bool {
+                false
+            }
         }
 
         assert!(

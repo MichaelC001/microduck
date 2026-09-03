@@ -161,6 +161,89 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// results are not `deny_unknown_fields`. An older `updaterd` answers `update.show` with
 /// [`code::METHOD_NOT_FOUND`] naming it, which is the designed skew behaviour rather than a
 /// handshake refusal.
+///
+/// # v22 — `robot.skills`, `robot.setSkill`, `robot.removeSkill`
+///
+/// The last thing in the policy path a terminal on the robot could reach and nothing else could.
+/// `[[policy.skill]]` is a repeating table, so `robotctl policy add` wrote it directly — there
+/// was no method to route, and a remote client could fetch a policy and fill a *slot* with it but
+/// never make it answer to `robot.do` by name.
+///
+/// `robotd` writes the file and reloads itself, so one call is the whole operation. The
+/// alternative was a client writing and then remembering `robot.reloadPolicies`, and one that
+/// forgot would leave a robot whose config and behaviour disagree until the next restart.
+///
+/// [`SkillParams`] is the same shape read and written, and every optional field means "the
+/// default for this" — so a client may list, change one field and send it back. An entry that
+/// already exists supplies whatever the call leaves out.
+///
+/// [`SkillsResult`] also carries `built_in`: the names `robot.do` answers to that are not table
+/// entries, because the daemon drives them itself. A client listing what a robot can do needs
+/// both, and `policies.skills` alone omitted two of the five the pad ships bound to — the same
+/// trap `do_names` exists to close on the robot side.
+///
+/// # v21 — `pad.bindings`, `pad.bind`
+///
+/// Which button runs which skill stops being a thing only somebody at a keyboard on the robot can
+/// change. `robotctl pad bind` edited the config file directly, so unlike every other command it
+/// had no wire surface at all and routing could not help.
+///
+/// **Two methods in `pad.*` that `configd` does not serve.** The rest of that namespace is about
+/// the radio and is `configd`'s; a binding is about what a button does to the robot, and checking
+/// a name needs the skill list, which only `robotd` has. Routing is per method throughout, so
+/// this costs nothing — `policy.*` and `robot.loadPolicy` already split one concept across two
+/// daemons the same way. An older `updaterd` or `configd` reached by mistake answers
+/// [`code::METHOD_NOT_FOUND`] naming it.
+///
+/// Additive as methods. `pad.bind` is the first call on either radio transport that **writes the
+/// config file**, and it has to be: `padd` re-reads `[pad]` every second, so a binding held in
+/// memory would be reverted before the caller let go of the phone. That also means it needs no
+/// reload and no restart.
+///
+/// # v20 — `robot.policies` carries the skills
+///
+/// One field, and it is what makes any of this usable from something that is not `robotctl`:
+/// which one-shot skills a robot has is config now, so a client cannot assume a list and cannot
+/// offer a "bow" button without being told there is a bow. The names were already published in
+/// `robot.subscribe`'s acknowledgement, but that is a 50 Hz stream and the question is asked
+/// once — the wrong shape for a phone, and BLE deliberately does not route it.
+///
+/// Additive: a client that ignores the field is unaffected, and an older `robotd` omits it,
+/// which deserialises to empty rather than failing because results are not
+/// `deny_unknown_fields`. A client reading an empty list should treat it as "this robot did not
+/// say" rather than "this robot has no skills" — the same distinction `unavailable` draws for
+/// the gait.
+///
+/// # v19 — `policy.*` and `robot.reloadPolicies`
+///
+/// The official policy set stops needing a daemon release to change. `policy.check` asks the Hub
+/// what revisions exist against the one installed, `policy.install` fetches one, and
+/// `robot.reloadPolicies` is how the thing that swapped the set tells `robotd` to re-read it —
+/// necessary because installing a set swaps a symlink *underneath* unchanged paths, so
+/// `robot.loadPolicy` would correctly conclude there was nothing to do.
+///
+/// Additive as methods. `policy.*` is the first namespace `updaterd` serves that is not
+/// `update.*`, and it is there rather than in `robotd` because it needs a network stack, and not
+/// in `robotctl` because that must not link one. See `docs/design/policy-channel-design.md` §8.
+///
+/// # v18 — `robot.policies`, `robot.loadPolicy`
+///
+/// Which `.onnx` fills a slot stops being a restart-only decision: a policy can be swapped into
+/// one slot while the robot runs, and dropped again, without editing a file by hand. Additive as
+/// methods, and the state they expose was previously unavailable at all rather than available in
+/// another shape, so nothing an older client reads changes meaning — the policy names in the
+/// `robot.subscribe` acknowledgement could already change mid-session as of v15.
+///
+/// **`robot.loadPolicy` persists.** A slot is `[policy] <slot>` in `robotd.toml` and nothing
+/// else, so the daemon writes the key before it queues the swap and a gait chosen over the wire
+/// is the gait the robot boots into. Worth stating on the wire rather than only in the daemon,
+/// because it is the difference between a call a client offers as "try this" and one it offers
+/// as "use this" — and the undo is the same method with no path, not a restart.
+///
+/// An older `robotd` answers either with [`code::METHOD_NOT_FOUND`] naming the method, which is
+/// the designed skew behaviour and not a handshake refusal. See
+/// `docs/design/policy-channel-design.md` §8.
+///
 /// # v17 — a unit state that can say "crash loop"
 ///
 /// [`UnitState`] gains `Restarting` and `Failed`, which `system.services` can now answer with.
@@ -169,7 +252,24 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// older `robotctl` against this `configd` prints no `units` block at all rather than a wrong one.
 /// Both come out of the same release and an apply restarts both, so the skew lasts as long as the
 /// update does; a board left mid-update sees a missing block, not a lie.
-pub const API_VERSION: u32 = 17;
+pub const API_VERSION: u32 = 22;
+
+/// The observation width every policy this robot family runs is built against.
+///
+/// Here rather than only in `duck_control` because it is a **contract with whoever publishes a
+/// policy**, not an implementation detail: it is what a repo's manifest declares, what
+/// `updaterd` refuses a mismatched policy on before downloading it, and what `robotd` refuses it
+/// on at load. `duck_control::obs` is still where the observation is built, and a test there
+/// asserts the two agree.
+pub const POLICY_OBS_LEN: usize = 61;
+
+/// The action count, on the same footing as [`POLICY_OBS_LEN`]: fifteen servos, fourteen of them
+/// driven by a policy.
+pub const POLICY_ACTION_LEN: usize = 14;
+
+/// The robot this daemon drives, as a policy manifest spells it. Refusing a policy published for
+/// something else is cheaper than discovering it in the way the robot moves.
+pub const ROBOT_MODEL: &str = "microduck";
 
 /// The longest an update may legitimately go quiet, in seconds — the pre-install hook's ceiling.
 ///
@@ -420,6 +520,44 @@ pub mod method {
     /// comes back in the configured mode.
     pub const ROBOT_SET_MODE: &str = "robot.setMode";
 
+    /// What each policy slot is running, and where that file came from.
+    ///
+    /// Distinct from [`ROBOT_MODE`], which says which *set* of slots is in play. This says what
+    /// is in them — and, when a load failed, what is in them instead of what was asked for.
+    pub const ROBOT_POLICIES: &str = "robot.policies";
+
+    /// Put a different `.onnx` in one slot, or drop an override and go back to the default.
+    ///
+    /// Answered like [`ROBOT_SET_MODE`] and for the same reason: the swap happens at the home
+    /// pose, seconds later, so the reply says the request was accepted and
+    /// [`ROBOT_POLICIES`] says what came of it.
+    pub const ROBOT_LOAD_POLICY: &str = "robot.loadPolicy";
+
+    /// Re-read every policy slot from disk, whatever the paths say.
+    ///
+    /// Distinct from [`ROBOT_LOAD_POLICY`] because the paths do not change: installing a newer
+    /// official set swaps a symlink underneath them, so every slot still resolves to the same
+    /// string and a load would correctly conclude there is nothing to do. This is how the thing
+    /// that swapped the symlink says otherwise.
+    pub const ROBOT_RELOAD_POLICIES: &str = "robot.reloadPolicies";
+
+    // ── policy.* ─────────────────────────────────────────────────────────────
+    //
+    // Served by `updaterd`, not `robotd`, and the split is the same one everywhere else here:
+    // `robotd` says what it is *running*, `updaterd` is the thing with a network stack and is
+    // therefore what asks the Hub what exists. `robotctl` must not link an HTTP client — it is on
+    // the recovery path and its dependency list is deliberately short — so the fetch cannot live
+    // in the CLI either. `docs/design/policy-channel-design.md` §8.
+
+    /// Is there a newer policy set than the one installed?
+    pub const POLICY_CHECK: &str = "policy.check";
+    /// Install a policy set from the Hub and make it live.
+    pub const POLICY_INSTALL: &str = "policy.install";
+    /// Fetch one policy from any Hub repo into this robot's library.
+    pub const POLICY_FETCH: &str = "policy.fetch";
+    /// Search the Hub for policies.
+    pub const POLICY_SEARCH: &str = "policy.search";
+
     /// Turn the connection into a stream of [`ROBOT_STATE`] notifications.
     pub const ROBOT_SUBSCRIBE: &str = "robot.subscribe";
     /// Server → client. Never carries an `id`.
@@ -480,6 +618,11 @@ pub mod method {
     pub const PAD_PAIR: &str = "pad.pair";
     /// Forget a pad, so it stops reconnecting.
     pub const PAD_FORGET: &str = "pad.forget";
+    pub const PAD_BINDINGS: &str = "pad.bindings";
+    pub const PAD_BIND: &str = "pad.bind";
+    pub const ROBOT_SKILLS: &str = "robot.skills";
+    pub const ROBOT_SET_SKILL: &str = "robot.setSkill";
+    pub const ROBOT_REMOVE_SKILL: &str = "robot.removeSkill";
 
     /// Subscribe to the raw input stream of the pad `padd` is driving from.
     ///
@@ -652,6 +795,22 @@ pub enum Call {
     RobotMode,
     /// Switch drive mode; see [`method::ROBOT_SET_MODE`].
     RobotSetMode(SetModeParams),
+    /// What each policy slot runs; see [`method::ROBOT_POLICIES`].
+    RobotPolicies,
+    /// Load one slot, or reset it; see [`method::ROBOT_LOAD_POLICY`].
+    RobotLoadPolicy(LoadPolicyParams),
+    /// Re-read every slot from disk; see [`method::ROBOT_RELOAD_POLICIES`].
+    RobotReloadPolicies,
+
+    // ── policy.* ─────────────────────────────────────────────────────────────
+    /// What is installed and what the Hub offers; see [`method::POLICY_CHECK`].
+    PolicyCheck,
+    /// Install a set and make it live; see [`method::POLICY_INSTALL`].
+    PolicyInstall(PolicyInstallParams),
+    /// Fetch one policy into the library; see [`method::POLICY_FETCH`].
+    PolicyFetch(PolicyFetchParams),
+    /// Search the Hub; see [`method::POLICY_SEARCH`].
+    PolicySearch(PolicySearchParams),
     RobotSubscribe(SubscribeParams),
     // ── net.* ────────────────────────────────────────────────────────────────
     NetStatus,
@@ -684,6 +843,11 @@ pub enum Call {
     PadStatus,
     PadPair(PadPairParams),
     PadForget(PadForgetParams),
+    PadBindings,
+    PadBind(PadBindParams),
+    RobotSkills,
+    RobotSetSkill(SkillParams),
+    RobotRemoveSkill(SkillNameParams),
     /// Subscribe to the raw pad input stream. Answered by `padd`, not `configd`.
     PadInput,
     /// Subscribe to the ToF depth stream. Answered by `tofd`.
@@ -778,6 +942,13 @@ impl Call {
             Call::RobotShutdown => method::ROBOT_SHUTDOWN,
             Call::RobotMode => method::ROBOT_MODE,
             Call::RobotSetMode(_) => method::ROBOT_SET_MODE,
+            Call::RobotPolicies => method::ROBOT_POLICIES,
+            Call::RobotLoadPolicy(_) => method::ROBOT_LOAD_POLICY,
+            Call::RobotReloadPolicies => method::ROBOT_RELOAD_POLICIES,
+            Call::PolicyCheck => method::POLICY_CHECK,
+            Call::PolicyInstall(_) => method::POLICY_INSTALL,
+            Call::PolicyFetch(_) => method::POLICY_FETCH,
+            Call::PolicySearch(_) => method::POLICY_SEARCH,
             Call::RobotSubscribe(_) => method::ROBOT_SUBSCRIBE,
             Call::NetStatus => method::NET_STATUS,
             Call::NetScan => method::NET_SCAN,
@@ -793,6 +964,11 @@ impl Call {
             Call::PadStatus => method::PAD_STATUS,
             Call::PadPair(_) => method::PAD_PAIR,
             Call::PadForget(_) => method::PAD_FORGET,
+            Call::PadBindings => method::PAD_BINDINGS,
+            Call::PadBind(_) => method::PAD_BIND,
+            Call::RobotSkills => method::ROBOT_SKILLS,
+            Call::RobotSetSkill(_) => method::ROBOT_SET_SKILL,
+            Call::RobotRemoveSkill(_) => method::ROBOT_REMOVE_SKILL,
             Call::PadInput => method::PAD_INPUT,
             Call::TofStream => method::TOF_STREAM,
         }
@@ -824,6 +1000,14 @@ impl Call {
                 // `pad.status` is a read and stays ungated.
                 | Call::PadPair(_)
                 | Call::PadForget(_)
+                // Replacing the policy set changes what drives fifteen servos, which is at least
+                // as consequential as bonding a pad. `policy.check` is a read and stays ungated,
+                // like `pad.status` and every other question about what a robot is.
+                | Call::PolicyInstall(_)
+                // Putting a stranger's network on the board is at least as consequential as
+                // replacing the official set. `policy.search` and `policy.fetch`'s read-only
+                // cousins stay ungated — asking what exists changes nothing.
+                | Call::PolicyFetch(_)
         )
     }
 
@@ -869,6 +1053,13 @@ impl Call {
             // enforces at write time, so the answer cannot grow without limit however long
             // a hook talked for.
             Call::Show(_) => (Updater, Prompt),
+            // `check` is one HTTP round trip. `install` downloads a policy set and then asks
+            // `robotd` to reload, which is the same order of magnitude as a small update — long,
+            // but bounded and not a stream.
+            Call::PolicyCheck | Call::PolicyInstall(_) => (Updater, Prompt),
+            // `fetch` downloads one file and `search` is a single query; both are bounded and
+            // neither streams.
+            Call::PolicyFetch(_) | Call::PolicySearch(_) => (Updater, Prompt),
             // Owns its connection until the peer goes away and never reads another request.
             Call::Subscribe => (Updater, Stream),
 
@@ -877,6 +1068,7 @@ impl Call {
             | Call::RobotHealth
             | Call::RobotModelApi
             | Call::RobotRemoteSessionActive
+            | Call::RobotPolicies
             | Call::RobotMode => (Robot, Prompt),
             // Intents and one-shot skills. All fast: they store a value the control loop reads on
             // its next tick, and none of them waits for the robot to finish anything.
@@ -894,6 +1086,8 @@ impl Call {
             | Call::RobotTheremin(_)
             | Call::RobotChorale(_)
             | Call::RobotSetMode(_)
+            | Call::RobotLoadPolicy(_)
+            | Call::RobotReloadPolicies
             | Call::RobotShutdown => (Robot, Prompt),
             Call::RobotSubscribe(_) => (Robot, Stream),
             // `btd` asking what to put on the air. The answering connection carries the beacon
@@ -911,6 +1105,22 @@ impl Call {
             | Call::SystemSetPairingPin(_)
             | Call::PadStatus
             | Call::PadForget(_) => (Config, Prompt),
+
+            // **The one place `pad.*` splits across two daemons.** Pairing is about the radio,
+            // which `configd` owns. A binding is about what a button does to the robot, and
+            // answering it needs two things only `robotd` has: the list of skills this robot
+            // actually has, so a name can be refused rather than becoming a dead button, and the
+            // config path it is already parsing. Its true sibling is `robot.loadPolicy`, not
+            // `pad.pair`.
+            //
+            // Routing is per method throughout this table — `policy.*` goes to `updaterd` while
+            // `robot.loadPolicy` goes to `robotd`, for the same concept — so this costs nothing
+            // mechanically. It is only worth a comment because the name suggests otherwise.
+            Call::PadBindings | Call::PadBind(_) => (Robot, Prompt),
+
+            // The skill table. `robotd` writes it and reloads itself afterwards, so one call is
+            // enough — and it is the daemon that has to accept the result either way.
+            Call::RobotSkills | Call::RobotSetSkill(_) | Call::RobotRemoveSkill(_) => (Robot, Slow),
             // Re-sweeps the radio rather than returning the last scan.
             Call::NetScan => (Config, Slow),
             // `configd` polls NetworkManager for up to 45 seconds before calling a join failed,
@@ -979,6 +1189,10 @@ impl Call {
             Call::RobotPose(p) => encode(p),
             Call::RobotMouth(p) => encode(p),
             Call::RobotSetMode(p) => encode(p),
+            Call::RobotLoadPolicy(p) => encode(p),
+            Call::PolicyInstall(p) => encode(p),
+            Call::PolicyFetch(p) => encode(p),
+            Call::PolicySearch(p) => encode(p),
             Call::RobotSound(p) => encode(p),
             Call::RobotTheremin(p) => encode(p),
             Call::RobotChorale(p) => encode(p),
@@ -992,6 +1206,9 @@ impl Call {
             Call::SystemAuthenticate(p) => encode(p),
             Call::PadPair(p) => encode(p),
             Call::PadForget(p) => encode(p),
+            Call::PadBind(p) => encode(p),
+            Call::RobotSetSkill(p) => encode(p),
+            Call::RobotRemoveSkill(p) => encode(p),
             Call::Status
             | Call::Subscribe
             | Call::RobotSafeToRestart
@@ -1002,6 +1219,9 @@ impl Call {
             | Call::RobotInit
             | Call::RobotRelax
             | Call::RobotShutdown
+            | Call::RobotPolicies
+            | Call::RobotReloadPolicies
+            | Call::PolicyCheck
             | Call::RobotMode => Value::Object(serde_json::Map::new()),
             Call::NetStatus
             | Call::NetScan
@@ -1010,6 +1230,8 @@ impl Call {
             | Call::SystemReboot
             | Call::SystemPairingPin
             | Call::PadStatus
+            | Call::PadBindings
+            | Call::RobotSkills
             | Call::PadInput
             | Call::TofStream
             | Call::ChoraleSubscribe => Value::Object(serde_json::Map::new()),
@@ -1063,6 +1285,13 @@ impl Call {
             method::ROBOT_SHUTDOWN => Call::RobotShutdown,
             method::ROBOT_MODE => Call::RobotMode,
             method::ROBOT_SET_MODE => Call::RobotSetMode(decode(params)?),
+            method::ROBOT_POLICIES => Call::RobotPolicies,
+            method::ROBOT_LOAD_POLICY => Call::RobotLoadPolicy(decode(params)?),
+            method::ROBOT_RELOAD_POLICIES => Call::RobotReloadPolicies,
+            method::POLICY_CHECK => Call::PolicyCheck,
+            method::POLICY_INSTALL => Call::PolicyInstall(decode(params)?),
+            method::POLICY_FETCH => Call::PolicyFetch(decode(params)?),
+            method::POLICY_SEARCH => Call::PolicySearch(decode(params)?),
             method::ROBOT_SUBSCRIBE => Call::RobotSubscribe(decode(params)?),
             method::NET_STATUS => Call::NetStatus,
             method::NET_SCAN => Call::NetScan,
@@ -1086,6 +1315,11 @@ impl Call {
                 Call::PadPair(decode(params.or(Some(&empty)))?)
             }
             method::PAD_FORGET => Call::PadForget(decode(params)?),
+            method::PAD_BINDINGS => Call::PadBindings,
+            method::PAD_BIND => Call::PadBind(decode(params)?),
+            method::ROBOT_SKILLS => Call::RobotSkills,
+            method::ROBOT_SET_SKILL => Call::RobotSetSkill(decode(params)?),
+            method::ROBOT_REMOVE_SKILL => Call::RobotRemoveSkill(decode(params)?),
             method::PAD_INPUT => Call::PadInput,
             method::TOF_STREAM => Call::TofStream,
             other => {
@@ -1184,7 +1418,7 @@ pub mod test_support {
             Call::RobotInit,
             Call::RobotRelax,
             Call::RobotDo(DoParams {
-                skill: Skill::GroundPick,
+                skill: "ground_pick".into(),
             }),
             Call::RobotPose(PoseParams {
                 z: -0.01,
@@ -1199,6 +1433,24 @@ pub mod test_support {
             }),
             Call::RobotShutdown,
             Call::RobotMode,
+            Call::RobotPolicies,
+            Call::RobotReloadPolicies,
+            Call::PolicyCheck,
+            Call::PolicyInstall(PolicyInstallParams {
+                version: Some("v2".into()),
+            }),
+            Call::PolicyFetch(PolicyFetchParams {
+                repo: "RemiFabre/microduck-flamingo-cycle".into(),
+                revision: None,
+                file: None,
+            }),
+            Call::PolicySearch(PolicySearchParams {
+                query: "microduck".into(),
+            }),
+            Call::RobotLoadPolicy(LoadPolicyParams {
+                slot: Some("walk".into()),
+                path: Some("/var/lib/robot/policies/bouncy.onnx".into()),
+            }),
             Call::RobotSubscribe(SubscribeParams { hz: Some(10) }),
             Call::NetStatus,
             Call::NetScan,
@@ -1229,6 +1481,16 @@ pub mod test_support {
             }),
             Call::PadForget(PadForgetParams {
                 mac: "78:86:2E:BB:13:28".into(),
+            }),
+            Call::RobotSkills,
+            Call::RobotSetSkill(SkillParams::default()),
+            Call::RobotRemoveSkill(SkillNameParams {
+                name: "polite-bow".into(),
+            }),
+            Call::PadBindings,
+            Call::PadBind(PadBindParams {
+                button: "x".into(),
+                skill: Some("polite-bow".into()),
             }),
             Call::PadInput,
             Call::TofStream,
@@ -1678,24 +1940,19 @@ pub struct ThereminState {
 ///
 /// An enum rather than a free string so a typo is [`code::INVALID_PARAMS`] at the door,
 /// not a silently ignored request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Skill {
-    /// Phase-scripted pick from the ground. One shot, ~3 s.
-    GroundPick,
-    /// Left-leg kick. One shot, half a second, blind to any ball.
-    KickLeft,
-    /// Right-leg kick.
-    KickRight,
-    /// Sit if standing, stand if sitting. The daemon knows which; the client need not.
-    SitToggle,
-    /// Forward roll, ~1 s. One request is one roll; a request that arrives while a roll
-    /// runs chains another when the current one completes — which is how a client maps
-    /// "button held" onto it: keep sending while the button is down.
-    Roulade,
-}
+/// Which one-shot skill to run, for [`Call::RobotDo`].
+///
+/// **A name, not an enumeration.** It was five variants — ground pick, the two kicks, the sit
+/// toggle and roulade — each of which needed a `Net`, a config slot and a branch in the control
+/// loop before a robot could do it. A robot's skills are now a list in its config, so what a
+/// client may ask for is whatever that robot has, and `robot.subscribe`'s acknowledgement is
+/// where a client learns the names rather than assuming them.
+///
+/// The five above are still the names a stock robot answers to. An unknown one is refused with
+/// the list it does know, which is the same shape as a bad policy slot.
+pub type Skill = String;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DoParams {
     pub skill: Skill,
@@ -1756,6 +2013,223 @@ pub struct ModeResult {
     pub mode: String,
 }
 
+/// Which slot to change, and to what, for [`Call::RobotLoadPolicy`].
+///
+/// The two `Option`s mirror the config key this ends up writing: `[policy] walk` is an
+/// `Option<PathBuf>` where unset means "resolve this slot's default for the current mode", so
+/// clearing an override and asking for the default are the same operation on the wire as they
+/// are on disk.
+///
+/// | `slot` | `path` | means |
+/// |---|---|---|
+/// | `Some` | `Some` | run this file in this slot |
+/// | `Some` | `None` | drop this slot's override, back to the default |
+/// | `None` | `None` | drop every override — "put it all back" |
+/// | `None` | `Some` | refused; there is no such thing as loading one file into every slot |
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LoadPolicyParams {
+    /// `"walk"`, `"stand"`, `"sitstand"`, `"ground_pick"`, `"kick_left"`, `"kick_right"` or
+    /// `"roulade"`. A string for the reason [`SetModeParams`] carries one: a slot this build
+    /// does not have should be refused with the list of ones it does, not fail to parse.
+    pub slot: Option<String>,
+    /// The `.onnx` to run. Absolute — the daemon resolves nothing relative, because its working
+    /// directory is not the caller's and a path that meant one file to each would be worse than
+    /// a refusal.
+    pub path: Option<String>,
+}
+
+/// Answer to [`Call::RobotPolicies`] — what is actually loaded, not what was configured.
+///
+/// The distinction is the point. A slot whose override failed to load reports the file it fell
+/// back to in `path` and says why in `error`, so "I loaded a policy and the robot did not
+/// change" has an answer that does not require reading the journal.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PoliciesResult {
+    /// `"walk"` or `"roller"` — which mode's slot defaults are in play.
+    pub mode: String,
+    /// Whether policies are loaded at all (`[policy] enabled`). False is a legitimate bench
+    /// configuration, not a fault — the slots below then say what *would* load, and nothing is
+    /// running. Without this a client cannot tell a deliberately quiet robot from a broken one.
+    pub enabled: bool,
+    /// One entry per slot this build has, including the empty ones.
+    pub slots: Vec<PolicySlot>,
+    /// The one-shot skills this robot has, in priority order — the names `robot.do` answers to.
+    ///
+    /// **A client cannot offer a "bow" button without knowing the robot has a bow.** Which skills
+    /// exist is config now, so there is no list to compile in; the other place it is published is
+    /// `robot.subscribe`'s acknowledgement, and that is a 50 Hz stream — the wrong thing to open
+    /// over BLE to answer a question asked once. Here it rides the read a client already makes to
+    /// show what is loaded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<String>,
+    /// Why the last policy change failed, when it was not a change to one slot.
+    ///
+    /// **A slot's failure is reported on the slot**; this is for the two that name none — a
+    /// reload and a whole-robot reset — where the answer would otherwise be a log line on the
+    /// robot and silence on the wire. `robot.setSkill` accepts and then triggers a reload, so
+    /// without this a client is told a skill was added and discovers it was not by pressing the
+    /// button.
+    ///
+    /// Cleared by the next change that succeeds. The robot is running the policy it had
+    /// throughout — a failed change swaps nothing — so this is *degraded*, never unhealthy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_error: Option<String>,
+}
+
+/// One policy slot's state, for [`PoliciesResult`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PolicySlot {
+    /// `"walk"`, `"stand"`, …
+    pub slot: String,
+    /// The file running in it. Absent means the slot is empty, which is a capability this
+    /// robot does not have rather than a fault — roller mode has no standing network.
+    pub path: Option<String>,
+    /// `"official"`, `"community"` or `"local"`. Absent when the slot is empty.
+    ///
+    /// A string rather than an enum so a client that predates an origin reports it verbatim
+    /// instead of failing to parse a robot's answer about what it is running.
+    pub origin: Option<String>,
+    /// Whether config overrides this slot, as opposed to it resolving to the mode's default.
+    pub overridden: bool,
+    /// Why this slot is not running what was asked of it. Set when an override failed to load
+    /// and the default was used instead; `path` then names what is actually running.
+    pub error: Option<String>,
+}
+
+/// Which set to install, for [`Call::PolicyInstall`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PolicyInstallParams {
+    /// A revision in the policy repo — a tag like `v2`, or a branch. Absent means whatever
+    /// [`Call::PolicyCheck`] calls the newest, which is the ordinary case and saves a client
+    /// having to make two calls to do the obvious thing.
+    pub version: Option<String>,
+}
+
+/// Answer to [`Call::PolicyCheck`].
+///
+/// Deliberately says what is installed *and* what exists, rather than a bare "update available".
+/// A robot two versions behind, a robot ahead of its release's pin, and a robot whose Hub is
+/// unreachable are three different situations, and a boolean makes them all look alike.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PolicyCheckResult {
+    /// The Hub repo the installed set came from, per its own provenance record.
+    pub repo: Option<String>,
+    /// The revision installed, e.g. `v1`.
+    pub installed: Option<String>,
+    /// The newest revision the repo offers, if the Hub could be reached.
+    pub available: Option<String>,
+    /// Every revision the repo offers, newest first. What makes going *back* possible.
+    pub versions: Vec<String>,
+    /// Why `available` is absent. An unreachable Hub is a fact to report, not an error to fail
+    /// on — the robot is walking either way.
+    pub unreachable: Option<String>,
+}
+
+/// Answer to [`Call::PolicyInstall`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PolicyInstallResult {
+    /// What is now live.
+    pub installed: String,
+    /// What was live before, when it was something else. Absent on a first install.
+    pub previous: Option<String>,
+    /// Whether `robotd` picked the new set up. False means the files are in place and the robot
+    /// is still running the old ones — a restart away from correct, and worth saying so rather
+    /// than reporting a success the robot has not acted on.
+    pub reloaded: bool,
+}
+
+/// Which policy to fetch, for [`Call::PolicyFetch`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PolicyFetchParams {
+    /// A Hub repo, `org/name`.
+    pub repo: String,
+    /// A branch, tag or commit. Absent means `main`.
+    pub revision: Option<String>,
+    /// Which file in the repo. Absent means "the only `.onnx` in it", which is what every
+    /// microduck policy repo published so far actually has — they all carry one `policy.onnx`.
+    /// A repo with several is a refusal naming them, not a guess.
+    pub file: Option<String>,
+}
+
+/// What a fetched policy turned out to be, for [`Call::PolicyFetch`].
+///
+/// Most of this comes from the repo's `manifest.json`, which the community convention already
+/// carries and which is **untrusted**: it is a stranger's description of a stranger's file. It is
+/// worth reading anyway, because a policy that says it is 51-D can be refused before the download
+/// rather than after the robot has been asked to run it — and a manifest that lies is caught by
+/// the shape gate at load, which is where the real check has always been.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PolicyFetchResult {
+    /// Where it landed. This is what goes in `[policy] <slot>`.
+    pub path: String,
+    pub repo: String,
+    pub revision: String,
+    /// The commit the revision resolved to, so a moving branch can be noticed later.
+    pub commit: Option<String>,
+    pub file: String,
+    /// `"official"` or `"community"`, by the org the repo belongs to.
+    pub origin: String,
+    /// The manifest's own name for it, if it had one.
+    pub name: Option<String>,
+    /// One line about what it does, from the manifest. Untrusted display text.
+    pub description: Option<String>,
+    /// The manifest's `kind` — `episodic` for a policy that returns itself to a safe pose,
+    /// `perpetual` for one that holds until told otherwise. Untrusted, and what decides whether
+    /// the daemon has to supply an ending.
+    pub kind: Option<String>,
+    /// How long the policy runs, from the manifest. Absent for a perpetual one, which has no
+    /// length of its own — a caller wanting it as a one-shot has to say how long to hold it.
+    pub duration_s: Option<f64>,
+    /// The manifest's `action_scale`, if it declared one.
+    pub action_scale: Option<f64>,
+    /// Seconds a perpetual policy needs to get back to its idle command, from the manifest.
+    pub unwind_s: Option<f64>,
+    /// The manifest's `command.idle` — the twist that means "stop", and what a skill unwinds to.
+    pub idle: Option<[f64; 3]>,
+    /// The manifest's `command.encoding`: absent or `"constant"` for the skill family, `"phase"`
+    /// for a ground pick, `"posture_flag"` for a sit↔stand. What decides whether the policy can
+    /// be a generic one-shot at all — a phase policy fed a constant is a robot moving plausibly
+    /// and wrongly.
+    pub encoding: Option<String>,
+    /// Whether holding the button chains another run, from the manifest.
+    pub chain: bool,
+    /// The manifest's `schema_version`, so a client can say which convention it read.
+    pub schema_version: Option<u32>,
+}
+
+/// What to search the Hub for, for [`Call::PolicySearch`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PolicySearchParams {
+    pub query: String,
+}
+
+/// Answer to [`Call::PolicySearch`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PolicySearchResult {
+    pub models: Vec<PolicySearchHit>,
+}
+
+/// One Hub model matching a search. Everything here is written by whoever published it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PolicySearchHit {
+    /// `org/name`.
+    pub id: String,
+    pub origin: String,
+    pub likes: Option<u64>,
+    pub downloads: Option<u64>,
+}
+
 /// How often a subscriber wants [`method::ROBOT_STATE`].
 ///
 /// Decimation is per-subscriber and happens server-side, so a dashboard asking for 10 Hz
@@ -1803,12 +2277,11 @@ pub struct SubscribeResult {
     pub sitstand: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ground_pick: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub kick_left: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub kick_right: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub roulade: Option<String>,
+    /// The configurable one-shot skills this robot has, in priority order, and the names
+    /// `robot.do` answers to. A list rather than a field per skill, because which skills a robot
+    /// has is now config: a client learns them here instead of assuming five.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<String>,
 }
 
 /// Whether the policy should run. Discrete intent — see [`method::ROBOT_ENABLE`].
@@ -2550,6 +3023,20 @@ impl IntentResult {
         }
     }
 
+    /// Accepted, and there was nothing to do — the robot is already in the state asked for.
+    ///
+    /// Distinct from [`Self::accepted`] only by carrying a reason, which is the whole signal: an
+    /// acceptance that queued no work still succeeded, but a caller that then waits for something
+    /// to change is waiting for a change that is never coming. `robot.loadPolicy` is the case
+    /// this exists for — resetting a slot that was never overridden would otherwise send the
+    /// robot home, reload every network and come back to exactly what it was running.
+    pub fn already(reason: impl Into<String>) -> Self {
+        Self {
+            accepted: true,
+            reason: Some(reason.into()),
+        }
+    }
+
     pub fn refused(reason: impl Into<String>) -> Self {
         Self {
             accepted: false,
@@ -2971,6 +3458,111 @@ pub enum PadPairResult {
         /// BlueZ's own words, for a support ticket. `reason` is what a client acts on.
         detail: Option<String>,
     },
+}
+
+/// One entry in the skill table, as a client sees it and as it is written back.
+///
+/// **The same shape read and written**, so a client can list, change one field and send it back
+/// without knowing which fields it is allowed to omit. Every optional one means "the default for
+/// this", which is what an absent key in `[[policy.skill]]` means too.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct SkillParams {
+    /// What `robot.do` answers to. The key of the table: setting an existing name replaces it.
+    pub name: String,
+    /// The `.onnx`. Absent means the file this robot's own set ships under `<name>.onnx`, which
+    /// is what makes overriding a built-in's *timing* possible without naming its file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Seconds it runs. Required for a skill this robot does not already have — a policy that
+    /// holds until told otherwise has no length of its own and something must choose one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration: Option<f64>,
+    /// The twist fed to the network while it runs. Absent is all zeros, which is what a policy
+    /// trained on `zero_command_padding` expects and what most one-shots want.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<[f64; 3]>,
+    /// The twist driven on the way back, for a policy that does not end itself. A manifest's
+    /// `command.idle` is where this comes from when there is one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unwind: Option<[f64; 3]>,
+    /// Seconds spent driving `unwind` before handing back to the gait.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unwind_s: Option<f64>,
+    /// Whether a request arriving while it runs starts another when this one finishes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chain: Option<bool>,
+    /// Scales raw output into a joint offset, when this skill wants its own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action_scale: Option<f64>,
+    /// Servo gain relative to the gait's, when this skill wants its own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gain_ratio: Option<f64>,
+    /// Read-only: whether config has an opinion about this skill, or it is one the release ships.
+    /// Ignored on the way in — a client cannot make a built-in an override by saying so.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub overridden: bool,
+}
+
+/// Parameters for [`Call::RobotRemoveSkill`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillNameParams {
+    pub name: String,
+}
+
+/// Answer to [`Call::RobotSkills`].
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct SkillsResult {
+    /// Every skill this robot has, in the order `robot.do` tries them.
+    pub skills: Vec<SkillParams>,
+    /// Names `robot.do` answers to that are **not** in the table above, because the daemon drives
+    /// them itself — `ground_pick` writes a scripted phase, `sit_toggle` is latched. A client
+    /// listing what a robot can do needs both, and neither can be edited here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub built_in: Vec<String>,
+}
+
+/// Parameters for [`Call::PadBind`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PadBindParams {
+    /// `"a"`, `"x"`, `"lb"`, `"rb"` or `"dpad_down"`. A string for the reason a slot is one: a
+    /// button this build does not have should be refused with the list of ones it does.
+    pub button: String,
+    /// Three states in one field, the same shape [`LoadPolicyParams`] uses for a path.
+    ///
+    /// - a name — run that skill;
+    /// - `""` — the button does nothing, switched off on purpose;
+    /// - absent — put it back to what this robot ships with.
+    ///
+    /// "Off" and "back to the default" are genuinely different wishes and a client needs both, so
+    /// neither can be spelled the way the other is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill: Option<String>,
+}
+
+/// Answer to [`Call::PadBindings`].
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct PadBindingsResult {
+    /// One entry per bindable button, in the order a listing should show them.
+    pub bindings: Vec<PadBinding>,
+}
+
+/// What one pad button runs.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct PadBinding {
+    pub button: String,
+    /// Empty means switched off, which is not the same as a button this robot cannot bind — those
+    /// are simply absent from the list.
+    pub skill: String,
+    /// Whether this differs from what the robot ships with, so a client can show what somebody
+    /// changed without knowing the defaults itself.
+    pub overridden: bool,
+    /// Set when the bound name is not a skill this robot has: a button that will do nothing when
+    /// pressed. Nothing else reports this, and pressing it is otherwise the only way to find out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// Answer to [`Call::PadForget`].
@@ -3873,7 +4465,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            46,
+            58,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }
@@ -4077,6 +4669,16 @@ mod tests {
                 method::PIN,
                 // Powering the machine off is as consequential as rebooting it.
                 method::ROBOT_SHUTDOWN,
+                // Replacing the policy set is at least as consequential as bonding a pad: it
+                // decides what drives fifteen servos. `policy.check` must stay off this list —
+                // asking whether a newer gait exists is inspection, and support has to be able
+                // to ask it on a robot it may not change.
+                method::POLICY_INSTALL,
+                // Putting a stranger's network in a slot is at least as consequential as
+                // replacing the official set. `policy.check` and `policy.search` stay off this
+                // list: asking what exists is inspection, and support has to be able to ask it
+                // on a robot it may not change.
+                method::POLICY_FETCH,
                 method::NET_CONNECT,
                 method::NET_FORGET,
                 method::SYSTEM_SET_NAME,

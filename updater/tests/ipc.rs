@@ -54,6 +54,9 @@ impl RobotClient for FakeRobot {
     async fn remote_session_active(&self, _t: Duration) -> bool {
         false
     }
+    async fn reload_policies(&self, _timeout: Duration) -> bool {
+        true
+    }
 }
 
 struct Harness {

@@ -9,9 +9,20 @@
 //! the way an API only the phone app uses inevitably would. The cost is a socket hop: tens
 //! of microseconds against a 20 ms tick.
 //!
-//! ## The mapping is the prototype's
+//! ## The mapping is the prototype's, and now it is config
 //!
-//! Muscle memory carries over from `microduck_runtime`:
+//! Muscle memory carries over from `microduck_runtime`, and the five one-shot buttons are
+//! `[pad]` in `robotd.toml` — so a robot that has learned a new skill can put it on a button
+//! without a release. The defaults are exactly the mapping below, so a robot with no `[pad]`
+//! section behaves as it always has.
+//!
+//! Only those five. `Start`, the two mode toggles, held `Select` and held `D-pad up` are not
+//! `robot.do` calls, and the button that powers a robot off is the one binding worth not being
+//! able to lose to a config edit.
+//!
+//! This daemon still knows nothing about what a skill *is*. It reads which button went down,
+//! looks up the name beside it, and sends that name; `robotd` decides whether the robot has such
+//! a thing and answers with the list it does have when it does not.
 //!
 //! ```text
 //! Start        toggle the policy
@@ -70,7 +81,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
@@ -108,6 +119,10 @@ struct Args {
     /// `robotd`'s socket.
     #[arg(long, default_value = "/run/robotd.sock")]
     socket: PathBuf,
+
+    /// Where the button bindings are read from — the same file everything else is configured in.
+    #[arg(long, default_value = robotd_params::DEFAULT_PATH)]
+    config: PathBuf,
 
     /// How often to read the pad, 1–1000 Hz. Matching the control rate exactly buys nothing —
     /// the loop reads the latest value once per tick — but staying at or above it keeps the
@@ -195,6 +210,43 @@ enum Mode {
     BodyPose,
 }
 
+/// How often to look for a rewritten config. See the loop.
+const BINDINGS_POLL: Duration = Duration::from_secs(1);
+
+/// The button bindings, or the mapping the prototype had.
+///
+/// A file that will not parse is never a reason to leave somebody without a pad: the defaults
+/// are a working robot, and the reason is logged. That matters more here than elsewhere because
+/// this is re-read while running — a half-saved file caught mid-write must not take the buttons
+/// away, and the next read a second later gets the finished one.
+fn read_bindings(path: &Path) -> robotd_params::PadParams {
+    match robotd_params::Params::load(path, false) {
+        Ok(params) => {
+            let pad = params.pad;
+            tracing::info!(
+                a = %pad.a, x = %pad.x, lb = %pad.lb, rb = %pad.rb,
+                dpad_down = %pad.dpad_down,
+                "button bindings"
+            );
+            pad
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                path = %path.display(),
+                "cannot read the button bindings; using the default mapping"
+            );
+            robotd_params::PadParams::default()
+        }
+    }
+}
+
+/// When the config was last written, for spotting a change. `None` for a file that is not there,
+/// which is a real state and compares equal to itself.
+fn config_mtime(path: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).ok()?.modified().ok()
+}
+
 fn main() -> std::process::ExitCode {
     let args = Args::parse();
     tracing_subscriber::fmt()
@@ -262,6 +314,16 @@ fn main() -> std::process::ExitCode {
     );
 
     let period = Duration::from_secs_f64(1.0 / args.hz as f64);
+    // The button bindings, read once like every other daemon reads its config. A file that will
+    // not parse is not a reason to leave somebody without a pad: the mapping the prototype had is
+    // the fallback, and the reason is logged.
+    let mut bindings = read_bindings(&args.config);
+    // When the file was last written, so a change is picked up without a restart. `padd` holds
+    // no motor control and no session state — the whole of it is this table — so re-reading is a
+    // swap between two ticks rather than anything to sequence.
+    let mut bindings_at = config_mtime(&args.config);
+    let mut bindings_checked = Instant::now();
+
     let mut mode = Mode::Drive;
     // Whether a pad was there last tick, so appearing and disappearing are each logged once.
     let mut driving = false;
@@ -281,31 +343,44 @@ fn main() -> std::process::ExitCode {
     loop {
         let tick = Instant::now();
 
+        // Once a second, not every tick: a `stat` at 50 Hz to catch a file somebody edits by
+        // hand a few times a week is work for nothing, and a second is faster than typing the
+        // next command.
+        if tick.duration_since(bindings_checked) >= BINDINGS_POLL {
+            bindings_checked = tick;
+            let now = config_mtime(&args.config);
+            if now != bindings_at {
+                bindings_at = now;
+                bindings = read_bindings(&args.config);
+                tracing::warn!("button bindings reloaded");
+            }
+        }
+
         // Drain the queue so axis polling below sees present state, and catch button
         // *edges* — a held Start must toggle once, not fifty times a second.
         let mut toggle_enable = false;
         let mut toggle_head = false;
         let mut toggle_body = false;
-        let mut ground_pick = false;
-        let mut kick_left = false;
-        let mut kick_right = false;
-        let mut sit_toggle = false;
-        let mut roulade = false;
+        // Which bindable buttons went down this tick, by their config name. A list rather than
+        // a flag apiece, because what each one runs is config now and this loop no longer knows.
+        let mut pressed: Vec<&'static str> = Vec::new();
         while let Some(event) = gilrs.next_event() {
             if let gilrs::EventType::ButtonPressed(button, _) = event.event {
                 match button {
                     Button::Start => toggle_enable = true,
                     Button::North => toggle_head = true,
                     Button::East => toggle_body = true,
-                    Button::South => ground_pick = true,
-                    // X on an Xbox pad. Press = one roulade; holding it chains rolls,
-                    // which the resend below carries.
-                    Button::West => roulade = true,
-                    // gilrs names the bumpers `LeftTrigger`/`RightTrigger`; the analog
-                    // triggers are `LeftTrigger2`/`RightTrigger2`.
-                    Button::LeftTrigger => kick_left = true,
-                    Button::RightTrigger => kick_right = true,
-                    Button::DPadDown => sit_toggle = true,
+                    // The five bindable ones. What each runs is `[pad]` in the config; this
+                    // only knows which physical control was pressed.
+                    //
+                    // gilrs names the *bumpers* `LeftTrigger`/`RightTrigger`; the analog
+                    // triggers are `LeftTrigger2`/`RightTrigger2`. Getting that backwards binds
+                    // a skill to a control nobody presses.
+                    Button::South => pressed.push("a"),
+                    Button::West => pressed.push("x"),
+                    Button::LeftTrigger => pressed.push("lb"),
+                    Button::RightTrigger => pressed.push("rb"),
+                    Button::DPadDown => pressed.push("dpad_down"),
                     _ => {}
                 }
             }
@@ -397,34 +472,44 @@ fn main() -> std::process::ExitCode {
             }
         }
 
-        // One-shot skills. Answered, because "refused, and here is why" is a real outcome —
-        // there may be no kick policy on this robot, or another move mid-flight.
-        for (fired, skill) in [
-            (ground_pick, proto::Skill::GroundPick),
-            (kick_left, proto::Skill::KickLeft),
-            (kick_right, proto::Skill::KickRight),
-            (sit_toggle, proto::Skill::SitToggle),
-            (roulade, proto::Skill::Roulade),
-        ] {
-            if fired {
-                let call = proto::Call::RobotDo(proto::DoParams { skill });
-                if let Err(e) = request(&mut stream, &mut next_id, &call) {
-                    tracing::error!(error = %e, "skill request failed");
-                    return std::process::ExitCode::FAILURE;
-                }
+        // One-shot skills. Answered, because "refused, and here is why" is a real outcome — a
+        // skill this robot does not have, one mid-flight, or the policy not driving.
+        //
+        // The name comes from config and is sent as it was written. `padd` does not check it
+        // against anything: which skills exist is the robot's to know, and it answers an unknown
+        // one with the list it does have, which is a better error than this side could give.
+        for button in &pressed {
+            // An empty binding is a button switched off on purpose, not a fault.
+            let skill = bindings.skill(button).unwrap_or_default();
+            if skill.is_empty() {
+                tracing::debug!(button, "no skill bound");
+                continue;
+            }
+            let call = proto::Call::RobotDo(proto::DoParams {
+                skill: skill.to_owned(),
+            });
+            if let Err(e) = request(&mut stream, &mut next_id, &call) {
+                tracing::error!(error = %e, "skill request failed");
+                return std::process::ExitCode::FAILURE;
             }
         }
 
-        // X held: keep the roulade chain alive. The robot chains another roll when a
-        // request lands near the end of the current one, so "held" is spelled "resent every
-        // tick" — as a notification, because fifty answered requests a second would spend
-        // their time waiting on replies, and the press above already got the real answer.
+        // X held: keep a chaining skill going. The robot starts another when a request lands
+        // near the end of the current one, so "held" is spelled "resent every tick" — as a
+        // notification, because fifty answered requests a second would spend their time waiting
+        // on replies, and the press above already got the real answer.
+        //
+        // Whatever X is bound to, not the word "roulade": a skill that does not chain simply
+        // refuses the resend, which costs a notification nobody reads. Only X, because it is the
+        // button the prototype held and the only one anybody holds.
+        let held = bindings.skill("x").unwrap_or_default();
         if pad.is_pressed(Button::West)
-            && !roulade
+            && !pressed.contains(&"x")
+            && !held.is_empty()
             && let Err(e) = notify(
                 &mut stream,
                 &proto::Call::RobotDo(proto::DoParams {
-                    skill: proto::Skill::Roulade,
+                    skill: held.to_owned(),
                 }),
             )
         {

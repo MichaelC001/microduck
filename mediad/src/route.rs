@@ -102,6 +102,63 @@ fn permits(call: &proto::Call) -> bool {
         // where it belongs.
         RobotSetMode(_) => false,
 
+        // And loading one. This was a deferral rather than a rule, and it said what would lift
+        // it: "nothing on this transport can name a slot or a file yet — lift it when there is
+        // something to lift it *for*." There is now. The "peer can watch" argument that permits
+        // `robot.init` and `robot.shutdown` above covers trying a gait over a video link at least
+        // as well, and better than it covers standing the robot up: the peer is looking at the
+        // thing the gait is about to move. A load that fails keeps the running controller, so the
+        // failure mode is "nothing happened".
+        //
+        // The honest caveat is §4: there is no authorisation on this transport, so any LAN peer
+        // inherits this, where BLE carries the same call with a caller who is PIN-bonded and
+        // within ten metres. Worth remembering when §4 is revisited; not a reason to withhold
+        // the call from the transport that can actually show somebody the result.
+        //
+        // And it does persist: `robotd` writes the slot key before it queues the swap, so a
+        // gait chosen here is the one the robot boots into. That makes §4 weigh more, not less
+        // — the same weight it already carries for `pad.bind` below — and it is why the undo is
+        // the same call with no path rather than a restart.
+        RobotLoadPolicy(_) => true,
+
+        // Which button runs which skill, and changing one. A peer that can already ask for a
+        // skill has an obvious use for deciding which button asks for it, and the page showing
+        // the robot is a reasonable place to do that from.
+        //
+        // §4 applies as it does to everything else here: this writes the config file, because
+        // `padd` re-reads `[pad]` every second and a binding held in memory would be reverted.
+        // So a LAN peer changes something that outlives the session. Named rather than hidden;
+        // the answer is authorisation on this transport, not a smaller surface.
+        PadBindings | PadBind(_) => true,
+
+        // The skill table. With `policy.fetch` above, this is what makes the whole path reachable
+        // from a browser: pull a stranger's policy onto the board, give it a name and a length,
+        // and ask for it by that name.
+        RobotSkills | RobotSetSkill(_) | RobotRemoveSkill(_) => true,
+
+        // Reading what each slot runs — and which skills this robot has, which is how a client
+        // knows there is a bow to ask `robot.do` for. The same kind of question as the update
+        // reads below, and a remote client watching a gait misbehave has an obvious use for it.
+        RobotPolicies => true,
+
+        // Re-reading the slots goes with loading one: a client that can change what drives the
+        // robot wants the case where something else changed it too.
+        RobotReloadPolicies => true,
+
+        // Is there a newer official set, and what else is on the Hub. Reads that reach the
+        // network and change nothing, alongside the `update.check` this transport already serves.
+        PolicyCheck | PolicySearch(_) => true,
+
+        // And installing one, or fetching a stranger's. The peer can watch the robot try the
+        // result, which is the argument that permits everything else consequential here.
+        //
+        // §4 is the caveat and it is real: no authorisation on this transport, so any LAN peer
+        // inherits this, and this pair writes to the eMMC rather than only pointing at a file
+        // already on it. Named rather than hidden — the answer is authorisation, not a smaller
+        // surface, and a robot whose gait a neighbour can replace is a robot whose gait a
+        // neighbour can already replace with `robot.loadPolicy`.
+        PolicyFetch(_) | PolicyInstall(_) => true,
+
         // ── the streams BLE pointed here ────────────────────────────────────
         //
         // `pad.input` exists to measure the cadence of its own delivery, and `btd` refuses it
@@ -298,6 +355,66 @@ mod tests {
 
     /// A WebRTC peer reaches services `btd` deliberately holds no socket to. Worth pinning,
     /// because it is the concrete difference between the two transports' needs: `mediad` will hold
+    /// **A peer watching the video can run a skill and change what the robot walks with.**
+    ///
+    /// The argument that permits `robot.init` and `robot.shutdown` — the peer can see the robot —
+    /// covers a gait better than it covers standing up, because the peer is looking at the thing
+    /// the gait is about to move. `robot.policies` carries the skill list a client needs before
+    /// it can offer either.
+    #[test]
+    fn a_watching_peer_can_run_a_skill_and_change_a_policy() {
+        for call in [
+            proto::Call::RobotPolicies,
+            proto::Call::RobotDo(proto::DoParams {
+                skill: "polite-bow".to_owned(),
+            }),
+            proto::Call::RobotLoadPolicy(proto::LoadPolicyParams {
+                slot: Some("walk".to_owned()),
+                path: Some("/opt/robot/policies/current/alpha_walking.onnx".to_owned()),
+            }),
+            proto::Call::RobotReloadPolicies,
+            proto::Call::PadBindings,
+            proto::Call::PadBind(proto::PadBindParams {
+                button: "x".to_owned(),
+                skill: Some("polite-bow".to_owned()),
+            }),
+            proto::Call::RobotSkills,
+            proto::Call::RobotSetSkill(proto::SkillParams::default()),
+            proto::Call::RobotRemoveSkill(proto::SkillNameParams {
+                name: "polite-bow".to_owned(),
+            }),
+        ] {
+            assert!(
+                matches!(route_for(&call), Route::To(..)),
+                "{} is refused",
+                call.method()
+            );
+        }
+    }
+
+    /// **The whole Hub path, from a browser.** Search for a gait, ask whether the official set
+    /// has moved, install one, fetch a stranger's — the four that reach the network.
+    ///
+    /// The peer can watch the robot try the result, which is the argument that permits everything
+    /// else consequential here. §4 is the caveat and it is recorded on the arms: there is no
+    /// authorisation on this transport, so a LAN peer inherits it.
+    #[test]
+    fn a_watching_peer_can_browse_and_install_from_the_hub() {
+        for call in [
+            proto::Call::PolicyCheck,
+            proto::Call::PolicySearch(proto::PolicySearchParams {
+                query: "microduck".to_owned(),
+            }),
+            proto::Call::PolicyInstall(proto::PolicyInstallParams::default()),
+        ] {
+            assert!(
+                matches!(route_for(&call), Route::To(..)),
+                "{} is refused",
+                call.method()
+            );
+        }
+    }
+
     /// five connections where `btd` holds three.
     #[test]
     fn reaches_padd_and_tofd_which_btd_cannot() {

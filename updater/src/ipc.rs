@@ -573,6 +573,69 @@ impl Server {
                 })
                 .await
             }
+            // No engine lock: it reads a directory and makes one HTTP request, touches no engine
+            // state, and a question about whether a newer gait exists should stay answerable
+            // while an unrelated update runs.
+            Call::PolicyCheck => {
+                Response::ok(Some(id), &crate::policy::check(
+                    std::path::Path::new(crate::policy::POLICY_ROOT),
+                ).await)
+            }
+            // `try_lock` and the same `BUSY` every other mutation answers with. Swapping the
+            // policy set while a release is being installed would have two things rewriting what
+            // the robot runs at once, and the second one to finish would win by accident.
+            Call::PolicyInstall(params) => {
+                let engine = match self.engine.try_lock() {
+                    Ok(engine) => engine,
+                    Err(_) => {
+                        return Response::err(
+                            Some(id),
+                            proto::Error::new(
+                                proto::code::BUSY,
+                                "an update is in progress; retry shortly",
+                            ),
+                        );
+                    }
+                };
+                match engine.install_policies(params.version.as_deref()).await {
+                    Ok(result) => Response::ok(Some(id), &result),
+                    Err(e) => Response::err(Some(id), e.to_rpc_error()),
+                }
+            }
+            // Read-only and no engine lock: asking the Hub what exists changes nothing here.
+            Call::PolicySearch(params) => match crate::policy::search(&params.query).await {
+                Ok(result) => Response::ok(Some(id), &result),
+                Err(e) => Response::err(Some(id), e.to_rpc_error()),
+            },
+            // `try_lock` like the other mutations. Nothing it writes collides with an update —
+            // the library is outside every release directory — but it asks `robotd` for the
+            // model API, and doing that mid-swap gets an answer about whichever daemon happens
+            // to be running at that instant.
+            Call::PolicyFetch(params) => {
+                let engine = match self.engine.try_lock() {
+                    Ok(engine) => engine,
+                    Err(_) => {
+                        return Response::err(
+                            Some(id),
+                            proto::Error::new(
+                                proto::code::BUSY,
+                                "an update is in progress; retry shortly",
+                            ),
+                        );
+                    }
+                };
+                match engine
+                    .fetch_policy(
+                        &params.repo,
+                        params.revision.as_deref(),
+                        params.file.as_deref(),
+                    )
+                    .await
+                {
+                    Ok(result) => Response::ok(Some(id), &result),
+                    Err(e) => Response::err(Some(id), e.to_rpc_error()),
+                }
+            }
             Call::Rollback(params) => {
                 let component = params.component.0;
                 self.run_mutating(id, out, move |engine, _tx| {
@@ -644,6 +707,9 @@ impl Server {
             | Call::RobotShutdown
             | Call::RobotMode
             | Call::RobotSetMode(_)
+            | Call::RobotPolicies
+            | Call::RobotLoadPolicy(_)
+            | Call::RobotReloadPolicies
             | Call::RobotSubscribe(_) => Response::err(
                 Some(id),
                 proto::Error::new(
@@ -670,11 +736,19 @@ impl Server {
             // working.
             | Call::PadStatus
             | Call::PadPair(_)
-            | Call::PadForget(_) => Response::err(
+            | Call::PadForget(_)
+            // The two exceptions in that namespace go to `robotd` rather than `configd` — a
+            // binding needs the skill list to check a name against — but from here the answer is
+            // the same either way: not this daemon.
+            | Call::PadBindings
+            | Call::PadBind(_)
+            | Call::RobotSkills
+            | Call::RobotSetSkill(_)
+            | Call::RobotRemoveSkill(_) => Response::err(
                 Some(id),
                 proto::Error::new(
                     proto::code::METHOD_NOT_FOUND,
-                    "net.*, system.* and pad.* are served by configd, not updaterd",
+                    "net.*, system.* and pad.* are served by configd and robotd, not updaterd",
                 ),
             ),
 
