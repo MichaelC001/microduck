@@ -1016,8 +1016,14 @@ impl SetManifest {
     }
 }
 
-/// Skill names the daemon implements itself, which a policy set may not take over.
-const DAEMON_OWNED_SKILLS: [&str; 2] = ["ground_pick", "sit_toggle"];
+/// Skill names the daemon implements itself, which nothing else may take over.
+///
+/// Public because there are three ways to add a skill — a set's manifest, `robotctl policy add`
+/// and `robot.setSkill` — and a list only one of them checks is a guard for one of them. Each
+/// has its own arm of the control cascade, so a table entry answering to either name is
+/// unreachable: `robot.do` matches the built-in first, and the entry sits in the list being
+/// offered and never run.
+pub const DAEMON_OWNED_SKILLS: [&str; 2] = ["ground_pick", "sit_toggle"];
 
 /// The ground pick hands back at this fraction of its cycle when the set does not say — the
 /// prototype's cutoff. Ending at 100% replays the reach on the way out.
@@ -1080,8 +1086,8 @@ fn fallback_skills() -> Vec<SkillDef> {
     let kick = |name: &str, file: &str| SkillDef {
         name: name.to_owned(),
         // The kick files are `ball_kick_*.onnx`, which is not `<name>.onnx` — the names are the
-        // roles and the files are the training runs, an indirection `policies/README.md` argued
-        // for and this keeps.
+        // roles and the files are the training runs. The set's manifest keeps that indirection
+        // in its own `name` field; this is the same thing for a set that predates it.
         path: Some(PathBuf::from(POLICY_DIR).join(file)),
         duration: 0.5,
         chain: false,

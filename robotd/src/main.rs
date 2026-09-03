@@ -3430,19 +3430,15 @@ fn set_skill_request(
             "a skill needs a name; it is what `robot.do` asks for",
         );
     }
-    // The two the daemon drives itself. A table entry answering to either would shadow it with a
-    // network fed an all-zero command it was never trained on.
-    if matches!(p.name.as_str(), "ground_pick" | "sit_toggle") {
+    // The two the daemon drives itself. Checked here so the refusal arrives before the file is
+    // read and the answer names the caller's own request; `edit::set_skill` refuses the same
+    // names for whoever comes the other way, which is the writer `robotctl policy add` uses.
+    if params::DAEMON_OWNED_SKILLS.contains(&p.name.as_str()) {
         return proto::IntentResult::refused(format!(
             "{} is driven by the robot itself and cannot be a table entry",
             p.name
         ));
     }
-
-    let mut model = match params::edit::Model::load(&state.config_path) {
-        Ok(model) => model,
-        Err(e) => return proto::IntentResult::refused(e),
-    };
 
     // An existing entry supplies whatever this call leaves out, so a client may send one field.
     let existing = params::Params::load(&state.config_path, false)
@@ -3511,10 +3507,7 @@ fn set_skill_request(
         },
     };
 
-    if let Err(e) = model.set_skill(&skill) {
-        return proto::IntentResult::refused(e);
-    }
-    if let Err(e) = model.save() {
+    if let Err(e) = params::edit::set_skill(&state.config_path, &skill) {
         return proto::IntentResult::refused(e);
     }
     intents.request_policy_change(intents::PolicyChange::Reload);
@@ -3530,19 +3523,12 @@ fn remove_skill_request(
     state: &RobotState,
     intents: &Intents,
 ) -> proto::IntentResult {
-    let mut model = match params::edit::Model::load(&state.config_path) {
-        Ok(model) => model,
-        Err(e) => return proto::IntentResult::refused(e),
-    };
-    match model.remove_skill(&p.name) {
+    match params::edit::remove_skill(&state.config_path, &p.name) {
         Ok(false) => {
             proto::IntentResult::already(format!("no configured skill called {:?}", p.name))
         }
         Err(e) => proto::IntentResult::refused(e),
         Ok(true) => {
-            if let Err(e) = model.save() {
-                return proto::IntentResult::refused(e);
-            }
             intents.request_policy_change(intents::PolicyChange::Reload);
             proto::IntentResult::accepted()
         }

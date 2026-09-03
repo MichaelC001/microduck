@@ -3085,12 +3085,9 @@ fn run_policy_skill(
     config: &Path,
     command: &PolicyCommand,
 ) -> Result<(), Failure> {
-    let mut model = configure::Model::load(config).map_err(|e| Failure::new(exit::FAILED, e))?;
-
     if let PolicyCommand::Remove { name, json } = command {
         ensure_recordable(config)?;
-        let removed = model
-            .remove_skill(name)
+        let removed = robotd_params::edit::remove_skill(config, name)
             .map_err(|e| Failure::new(exit::FAILED, e))?;
         if *json {
             println!("{}", compact(&serde_json::json!({ "removed": removed })));
@@ -3207,9 +3204,7 @@ fn run_policy_skill(
         },
     };
 
-    model
-        .set_skill(&skill)
-        .map_err(|e| Failure::new(exit::FAILED, e))?;
+    robotd_params::edit::set_skill(config, &skill).map_err(|e| Failure::new(exit::FAILED, e))?;
 
     if *json {
         println!("{}", compact(&serde_json::json!({ "added": name })));
@@ -4902,37 +4897,6 @@ mod tests {
     }
 
     /// **Adding the same skill twice retunes it rather than giving the robot two.**
-    #[test]
-    fn adding_a_skill_twice_replaces_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = dir.path().join("robotd.toml");
-        std::fs::write(&config, "# kept\n[policy]\nmode = \"walk\"\n").unwrap();
-
-        let skill = |duration: f64| robotd_params::SkillDef {
-            name: "polite-bow".into(),
-            path: Some(PathBuf::from("/srv/bow.onnx")),
-            duration,
-            ..Default::default()
-        };
-        let mut model =
-            must(configure::Model::load(&config).map_err(|e| Failure::new(exit::FAILED, e)));
-        must(
-            model
-                .set_skill(&skill(4.0))
-                .map_err(|e| Failure::new(exit::FAILED, e)),
-        );
-        must(
-            model
-                .set_skill(&skill(6.0))
-                .map_err(|e| Failure::new(exit::FAILED, e)),
-        );
-
-        let written = std::fs::read_to_string(&config).unwrap();
-        assert_eq!(written.matches("[[policy.skill]]").count(), 1, "{written}");
-        assert!(written.contains("duration = 6.0"), "{written}");
-        assert!(written.contains("# kept"), "comments survive: {written}");
-    }
-
     /// Only what differs from a plain zero-command one-shot is written — a file full of explicit
     /// defaults is the unreadable thing this editor exists to avoid.
     #[test]
@@ -4944,95 +4908,6 @@ mod tests {
         let sit = skill_encoding_refusal("sit", Some("posture_flag")).expect("refused");
         assert!(sit.contains("policy load sitstand"), "{sit}");
         assert!(skill_encoding_refusal("x", Some("telepathy")).is_some());
-    }
-
-    #[test]
-    fn a_plain_skill_writes_no_command_or_unwind() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = dir.path().join("robotd.toml");
-        std::fs::write(&config, "[policy]\n").unwrap();
-
-        let mut model =
-            must(configure::Model::load(&config).map_err(|e| Failure::new(exit::FAILED, e)));
-        must(
-            model
-                .set_skill(&robotd_params::SkillDef {
-                    name: "polite-bow".into(),
-                    path: Some(PathBuf::from("/srv/bow.onnx")),
-                    duration: 4.0,
-                    ..Default::default()
-                })
-                .map_err(|e| Failure::new(exit::FAILED, e)),
-        );
-
-        let written = std::fs::read_to_string(&config).unwrap();
-        assert!(!written.contains("command"), "{written}");
-        assert!(!written.contains("unwind"), "{written}");
-        assert!(!written.contains("chain"), "{written}");
-    }
-
-    /// A policy that holds until told otherwise writes both halves, and what is written is
-    /// checked through the daemon's own loader — what this writes, robotd starts on.
-    #[test]
-    fn a_two_phase_skill_writes_both_halves() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = dir.path().join("robotd.toml");
-        std::fs::write(&config, "[policy]\n").unwrap();
-
-        let mut model =
-            must(configure::Model::load(&config).map_err(|e| Failure::new(exit::FAILED, e)));
-        must(
-            model
-                .set_skill(&robotd_params::SkillDef {
-                    name: "flamingo".into(),
-                    path: Some(PathBuf::from("/srv/f.onnx")),
-                    duration: 5.0,
-                    command: [1.0, 1.0, 0.0],
-                    unwind: [0.0, 1.0, 0.0],
-                    unwind_s: 3.0,
-                    ..Default::default()
-                })
-                .map_err(|e| Failure::new(exit::FAILED, e)),
-        );
-
-        let parsed = robotd_params::Params::load(&config, true).expect("robotd would accept it");
-        let flamingo = parsed.policy.resolved().skills.pop().unwrap();
-        assert_eq!(flamingo.name, "flamingo");
-        assert_eq!(flamingo.command, [1.0, 1.0, 0.0]);
-        assert_eq!(flamingo.unwind_s, 3.0);
-    }
-
-    /// Removing says whether there was anything to remove, so a typo says so instead of looking
-    /// like success.
-    #[test]
-    fn removing_a_skill_says_whether_there_was_one() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = dir.path().join("robotd.toml");
-        std::fs::write(&config, "[policy]\n").unwrap();
-
-        let mut model =
-            must(configure::Model::load(&config).map_err(|e| Failure::new(exit::FAILED, e)));
-        assert!(!must(
-            model
-                .remove_skill("nothing")
-                .map_err(|e| Failure::new(exit::FAILED, e))
-        ));
-
-        must(
-            model
-                .set_skill(&robotd_params::SkillDef {
-                    name: "polite-bow".into(),
-                    path: Some(PathBuf::from("/srv/bow.onnx")),
-                    duration: 4.0,
-                    ..Default::default()
-                })
-                .map_err(|e| Failure::new(exit::FAILED, e)),
-        );
-        assert!(must(
-            model
-                .remove_skill("polite-bow")
-                .map_err(|e| Failure::new(exit::FAILED, e))
-        ));
     }
 
     /// A twist is three numbers; anything else is a refusal rather than a partial parse, which

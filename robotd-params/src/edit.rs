@@ -330,7 +330,17 @@ impl Model {
     ///
     /// By name rather than by appending, so running the same command twice retunes a skill
     /// instead of giving a robot two of it.
-    pub fn set_skill(&mut self, skill: &crate::SkillDef) -> Result<(), String> {
+    fn put_skill(&mut self, skill: &crate::SkillDef) -> Result<(), String> {
+        // Here rather than only in the caller, because a skill can be added from three places
+        // and a rule one of them enforces is not a rule. `robot.do` matches the two the daemon
+        // drives itself before it looks at the table, so an entry answering to either name is
+        // one this file offers and nothing can ever run.
+        if crate::DAEMON_OWNED_SKILLS.contains(&skill.name.as_str()) {
+            return Err(format!(
+                "{} is driven by the robot itself and cannot be a table entry",
+                skill.name
+            ));
+        }
         let mut entry = toml_edit::Table::new();
         entry["name"] = toml_edit::value(skill.name.clone());
         if let Some(path) = &skill.path {
@@ -388,11 +398,11 @@ impl Model {
             Some(at) => *skills.get_mut(at).expect("just found it") = entry,
             None => skills.push(entry),
         }
-        self.validate_and_write()
+        Ok(())
     }
 
     /// Remove a `[[policy.skill]]` entry by name. `false` if there was none.
-    pub fn remove_skill(&mut self, name: &str) -> Result<bool, String> {
+    fn drop_skill(&mut self, name: &str) -> Result<bool, String> {
         let Some(skills) = self
             .doc
             .get_mut("policy")
@@ -404,10 +414,7 @@ impl Model {
         };
         let before = skills.len();
         skills.retain(|t| t.get("name").and_then(|n| n.as_str()) != Some(name));
-        if skills.len() == before {
-            return Ok(false);
-        }
-        self.validate_and_write().map(|()| true)
+        Ok(skills.len() != before)
     }
 
     /// Validate the pending edits through the daemon's own gate, then write atomically.
@@ -415,8 +422,39 @@ impl Model {
     /// Validation goes through a real file and [`Params::load`] rather than a bare parse,
     /// because `load` is what `robotd` runs at startup — range checks included. What this tool
     /// writes, the daemon starts on.
+    ///
+    /// **The pending edits are re-applied to the file as it is now**, under the lock, rather
+    /// than to the copy read when this model was loaded. A model can be open for as long as
+    /// somebody leaves `robotctl configure` on screen, and `robotd` writes the same file for
+    /// `pad.bind` while they do — saving the old document back would silently revert that.
+    /// Only the keys this model actually edited are carried across; everything else is
+    /// whatever the file says.
     pub fn save(&mut self) -> Result<(), String> {
+        let lock = lock(&self.path)?;
+        if let Ok(fresh) = std::fs::read_to_string(&self.path)
+            && let Ok(doc) = fresh.parse::<DocumentMut>()
+        {
+            self.doc = doc;
+        }
         let text = self.rendered();
+        self.write_through(&lock, &text)?;
+        // The document on disk is now the rendered one; fold the edits in.
+        self.doc = text.parse().expect("just validated");
+        for key in self.pending.keys() {
+            let key = (*key).to_owned();
+            if !self.written.contains(&key) {
+                self.written.push(key);
+            }
+        }
+        self.pending.clear();
+        Ok(())
+    }
+
+    /// Stage, validate through the daemon's own loader, and rename into place.
+    ///
+    /// Takes the lock as proof rather than acquiring it, so the caller's read-modify-write is
+    /// covered by one hold rather than by two that another writer can slip between.
+    fn write_through(&self, _lock: &Lock, text: &str) -> Result<(), String> {
         let staged = self.path.with_extension("toml.new");
         let write = |path: &Path| -> std::io::Result<()> {
             let mut file = std::fs::File::create(path)?;
@@ -431,41 +469,66 @@ impl Model {
             ));
         }
         std::fs::rename(&staged, &self.path).map_err(|e| writable_hint(&self.path, &e))?;
-        // The document on disk is now the rendered one; fold the edits in.
-        self.doc = text.parse().expect("just validated");
-        for key in self.pending.keys() {
-            let key = (*key).to_owned();
-            if !self.written.contains(&key) {
-                self.written.push(key);
-            }
+        // The rename is only durable once the directory entry is. A robot switched off at the
+        // wall is the normal case here, not the exceptional one — same discipline as `configd`'s
+        // store and the update journal.
+        if let Some(dir) = self.path.parent()
+            && let Ok(dir) = std::fs::File::open(dir)
+        {
+            let _ = dir.sync_all();
         }
-        self.pending.clear();
         Ok(())
     }
+}
 
-    /// Write the document as it stands, through the same gate `save` uses.
-    ///
-    /// The skill writers change `doc` directly rather than queueing a keyed edit — a repeating
-    /// table has no key to queue — so they need `save`'s validation and atomic rename without
-    /// its pending-edit bookkeeping. Same loader, same temp-file-and-rename, same refusal to
-    /// write a file `robotd` would not start on.
-    fn validate_and_write(&mut self) -> Result<(), String> {
-        let text = self.doc.to_string();
-        let staged = self.path.with_extension("toml.new");
-        let write = |path: &Path| -> std::io::Result<()> {
-            let mut file = std::fs::File::create(path)?;
-            file.write_all(text.as_bytes())?;
-            file.sync_all()
-        };
-        write(&staged).map_err(|e| writable_hint(&staged, &e))?;
-        if let Err(e) = Params::load(&staged, true) {
-            let _ = std::fs::remove_file(&staged);
-            return Err(format!(
-                "refusing to write a config robotd would reject: {e}"
-            ));
-        }
-        std::fs::rename(&staged, &self.path).map_err(|e| writable_hint(&self.path, &e))
+/// An exclusive hold on the config file, for the duration of one read-modify-write.
+type Lock = std::fs::File;
+
+/// Take it.
+///
+/// **Four writers share `robotd.toml`**: `robotctl configure`, `robotctl policy`, `robotctl pad`,
+/// and `robotd` itself, which writes it serving `robot.loadPolicy`, `robot.setSkill` and
+/// `pad.bind` from a phone. Two of them staging into the same `robotd.toml.new` at the same
+/// moment is a file with one writer's half of the work, renamed into place by the other.
+///
+/// On a lock file beside the config rather than on the config itself, so the hold outlives the
+/// rename that replaces it — the arrangement `configd`'s store uses, for the same reason.
+fn lock(path: &Path) -> Result<Lock, String> {
+    let lock_path = path.with_extension("lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|e| writable_hint(&lock_path, &e))?;
+    file.lock()
+        .map_err(|e| format!("cannot lock {}: {e}", lock_path.display()))?;
+    Ok(file)
+}
+
+/// Add or replace one `[[policy.skill]]` entry, by name.
+///
+/// Load, edit and write under one hold of the lock, because a repeating table cannot be queued
+/// as a keyed edit and so cannot be rebased the way [`Model::save`] rebases one. `robotctl
+/// policy add` and `robot.setSkill` both come through here.
+pub fn set_skill(path: &Path, skill: &crate::SkillDef) -> Result<(), String> {
+    let lock = lock(path)?;
+    let mut model = Model::load(path)?;
+    model.put_skill(skill)?;
+    let text = model.doc.to_string();
+    model.write_through(&lock, &text)
+}
+
+/// Take a skill out of the table. `false` if there was none, which is not a failure — it is the
+/// answer to "is this robot's own back", and the caller says so differently.
+pub fn remove_skill(path: &Path, name: &str) -> Result<bool, String> {
+    let lock = lock(path)?;
+    let mut model = Model::load(path)?;
+    if !model.drop_skill(name)? {
+        return Ok(false);
     }
+    let text = model.doc.to_string();
+    model.write_through(&lock, &text).map(|()| true)
 }
 
 /// Three floats as a TOML array.
@@ -507,11 +570,15 @@ pub fn sections() -> Vec<&'static str> {
     out
 }
 
-/// Permission errors get the actual fix, because the file is root-owned by design.
+/// Permission errors say what to do about it, because the file is root-owned by design.
+///
+/// It does not name a command any more. Four callers write this file and `robotd` is one of
+/// them — it runs as root, so telling whoever asked over the radio to "run `sudo robotctl
+/// configure`" would send them to a terminal to fix something sudo cannot reach.
 fn writable_hint(path: &Path, e: &std::io::Error) -> String {
     if e.kind() == std::io::ErrorKind::PermissionDenied {
         format!(
-            "cannot write {}: permission denied — run `sudo robotctl configure`",
+            "cannot write {}: permission denied — it is root-owned, so this needs sudo",
             path.display()
         )
     } else {
@@ -939,6 +1006,207 @@ mod tests {
                 // buttons do, which is the thing somebody browses for rather than tunes.
                 "pad"
             ]
+        );
+    }
+
+    /// **Four processes write this file**, and two staging into the same `robotd.toml.new` at
+    /// once is one writer's half renamed into place by the other. Every writer takes the lock
+    /// for its whole read-modify-write, so concurrent adds compose instead of racing.
+    #[test]
+    fn concurrent_writers_do_not_lose_each_other_s_work() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("robotd.toml");
+        std::fs::write(&config, "[policy]\n").expect("write");
+
+        let hands: Vec<_> = (0..8)
+            .map(|i| {
+                let config = config.clone();
+                std::thread::spawn(move || {
+                    set_skill(
+                        &config,
+                        &crate::SkillDef {
+                            name: format!("skill-{i}"),
+                            path: Some(PathBuf::from("/srv/bow.onnx")),
+                            duration: 1.0,
+                            ..Default::default()
+                        },
+                    )
+                })
+            })
+            .collect();
+        for hand in hands {
+            hand.join().expect("thread").expect("written");
+        }
+
+        let parsed = Params::load(&config, true).expect("robotd would start on it");
+        let mut names: Vec<String> = parsed
+            .policy
+            .skills
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        names.sort();
+        assert_eq!(names.len(), 8, "every writer's entry survived: {names:?}");
+    }
+
+    /// The keyed edits rebase on save, so a model left open while something else writes the file
+    /// carries its own change across rather than reverting the other. `robotctl configure` can
+    /// sit on screen for minutes while a phone calls `pad.bind`.
+    #[test]
+    fn saving_an_open_model_keeps_what_somebody_else_wrote() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("robotd.toml");
+        std::fs::write(&config, "[policy]\n").expect("write");
+
+        // Opened, and then left alone the way an editor is.
+        let mut open = Model::load(&config).expect("loads");
+        open.edit(entry("audio.enabled"), "false").expect("edits");
+
+        set_skill(
+            &config,
+            &crate::SkillDef {
+                name: "polite-bow".into(),
+                path: Some(PathBuf::from("/srv/bow.onnx")),
+                duration: 4.0,
+                ..Default::default()
+            },
+        )
+        .expect("added underneath");
+
+        open.save().expect("saves");
+        let written = std::fs::read_to_string(&config).expect("read");
+        assert!(written.contains("enabled = false"), "{written}");
+        assert!(
+            written.contains("polite-bow"),
+            "and the bow is still here: {written}"
+        );
+    }
+
+    /// By name rather than by appending: running `robotctl policy add` twice retunes a skill
+    /// instead of giving a robot two of it.
+    #[test]
+    fn adding_a_skill_twice_replaces_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("robotd.toml");
+        std::fs::write(&config, "# kept\n[policy]\nmode = \"walk\"\n").expect("write");
+
+        let skill = |duration: f64| crate::SkillDef {
+            name: "polite-bow".into(),
+            path: Some(PathBuf::from("/srv/bow.onnx")),
+            duration,
+            ..Default::default()
+        };
+        set_skill(&config, &skill(4.0)).expect("added");
+        set_skill(&config, &skill(6.0)).expect("retuned");
+
+        let written = std::fs::read_to_string(&config).expect("read");
+        assert_eq!(written.matches("[[policy.skill]]").count(), 1, "{written}");
+        assert!(written.contains("duration = 6.0"), "{written}");
+        assert!(written.contains("# kept"), "comments survive: {written}");
+    }
+
+    /// Only what differs from a plain zero-command one-shot is written — a file full of explicit
+    /// defaults is the unreadable thing this editor exists to avoid.
+    #[test]
+    fn a_plain_skill_writes_no_command_or_unwind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("robotd.toml");
+        std::fs::write(&config, "[policy]\n").expect("write");
+
+        set_skill(
+            &config,
+            &crate::SkillDef {
+                name: "polite-bow".into(),
+                path: Some(PathBuf::from("/srv/bow.onnx")),
+                duration: 4.0,
+                ..Default::default()
+            },
+        )
+        .expect("added");
+
+        let written = std::fs::read_to_string(&config).expect("read");
+        assert!(!written.contains("command"), "{written}");
+        assert!(!written.contains("unwind"), "{written}");
+        assert!(!written.contains("chain"), "{written}");
+    }
+
+    /// A policy that holds until told otherwise writes both halves, and what is written is
+    /// checked through the daemon's own loader — what this writes, robotd starts on.
+    #[test]
+    fn a_two_phase_skill_writes_both_halves() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("robotd.toml");
+        std::fs::write(&config, "[policy]\n").expect("write");
+
+        set_skill(
+            &config,
+            &crate::SkillDef {
+                name: "flamingo".into(),
+                path: Some(PathBuf::from("/srv/f.onnx")),
+                duration: 5.0,
+                command: [1.0, 1.0, 0.0],
+                unwind: [0.0, 1.0, 0.0],
+                unwind_s: 3.0,
+                ..Default::default()
+            },
+        )
+        .expect("added");
+
+        let parsed = Params::load(&config, true).expect("robotd would accept it");
+        let flamingo = parsed.policy.resolved().skills.pop().expect("the skill");
+        assert_eq!(flamingo.name, "flamingo");
+        assert_eq!(flamingo.command, [1.0, 1.0, 0.0]);
+        assert_eq!(flamingo.unwind_s, 3.0);
+    }
+
+    /// Removing says whether there was anything to remove, so a typo says so instead of looking
+    /// like success.
+    #[test]
+    fn removing_a_skill_says_whether_there_was_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("robotd.toml");
+        std::fs::write(&config, "[policy]\n").expect("write");
+
+        assert_eq!(remove_skill(&config, "nothing"), Ok(false));
+        set_skill(
+            &config,
+            &crate::SkillDef {
+                name: "polite-bow".into(),
+                path: Some(PathBuf::from("/srv/bow.onnx")),
+                duration: 4.0,
+                ..Default::default()
+            },
+        )
+        .expect("added");
+        assert_eq!(remove_skill(&config, "polite-bow"), Ok(true));
+    }
+
+    /// **A name the daemon drives itself is refused by the writer, not only by the wire.**
+    /// `robotctl policy add` writes through here and `robot.setSkill` does not, so a guard that
+    /// lived only in the route left the local command able to write an entry that `robot.do`
+    /// would list and never run — it matches the built-in first.
+    #[test]
+    fn a_skill_cannot_take_a_name_the_daemon_drives_itself() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("robotd.toml");
+        std::fs::write(&config, "[policy]\n").expect("write");
+
+        for name in crate::DAEMON_OWNED_SKILLS {
+            let refusal = set_skill(
+                &config,
+                &crate::SkillDef {
+                    name: name.to_owned(),
+                    duration: 1.0,
+                    ..Default::default()
+                },
+            )
+            .expect_err("refused");
+            assert!(refusal.contains(name), "{refusal}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(&config).expect("read"),
+            "[policy]\n",
+            "and nothing was written"
         );
     }
 }
