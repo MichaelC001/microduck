@@ -138,7 +138,19 @@ through `rkaiq`.
 **Three things keep it open.**
 
 **Outside the LAN.** The same design with a rendezvous service and TURN in front (§7),
-deliberately built second.
+deliberately built second. [`remote-access-design.md`](../design/remote-access-design.md) now owns
+it: a Hugging Face account reached by the OAuth device flow, and a bridge from the rendezvous Space
+the mini's fleet already uses to the signalling server already on the robot.
+
+The **account** is built and is the first half — `robotctl account login` prints a code, somebody
+approves it at hf.co/oauth/device, and the robot holds a credential it renews itself; the same
+three calls work over BLE, which is the only transport a robot with no wifi has, and over a
+datachannel. Nothing consumes the credential yet: the **bridge** is next, and it is where the
+rendezvous Space's protocol turns out to be HTTP rather than the WebSocket a LAN client speaks.
+
+One thing to fix before a duck ships with this: the token carries every scope Hugging Face grants,
+because the first-party device-code client takes no `scope` parameter. Narrowing it to
+`openid profile read-repos` is a public OAuth app in the org and one constant.
 
 **The SDK, and a small Python client.** §5.3 designs it as WebSocket plus snapshot: the same
 JSON-RPC, no media stack, `get_frame` returning a JPEG, a few dozen lines — and `mediad`'s

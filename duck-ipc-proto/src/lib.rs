@@ -162,6 +162,27 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// [`code::METHOD_NOT_FOUND`] naming it, which is the designed skew behaviour rather than a
 /// handshake refusal.
 ///
+/// # v23 — `account.*`
+///
+/// A robot can belong to a Hugging Face account, which is the thing that has to be true before it
+/// can be reached from outside its own LAN: the robot's relay proves to a rendezvous service that
+/// it belongs to an account, the service shows a client only its own robots, and those two
+/// together are the authorisation a bridged session arrives with. Nothing about the *robot's* own
+/// gate changes — there still is not one — see `docs/design/remote-access-design.md` §7.
+///
+/// Additive as methods, and `updaterd` serves them for the reasons `policy.*` is there: it is the
+/// daemon with a network stack, and the credential it stores is also what would reach a private
+/// Hub repo. An older `updaterd` answers [`code::METHOD_NOT_FOUND`] naming the method, which is
+/// the designed skew behaviour rather than a handshake refusal.
+///
+/// **`account.login` answers with a code rather than with a token**, and that shape is not an
+/// implementation detail: the flow is RFC 8628, so somebody has to read a short code and approve
+/// it in a browser, and the client that showed them the code may well be gone by the time they
+/// do — a phone that opens a browser backgrounds itself, and iOS then tears the GATT link down.
+/// So `login` returns immediately, `updaterd` owns the waiting, and `status` is what a client
+/// comes back to. A login that reported success by holding the connection open would work on a
+/// laptop and fail on the device it is for.
+///
 /// # v22 — `robot.skills`, `robot.setSkill`, `robot.removeSkill`
 ///
 /// The last thing in the policy path a terminal on the robot could reach and nothing else could.
@@ -252,7 +273,7 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// older `robotctl` against this `configd` prints no `units` block at all rather than a wrong one.
 /// Both come out of the same release and an apply restarts both, so the skew lasts as long as the
 /// update does; a board left mid-update sees a missing block, not a lie.
-pub const API_VERSION: u32 = 22;
+pub const API_VERSION: u32 = 23;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -558,6 +579,25 @@ pub mod method {
     /// Search the Hub for policies.
     pub const POLICY_SEARCH: &str = "policy.search";
 
+    // ── account.* ────────────────────────────────────────────────────────────
+    //
+    // Which Hugging Face account this robot belongs to. Served by `updaterd` for `policy.*`'s
+    // reasons exactly — it is the daemon with a network stack, and `robotctl` must not link one —
+    // and because the credential it stores is also what reaches a *private* Hub repo, which is
+    // already this daemon's job.
+    //
+    // The account is what makes a robot reachable from outside the LAN: the relay proves the robot
+    // belongs to an account, the rendezvous service shows a client only its own robots, and the
+    // pair of those is the authorisation a bridged session arrives with.
+    // `docs/design/remote-access-design.md` §2.
+
+    /// Begin an OAuth device-code login. Answers immediately with a code to show somebody.
+    pub const ACCOUNT_LOGIN: &str = "account.login";
+    /// Which account this robot belongs to, and whether a login is in flight.
+    pub const ACCOUNT_STATUS: &str = "account.status";
+    /// Forget the account. The robot stops being reachable from outside the LAN.
+    pub const ACCOUNT_LOGOUT: &str = "account.logout";
+
     /// Turn the connection into a stream of [`ROBOT_STATE`] notifications.
     pub const ROBOT_SUBSCRIBE: &str = "robot.subscribe";
     /// Server → client. Never carries an `id`.
@@ -811,6 +851,14 @@ pub enum Call {
     PolicyFetch(PolicyFetchParams),
     /// Search the Hub; see [`method::POLICY_SEARCH`].
     PolicySearch(PolicySearchParams),
+
+    // ── account.* ────────────────────────────────────────────────────────────
+    /// Start a device-code login; see [`method::ACCOUNT_LOGIN`].
+    AccountLogin(AccountLoginParams),
+    /// Who this robot belongs to; see [`method::ACCOUNT_STATUS`].
+    AccountStatus,
+    /// Forget the account; see [`method::ACCOUNT_LOGOUT`].
+    AccountLogout,
     RobotSubscribe(SubscribeParams),
     // ── net.* ────────────────────────────────────────────────────────────────
     NetStatus,
@@ -949,6 +997,9 @@ impl Call {
             Call::PolicyInstall(_) => method::POLICY_INSTALL,
             Call::PolicyFetch(_) => method::POLICY_FETCH,
             Call::PolicySearch(_) => method::POLICY_SEARCH,
+            Call::AccountLogin(_) => method::ACCOUNT_LOGIN,
+            Call::AccountStatus => method::ACCOUNT_STATUS,
+            Call::AccountLogout => method::ACCOUNT_LOGOUT,
             Call::RobotSubscribe(_) => method::ROBOT_SUBSCRIBE,
             Call::NetStatus => method::NET_STATUS,
             Call::NetScan => method::NET_SCAN,
@@ -1008,6 +1059,14 @@ impl Call {
                 // replacing the official set. `policy.search` and `policy.fetch`'s read-only
                 // cousins stay ungated — asking what exists changes nothing.
                 | Call::PolicyFetch(_)
+                // Signing the robot in binds it to a Hugging Face account, and signing it out
+                // takes it away again. That is the most consequential pair here by one measure
+                // nothing else in this list shares: it decides who can reach the robot *from
+                // outside the building*, and it outlives every session and every reboot.
+                // `account.status` is a read and stays ungated — a support engineer should be
+                // able to ask which account a robot thinks it belongs to.
+                | Call::AccountLogin(_)
+                | Call::AccountLogout
         )
     }
 
@@ -1060,6 +1119,16 @@ impl Call {
             // `fetch` downloads one file and `search` is a single query; both are bounded and
             // neither streams.
             Call::PolicyFetch(_) | Call::PolicySearch(_) => (Updater, Prompt),
+            // `login` is one HTTP round trip to Hugging Face and answers with the code to
+            // show somebody; the *waiting* happens in a task `updaterd` owns, not on this
+            // connection, so it is `Slow` for the round trip rather than `Stream` for the login.
+            // That is the whole reason `login` returns a code instead of a token: a client that
+            // backgrounds itself while its user reads the code — which is what a phone does when
+            // it opens a browser — must be able to come back and ask `status`.
+            Call::AccountLogin(_) => (Updater, Slow),
+            // Both read or write local state only. `status` is asked on a poll while a login is
+            // in flight, so it must not queue behind anything.
+            Call::AccountStatus | Call::AccountLogout => (Updater, Prompt),
             // Owns its connection until the peer goes away and never reads another request.
             Call::Subscribe => (Updater, Stream),
 
@@ -1193,6 +1262,7 @@ impl Call {
             Call::PolicyInstall(p) => encode(p),
             Call::PolicyFetch(p) => encode(p),
             Call::PolicySearch(p) => encode(p),
+            Call::AccountLogin(p) => encode(p),
             Call::RobotSound(p) => encode(p),
             Call::RobotTheremin(p) => encode(p),
             Call::RobotChorale(p) => encode(p),
@@ -1222,6 +1292,8 @@ impl Call {
             | Call::RobotPolicies
             | Call::RobotReloadPolicies
             | Call::PolicyCheck
+            | Call::AccountStatus
+            | Call::AccountLogout
             | Call::RobotMode => Value::Object(serde_json::Map::new()),
             Call::NetStatus
             | Call::NetScan
@@ -1292,6 +1364,9 @@ impl Call {
             method::POLICY_INSTALL => Call::PolicyInstall(decode(params)?),
             method::POLICY_FETCH => Call::PolicyFetch(decode(params)?),
             method::POLICY_SEARCH => Call::PolicySearch(decode(params)?),
+            method::ACCOUNT_LOGIN => Call::AccountLogin(decode(params)?),
+            method::ACCOUNT_STATUS => Call::AccountStatus,
+            method::ACCOUNT_LOGOUT => Call::AccountLogout,
             method::ROBOT_SUBSCRIBE => Call::RobotSubscribe(decode(params)?),
             method::NET_STATUS => Call::NetStatus,
             method::NET_SCAN => Call::NetScan,
@@ -1447,6 +1522,9 @@ pub mod test_support {
             Call::PolicySearch(PolicySearchParams {
                 query: "microduck".into(),
             }),
+            Call::AccountLogin(AccountLoginParams { force: false }),
+            Call::AccountStatus,
+            Call::AccountLogout,
             Call::RobotLoadPolicy(LoadPolicyParams {
                 slot: Some("walk".into()),
                 path: Some("/var/lib/robot/policies/bouncy.onnx".into()),
@@ -2210,6 +2288,99 @@ pub struct PolicyFetchResult {
 #[serde(default, deny_unknown_fields)]
 pub struct PolicySearchParams {
     pub query: String,
+}
+
+/// What to pass [`Call::AccountLogin`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccountLoginParams {
+    /// Sign in even though this robot already belongs to an account, or is already waiting for
+    /// a code to be approved.
+    ///
+    /// Without it, a robot that is already signed in refuses with [`code::INVALID_PARAMS`] naming
+    /// the account it belongs to, and one with a live code refuses with [`code::BUSY`]. The
+    /// second is the same permission as the first in a smaller size — replacing an *attempt* at
+    /// belonging to somebody — and it is the only way out of a code nobody is going to approve
+    /// that does not mean signing the robot out or waiting five minutes for it to expire.
+    ///
+    /// A superseded login is inert: it keeps its device code, and if Hugging Face approves it
+    /// later the answer is dropped rather than written. That is not ceremony: `account.login` is routed to BLE and to a
+    /// datachannel, so on a LAN anybody who can reach the robot can start one — and a login that
+    /// silently replaced the owner would convert "was on the wifi once" into remote access that
+    /// outlives being there. Taking a robot from its owner should require saying so.
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// Answer to [`Call::AccountLogin`], and the `login` member of [`AccountStatusResult`].
+///
+/// RFC 8628: show `user_code` to a person, send them to `verification_uri`, and poll
+/// [`Call::AccountStatus`] until it says who signed in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountLoginResult {
+    /// The short code somebody types. Display it prominently — see the note on
+    /// `verification_uri_complete`.
+    pub user_code: String,
+    /// Where they type it.
+    pub verification_uri: String,
+    /// RFC 8628's "page that needs no code typed into it", when a server sends one.
+    ///
+    /// **Hugging Face does not, and today this is `verification_uri` unchanged.** An earlier
+    /// version of the robot appended `?user_code=`; HF's device page ignores the parameter and
+    /// prefills nothing, so that URL read as a promise the page then broke. The field stays
+    /// because it is the protocol's — a server that starts sending a real one is used with no
+    /// wire change — which means a client must treat it as "somewhere to send them", not as
+    /// "the code is handled".
+    ///
+    /// So whatever this says, a client **leads with the code and never opens a browser by
+    /// itself**. The mini's app learned that the expensive way: auto-switching to Safari hid the
+    /// code before the user could read it, and the page asks them to type it anyway.
+    pub verification_uri_complete: String,
+    /// How long the code is good for. In [`AccountStatusResult`] this is what is *left*.
+    pub expires_in: u64,
+    /// How often the robot polls Hugging Face, in seconds. Informational — the robot does the
+    /// polling. A client polls [`Call::AccountStatus`] at whatever rate suits it.
+    pub interval: u64,
+}
+
+/// Answer to [`Call::AccountStatus`].
+///
+/// Three independent facts rather than one state, because they genuinely are: a `force` login can
+/// be in flight while the robot still belongs to the previous account, and a login that failed
+/// leaves both the previous account and a reason.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountStatusResult {
+    /// Who this robot belongs to. `None` means it belongs to nobody and cannot be reached from
+    /// outside its LAN.
+    pub account: Option<Account>,
+    /// A login in flight, with the code still to be approved and the time it has left.
+    pub login: Option<AccountLoginResult>,
+    /// Why the last login attempt failed, when one did and nothing has superseded it.
+    pub last_error: Option<String>,
+}
+
+/// The account a robot belongs to, in [`AccountStatusResult`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Account {
+    /// The Hugging Face username, as `/oauth/userinfo` reports it. What to show a person.
+    pub username: String,
+    /// Seconds until the stored access token expires, negative once it has.
+    ///
+    /// Present so a client can say "signed in, but this robot has not been online in a month"
+    /// rather than only discovering it when the robot stops appearing. The robot refreshes on its
+    /// own well before this reaches zero; it going negative means the robot could not.
+    pub token_expires_in: i64,
+    /// Whether a refresh token is stored, so an expiring access token can be renewed without
+    /// anybody signing in again.
+    pub refreshable: bool,
+}
+
+/// Answer to [`Call::AccountLogout`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountLogoutResult {
+    /// Who it was signed in as, or `None` if it was not signed in at all — so a client can tell
+    /// "signed out" from "there was nothing to sign out of" without asking first.
+    pub was: Option<String>,
 }
 
 /// Answer to [`Call::PolicySearch`].
@@ -4465,7 +4636,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            58,
+            61,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }
@@ -4679,6 +4850,12 @@ mod tests {
                 // list: asking what exists is inspection, and support has to be able to ask it
                 // on a robot it may not change.
                 method::POLICY_FETCH,
+                // Binding the robot to an account, and unbinding it. On this list for a reason
+                // none of the others share: it decides who can reach the robot from outside the
+                // building, and it survives every reboot. `account.status` must stay off it —
+                // which account a robot thinks it belongs to is the first thing support asks.
+                method::ACCOUNT_LOGIN,
+                method::ACCOUNT_LOGOUT,
                 method::NET_CONNECT,
                 method::NET_FORGET,
                 method::SYSTEM_SET_NAME,

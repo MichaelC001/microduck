@@ -320,6 +320,13 @@ out:
 - **`update.*` mutations.** For now only, and for a different reason than the PIN: applying an
   update restarts `mediad` and drops the session. Wanted later; §8 is what it will take.
 
+And one category came *in* that is worth naming here rather than only in the route table:
+**`account.*`**, the calls that bind this robot to a Hugging Face account. They are the first
+mutating calls this transport carries, and the console is where somebody would sign a robot in.
+It is also the only thing here whose effect outlives the session in the way an account does —
+[`remote-access-design.md`](remote-access-design.md) §2.6 is the argument and the three
+properties that make it hold, and `mediad::route` carries the short version.
+
 ### Replies are not correlated, deliberately
 
 `btd` forwards whatever a socket emits without parsing it, and has a test pinning that: a
@@ -383,9 +390,15 @@ Two properties follow, and both are the reason for this shape:
 
 - **Local mode never depends on the bridge.** If the rendezvous service is down, a LAN client still
   connects. Invariant 1 in `architecture.md` — local recovery stays independent — extends to media.
-- **The bridge parses nothing.** It proxies the gst signalling protocol, which is the same protocol
-  a LAN client speaks. That is the concrete payoff for using `webrtcsink` rather than `webrtcbin`:
-  the protocol already exists, so the bridge is a relay rather than a translator.
+- **The bridge invents no protocol.** The envelopes are the gst signalling protocol's, which is what
+  a LAN client already speaks, so the payload — SDP and ICE — passes through opaque. That is the
+  concrete payoff for using `webrtcsink` rather than `webrtcbin`.
+
+  It does **not** follow that the bridge is a pure relay, and this bullet used to say it was.
+  `reachy_mini`'s rendezvous carries those envelopes over HTTP — SSE inbound, `POST` outbound —
+  rather than over a WebSocket, and peer and session ids are per-hop. So the bridge rewrites the
+  envelope and keeps a session table both ways: a translator with an opaque payload.
+  [`remote-access-design.md`](remote-access-design.md) §3.2 has the two sides side by side.
 
 - **The bridge authenticates, so the robot does not have to.** The relay connects *outward* holding
   an account token, and the service shows a client only the robots its account owns — so a bridged
@@ -396,9 +409,11 @@ Two properties follow, and both are the reason for this shape:
   on the difference. Nothing is foreclosed if that stops being true.
 
 `reachy_mini` runs exactly this arrangement against a Hugging Face Space, with the robot
-registering as a `producer` and the Space keeping a TTL lease refreshed by a heartbeat. Whether we
-adopt that service, and how a robot is bound to an account, is out of scope here and stays out
-until local mode works.
+registering as a `producer` and the Space keeping a TTL lease refreshed by a heartbeat. Local mode
+works now, so the two questions this section left open — whether we adopt that service, and how a
+robot is bound to an account — are open no longer for want of asking:
+[`remote-access-design.md`](remote-access-design.md) owns both, and the account is a Hugging Face
+OAuth **device** flow rather than the redirect flow `reachy_mini` uses (§2.1 for why).
 
 ### The signalling protocol, for whoever writes the bridge
 
