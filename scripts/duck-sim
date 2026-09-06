@@ -257,6 +257,7 @@ TOML
                 setsid nohup "$REPO/target/debug/mediad" \
                 --sim-camera "127.0.0.1:$((FRAME_PORT + i))" \
                 --config "$STATE/mediad-$name.toml" \
+                --robot-socket "$STATE/$name.sock" --tof-socket "$STATE/$name-tof.sock" \
                 --port $((8443 + i)) --web-port $((8080 + i)) \
                 > "$STATE/$name-media.log" 2>&1 &
             echo $! > "$STATE/$name-media.pid"

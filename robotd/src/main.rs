@@ -1089,6 +1089,7 @@ fn spawn_control_thread(
                     state,
                     intents,
                     params,
+                    params_path,
                     period,
                     poweroff,
                 ));

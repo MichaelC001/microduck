@@ -114,6 +114,45 @@ struct Args {
     /// Worth it only for a consumer that cannot rotate for itself.
     #[arg(long)]
     flip_in_pipeline: bool,
+
+    /// Where the daemons listen, when not at `proto::socket`'s paths.
+    ///
+    /// On a robot the defaults are right and none of these is ever typed. They exist for the twin
+    /// (`scripts/duck-sim`), where every duck's `robotd` and `tofd` listen under a per-duck state
+    /// directory — without them a peer's `control` channel reaches a `mediad` whose routes all end
+    /// at `/run/*.sock`, and every call but `media.video` answers "not answering".
+    #[arg(long)]
+    robot_socket: Option<std::path::PathBuf>,
+    #[arg(long)]
+    tof_socket: Option<std::path::PathBuf>,
+    #[arg(long)]
+    config_socket: Option<std::path::PathBuf>,
+    #[arg(long)]
+    pad_socket: Option<std::path::PathBuf>,
+    #[arg(long)]
+    updater_socket: Option<std::path::PathBuf>,
+}
+
+impl Args {
+    fn sockets(&self) -> mediad::upstream::Sockets {
+        let mut s = mediad::upstream::Sockets::default();
+        if let Some(p) = &self.robot_socket {
+            s.robot = p.clone();
+        }
+        if let Some(p) = &self.tof_socket {
+            s.tof = p.clone();
+        }
+        if let Some(p) = &self.config_socket {
+            s.config = p.clone();
+        }
+        if let Some(p) = &self.pad_socket {
+            s.pad = p.clone();
+        }
+        if let Some(p) = &self.updater_socket {
+            s.updater = p.clone();
+        }
+        s
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -219,9 +258,9 @@ fn main() -> ExitCode {
         // producer that registered without a name would keep it until this daemon restarts. Costs a
         // unix-socket round trip on a boot where `configd` may not be up yet, which is why it is
         // bounded and why a failure is a warning rather than an exit.
+        let sockets = args.sockets();
         let producer =
-            mediad::producer::Producer::learn(Default::default(), duck_ipc_proto::build_info!())
-                .await;
+            mediad::producer::Producer::learn(sockets.clone(), duck_ipc_proto::build_info!()).await;
         tracing::info!(
             name = producer.name.as_deref().unwrap_or("unknown"),
             release = %producer.release,
@@ -350,7 +389,7 @@ fn main() -> ExitCode {
         // telemetry — which is the same reason a session keeps one connection per lane.
         while let Some(channel) = channels.recv().await {
             let (replies_tx, mut replies_rx) = tokio::sync::mpsc::channel::<String>(256);
-            let pool = mediad::upstream::Pool::new(Default::default(), replies_tx);
+            let pool = mediad::upstream::Pool::new(sockets.clone(), replies_tx);
 
             let to_peer = channel.outbound.clone();
             tokio::spawn(async move {

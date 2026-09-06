@@ -433,6 +433,7 @@ fn sim_loop(
                 let _ = frames.send(proto::TofFrame {
                     seq,
                     at_us: started.elapsed().as_micros() as u64,
+                    t_ns: proto::clock::monotonic_ns(),
                     rows: depth.rows,
                     cols: depth.cols,
                     distance_mm: depth.distance_mm,
