@@ -273,7 +273,26 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// older `robotctl` against this `configd` prints no `units` block at all rather than a wrong one.
 /// Both come out of the same release and an apply restarts both, so the skew lasts as long as the
 /// update does; a board left mid-update sees a missing block, not a lie.
-pub const API_VERSION: u32 = 23;
+///
+/// # v24 — a clock every stream shares, and what a map needs from the robot
+///
+/// Three additive fields and one read, for a mapper that pairs a camera frame with the joint
+/// angles and depth cells of the same instant (`docs/design/robotd-design.md` §mapping):
+///
+/// - [`RobotState::t_ns`] and [`TofFrame::t_ns`] are the same `CLOCK_MONOTONIC`, nanoseconds,
+///   so a sample from `robotd` and a frame from `tofd` can be put on one axis without guessing
+///   the offset between two daemons' start times. `t` and `at_us` stay as they were.
+/// - [`RobotState::imu`] is the trunk IMU as the loop sees it: gyro and orientation, not only
+///   the projected gravity [`SafetyState`] already carried. [`RobotState::frames`] is the
+///   camera and ToF sensor pose in the trunk frame, from the same head FK `robot.look` uses —
+///   published so no client has to carry a copy of the kinematics.
+/// - `robot.model` ([`ModelResult`]) answers the static geometry those poses are stated in.
+///
+/// `mediad`'s `media.video` answer gains `mono_ns` and `real_ns`, the two clocks read at the
+/// same instant, so a peer can put RTP timestamps (whose RTCP sender reports are wall-clock)
+/// onto the same monotonic axis. Additive everywhere: an older client ignores fields it does
+/// not know, and an older daemon leaves them at their defaults (zero, or absent).
+pub const API_VERSION: u32 = 24;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -546,6 +565,10 @@ pub mod method {
     /// Distinct from [`ROBOT_MODE`], which says which *set* of slots is in play. This says what
     /// is in them — and, when a load failed, what is in them instead of what was asked for.
     pub const ROBOT_POLICIES: &str = "robot.policies";
+
+    /// The static geometry [`RobotState::frames`] and [`TofFrame`] are stated in — see
+    /// [`ModelResult`]. A read; asked once per session.
+    pub const ROBOT_MODEL: &str = "robot.model";
 
     /// Put a different `.onnx` in one slot, or drop an override and go back to the default.
     ///
@@ -837,6 +860,8 @@ pub enum Call {
     RobotSetMode(SetModeParams),
     /// What each policy slot runs; see [`method::ROBOT_POLICIES`].
     RobotPolicies,
+    /// Static robot geometry for a mapper; see [`method::ROBOT_MODEL`].
+    RobotModel,
     /// Load one slot, or reset it; see [`method::ROBOT_LOAD_POLICY`].
     RobotLoadPolicy(LoadPolicyParams),
     /// Re-read every slot from disk; see [`method::ROBOT_RELOAD_POLICIES`].
@@ -991,6 +1016,7 @@ impl Call {
             Call::RobotMode => method::ROBOT_MODE,
             Call::RobotSetMode(_) => method::ROBOT_SET_MODE,
             Call::RobotPolicies => method::ROBOT_POLICIES,
+            Call::RobotModel => method::ROBOT_MODEL,
             Call::RobotLoadPolicy(_) => method::ROBOT_LOAD_POLICY,
             Call::RobotReloadPolicies => method::ROBOT_RELOAD_POLICIES,
             Call::PolicyCheck => method::POLICY_CHECK,
@@ -1138,6 +1164,7 @@ impl Call {
             | Call::RobotModelApi
             | Call::RobotRemoteSessionActive
             | Call::RobotPolicies
+            | Call::RobotModel
             | Call::RobotMode => (Robot, Prompt),
             // Intents and one-shot skills. All fast: they store a value the control loop reads on
             // its next tick, and none of them waits for the robot to finish anything.
@@ -1290,6 +1317,7 @@ impl Call {
             | Call::RobotRelax
             | Call::RobotShutdown
             | Call::RobotPolicies
+            | Call::RobotModel
             | Call::RobotReloadPolicies
             | Call::PolicyCheck
             | Call::AccountStatus
@@ -1358,6 +1386,7 @@ impl Call {
             method::ROBOT_MODE => Call::RobotMode,
             method::ROBOT_SET_MODE => Call::RobotSetMode(decode(params)?),
             method::ROBOT_POLICIES => Call::RobotPolicies,
+            method::ROBOT_MODEL => Call::RobotModel,
             method::ROBOT_LOAD_POLICY => Call::RobotLoadPolicy(decode(params)?),
             method::ROBOT_RELOAD_POLICIES => Call::RobotReloadPolicies,
             method::POLICY_CHECK => Call::PolicyCheck,
@@ -1509,6 +1538,7 @@ pub mod test_support {
             Call::RobotShutdown,
             Call::RobotMode,
             Call::RobotPolicies,
+            Call::RobotModel,
             Call::RobotReloadPolicies,
             Call::PolicyCheck,
             Call::PolicyInstall(PolicyInstallParams {
@@ -3252,6 +3282,78 @@ pub struct RobotState {
     /// state of a duck — see [`ChoraleState`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chorale: Option<ChoraleState>,
+    /// `CLOCK_MONOTONIC` at this tick, nanoseconds — the same clock as [`TofFrame::t_ns`], so a
+    /// mapper can put a state sample and a depth frame on one axis. Zero from a daemon predating
+    /// it; `t` is still the loop's own elapsed time. (v24)
+    #[serde(default)]
+    pub t_ns: u64,
+    /// The trunk IMU as the loop read it this tick. Absent from a daemon predating it, or while
+    /// no sensors have been read. (v24)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imu: Option<ImuState>,
+    /// Where the camera and the ToF sensor are in the trunk frame at this tick's measured head
+    /// joints, from the same head FK `robot.look` uses. Published so a client that pairs a picture
+    /// with a pose never carries its own copy of the kinematics. (v24)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frames: Option<FramesState>,
+}
+
+/// The trunk IMU, in [`RobotState::imu`]. Trunk frame: x forward, y left, z up.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ImuState {
+    /// Angular velocity, rad/s.
+    pub gyro: [f64; 3],
+    /// Orientation trunk → world, scalar-first `[w, x, y, z]`. The world is the IMU's own
+    /// gravity-aligned frame with an arbitrary yaw at boot — the same frame `odom` lives in.
+    pub quat: [f64; 4],
+}
+
+/// A pose in the trunk frame: position in metres, orientation scalar-first `[w, x, y, z]`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PoseState {
+    pub pos: [f64; 3],
+    pub quat: [f64; 4],
+}
+
+/// Sensor poses in the trunk frame, in [`RobotState::frames`].
+///
+/// Conventions, stated once: `camera` is the OpenCV camera frame (+x right, +y down, +z along
+/// the optical axis) — the frame intrinsics and a pixel's ray are expressed in. `tof` is the
+/// VL53L5CX/L8CX integration frame (+x along the optical axis, +y left, +z up), the frame
+/// [`ModelResult::tof_beams`] is stated in. Both come from `kinematics::head::HeadFk`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FramesState {
+    pub camera: PoseState,
+    pub tof: PoseState,
+}
+
+/// Answer to [`Call::RobotModel`]: the geometry that does not change while the robot runs.
+///
+/// Everything a mapper needs beyond the per-tick poses in [`RobotState::frames`], so that the
+/// kinematics stay in one place — the `kinematics` crate — and a laptop or a server asks rather
+/// than transcribes. Angles and distances in radians and metres.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ModelResult {
+    /// Which MJCF asset the numbers come from, e.g. `alpha`.
+    pub asset: String,
+    /// Height of the trunk origin above the floor when standing at rest.
+    pub trunk_height_m: f64,
+    /// Every joint, in [`RobotState::joints`] order.
+    pub joint_names: Vec<String>,
+    /// The four head joints in the order [`RobotState::head`] uses.
+    pub head_joints: Vec<String>,
+    /// Unit direction of each ToF zone in the sensor frame, row-major like
+    /// [`TofFrame::distance_mm`]: row 0 is the top of the grid, column 0 the sensor's left.
+    pub tof_beams: Vec<[f64; 3]>,
+    /// The sensor's field of view per axis, degrees.
+    pub tof_fov_deg: f64,
+    /// Sensor poses at every head joint zero — a fixed reference; the live ones are in
+    /// [`RobotState::frames`].
+    pub frames_at_zero: FramesState,
 }
 
 /// What the duck chorale is doing, in [`RobotState`].
@@ -4008,6 +4110,10 @@ pub struct TofFrame {
     /// Microseconds since `tofd` started — the sender's monotonic clock, like
     /// [`PadFrame::at_us`].
     pub at_us: u64,
+    /// `CLOCK_MONOTONIC` when the frame was read, nanoseconds — the clock
+    /// [`RobotState::t_ns`] shares. Zero from a `tofd` predating it. (v24)
+    #[serde(default)]
+    pub t_ns: u64,
     pub rows: u8,
     pub cols: u8,
     pub distance_mm: Vec<i16>,
@@ -4502,6 +4608,46 @@ macro_rules! log_startup_identity {
     }};
 }
 
+/// The clocks every daemon stamps with, so no two of them disagree about which clock
+/// "monotonic" means. Nanoseconds. `monotonic` is `CLOCK_MONOTONIC` — what
+/// [`RobotState::t_ns`] and [`TofFrame::t_ns`] carry; `realtime` is `CLOCK_REALTIME`, the
+/// clock RTCP sender reports are stated in, read together in `media.video` so a peer can
+/// relate the two.
+pub mod clock {
+    fn read(clock: libc::clockid_t) -> u64 {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `ts` is a valid, writable timespec and the clock ids are the constants libc
+        // exports for this platform.
+        let rc = unsafe { libc::clock_gettime(clock, &mut ts) };
+        debug_assert_eq!(rc, 0, "clock_gettime failed");
+        (ts.tv_sec as u64) * 1_000_000_000 + ts.tv_nsec as u64
+    }
+
+    /// `CLOCK_MONOTONIC`, nanoseconds.
+    pub fn monotonic_ns() -> u64 {
+        read(libc::CLOCK_MONOTONIC)
+    }
+
+    /// `CLOCK_REALTIME`, nanoseconds since the Unix epoch.
+    pub fn realtime_ns() -> u64 {
+        read(libc::CLOCK_REALTIME)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn monotonic_advances_and_realtime_is_this_century() {
+            let a = super::monotonic_ns();
+            let b = super::monotonic_ns();
+            assert!(b >= a);
+            assert!(super::realtime_ns() > 1_600_000_000_000_000_000);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::test_support::every_call;
@@ -4636,7 +4782,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            61,
+            62,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }
@@ -5216,6 +5362,9 @@ mod tests {
     fn the_theremin_block_is_absent_until_there_is_a_theremin() {
         let mut state = RobotState {
             t: 1.5,
+            t_ns: 0,
+            imu: None,
+            frames: None,
             movement: MoveState {
                 requested: [0.0; 3],
                 applied: [0.0; 3],
@@ -5273,6 +5422,9 @@ mod tests {
     fn robot_state_uses_the_documented_field_names() {
         let state = RobotState {
             t: 1.5,
+            t_ns: 0,
+            imu: None,
+            frames: None,
             movement: MoveState {
                 requested: [0.4, 0.0, 0.0],
                 applied: [0.15, 0.0, 0.0],

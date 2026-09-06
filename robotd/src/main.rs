@@ -2872,6 +2872,14 @@ async fn control_loop<T: RobotIo>(
                 },
                 theremin: theremin_state.clone(),
                 chorale: chorale_state.clone(),
+                t_ns: proto::clock::monotonic_ns(),
+                imu: Some(proto::ImuState {
+                    gyro: sensors.imu.gyro,
+                    quat: sensors.imu.quat,
+                }),
+                frames: Some(mapping::frames_at(mapping::head_joints_of(
+                    &sensors.positions,
+                ))),
             });
         }
 
@@ -3999,6 +4007,10 @@ fn dispatch(
         // What each slot is running, from where, and why it is not running what was asked. Served
         // from the snapshot the control loop publishes, so it answers during startup too rather
         // than racing the first load.
+        // The geometry the mapping fields of `robot.state` are stated in. Constant for the
+        // life of the process, read from the same asset the FK runs on.
+        proto::Call::RobotModel => proto::Response::ok(Some(id), &mapping::model()),
+
         proto::Call::RobotPolicies => proto::Response::ok(
             Some(id),
             &proto::PoliciesResult {
@@ -4268,6 +4280,96 @@ async fn shutdown() {
     tokio::select! {
         _ = term.recv() => {}
         _ = int.recv() => {}
+    }
+}
+
+/// What `robot.state` carries for a mapper, and what `robot.model` answers: sensor poses from
+/// the head FK, and the static geometry they are stated in. One place, the `kinematics` crate,
+/// so a laptop or a server that pairs a picture with a pose asks rather than transcribes.
+mod mapping {
+    use std::sync::LazyLock;
+
+    use duck_ipc_proto as proto;
+
+    static FK: LazyLock<kinematics::head::HeadFk> = LazyLock::new(kinematics::head::HeadFk::alpha);
+    static TOF: LazyLock<kinematics::tof::Reprojector> =
+        LazyLock::new(kinematics::tof::Reprojector::alpha);
+
+    /// The head joints, in [`kinematics::head::HeadFk`]'s order, out of a full joint vector.
+    const HEAD: [&str; 4] = ["neck_pitch", "head_pitch", "head_yaw", "head_roll"];
+
+    pub fn head_joints_of(positions: &[f64]) -> [f64; 4] {
+        let mut out = [0.0; 4];
+        for (slot, name) in out.iter_mut().zip(HEAD) {
+            if let Some(i) = proto::JOINT_NAMES.iter().position(|n| *n == name) {
+                *slot = positions.get(i).copied().unwrap_or(0.0);
+            }
+        }
+        out
+    }
+
+    fn pose(p: kinematics::Pose) -> proto::PoseState {
+        proto::PoseState {
+            pos: p.pos,
+            quat: p.quat.wxyz(),
+        }
+    }
+
+    pub fn frames_at(head: [f64; 4]) -> proto::FramesState {
+        proto::FramesState {
+            camera: pose(FK.camera_in_trunk_cv2(head)),
+            tof: pose(FK.tof_in_trunk(head)),
+        }
+    }
+
+    pub fn model() -> proto::ModelResult {
+        let model = kinematics::Model::alpha();
+        proto::ModelResult {
+            asset: "alpha".to_owned(),
+            trunk_height_m: model.trunk_height_m(),
+            joint_names: proto::JOINT_NAMES.iter().map(|s| (*s).to_owned()).collect(),
+            head_joints: HEAD.iter().map(|s| (*s).to_owned()).collect(),
+            tof_beams: TOF.beams().to_vec(),
+            tof_fov_deg: kinematics::tof::FOV_DEG,
+            frames_at_zero: frames_at([0.0; 4]),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn head_joints_come_out_of_the_wire_order() {
+            let mut joints = [0.0; 15];
+            joints[5] = 0.1;
+            joints[6] = 0.2;
+            joints[7] = 0.3;
+            joints[8] = 0.4;
+            assert_eq!(head_joints_of(&joints), [0.1, 0.2, 0.3, 0.4]);
+        }
+
+        #[test]
+        fn the_model_says_what_the_frames_are_stated_in() {
+            let m = model();
+            assert_eq!(m.tof_beams.len(), 64);
+            assert_eq!(m.joint_names.len(), 15);
+            assert!(m.trunk_height_m > 0.05 && m.trunk_height_m < 0.3);
+            // Camera and ToF are parallel, a couple of centimetres apart.
+            let f = m.frames_at_zero;
+            let d: f64 = (0..3)
+                .map(|i| (f.camera.pos[i] - f.tof.pos[i]).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            assert!(d > 0.01 && d < 0.05, "camera-tof distance {d}");
+        }
+
+        #[test]
+        fn frames_move_with_the_head() {
+            let a = frames_at([0.0; 4]).camera.pos;
+            let b = frames_at([0.0, 0.0, 1.0, 0.0]).camera.pos;
+            assert!(a != b);
+        }
     }
 }
 

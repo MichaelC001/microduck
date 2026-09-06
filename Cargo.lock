@@ -1079,6 +1079,7 @@ dependencies = [
 name = "duck-ipc-proto"
 version = "0.10.0"
 dependencies = [
+ "libc",
  "semver",
  "serde",
  "serde_json",

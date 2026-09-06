@@ -141,6 +141,9 @@ fn permits(call: &proto::Call) -> bool {
         // reads below, and a remote client watching a gait misbehave has an obvious use for it.
         RobotPolicies => true,
 
+        // The robot's static geometry, for a mapper on the other end of the video: a read.
+        RobotModel => true,
+
         // Re-reading the slots goes with loading one: a client that can change what drives the
         // robot wants the case where something else changed it too.
         RobotReloadPolicies => true,

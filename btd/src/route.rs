@@ -300,6 +300,9 @@ fn permits(call: &proto::Call) -> bool {
         // of skills to assume any more, so this is how a phone knows there is a bow to ask for.
         RobotPolicies => true,
 
+        // Static geometry, read-only; the same class of read as the one above.
+        RobotModel => true,
+
         // Re-reading the slots after something else edited the config. Same blast radius as
         // `robot.loadPolicy` and the same answer, and a client that can load wants this for the
         // case where the file changed underneath it.

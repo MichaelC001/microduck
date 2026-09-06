@@ -758,6 +758,7 @@ impl Server {
             | Call::RobotMode
             | Call::RobotSetMode(_)
             | Call::RobotPolicies
+            | Call::RobotModel
             | Call::RobotLoadPolicy(_)
             | Call::RobotReloadPolicies
             | Call::RobotSubscribe(_) => Response::err(
