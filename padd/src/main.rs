@@ -310,7 +310,7 @@ fn main() -> std::process::ExitCode {
         roller,
         "driving — Start once stands up, Start again toggles the policy, Y head mode, B body pose, \
          A ground pick, LB/RB kicks, DPad-Down sit, triggers mouth, DPad-Right reboot servos, \
-         DPad-Up (3s) walk/roller, Select (2s) shutdown"
+         DPad-Up (3s) walk/roller, Select torque off, Select (2s) shutdown"
     );
 
     let period = Duration::from_secs_f64(1.0 / args.hz as f64);
@@ -368,6 +368,7 @@ fn main() -> std::process::ExitCode {
         // Which bindable buttons went down this tick, by their config name. A list rather than
         // a flag apiece, because what each one runs is config now and this loop no longer knows.
         let mut pressed: Vec<&'static str> = Vec::new();
+        let mut relax = false;
         let mut reboot_motors = false;
         while let Some(event) = gilrs.next_event() {
             if let gilrs::EventType::ButtonPressed(button, _) = event.event {
@@ -386,6 +387,8 @@ fn main() -> std::process::ExitCode {
                     Button::LeftTrigger => pressed.push("lb"),
                     Button::RightTrigger => pressed.push("rb"),
                     Button::DPadDown => pressed.push("dpad_down"),
+                    // Emergency release: torque off. Held on, it is still the shutdown below.
+                    Button::Select => relax = true,
                     // Reboot the servos: the way back from a tripped overload without pulling
                     // the battery.
                     Button::DPadRight => reboot_motors = true,
@@ -532,6 +535,17 @@ fn main() -> std::process::ExitCode {
         {
             tracing::error!(error = %e, "send failed");
             return std::process::ExitCode::FAILURE;
+        }
+
+        if relax {
+            tracing::warn!("Select — robot.relax: torque off");
+            // Torque off leaves the robot limp, so the next Start stands it up again rather
+            // than toggling the policy on a robot that is lying on the floor.
+            up = false;
+            if let Err(e) = request(&mut stream, &mut next_id, &proto::Call::RobotRelax) {
+                tracing::error!(error = %e, "relax request failed");
+                return std::process::ExitCode::FAILURE;
+            }
         }
 
         if reboot_motors {
