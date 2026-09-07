@@ -725,9 +725,29 @@ robot unexplained.
 
 **And the transport is the one thing this cannot prove from a Space yet.** The control channel is
 SCTP over the same candidate pair as the media, so §6's dead TURN endpoint takes the click with
-it: from a data centre the session negotiates and may then carry nothing. It works from a laptop
-on the robot's own network, which is what the file's `__main__` is for, and it is why the status
-line names the stage it reached rather than saying "connecting…".
+it: from a data centre the session negotiates and may then carry nothing. That is why the status
+line names the stage it reached rather than saying "connecting…" — and why the page has a second
+way in.
+
+**`lan.py` is that second way, and it is a transport rather than a second design.** The robot is
+already serving `webrtcsink`'s signalling server at `ws://<robot>:8443` — the one the console
+talks to — and it carries the same gst envelopes the rendezvous carries over SSE and `POST /send`.
+So one hop is swapped and nothing above it changes: the same `control` channel, the same JSON-RPC,
+the same buttons, and the page holds either consumer without asking which. §3.2's table is the
+whole of the difference, and swapping in the direction of the LAN removes rather than adds — no
+account, no lease, no rendezvous, no relay, host candidates on both sides.
+
+Which turns out to be worth more than a workaround for a dead DNS record, and it is the argument
+for keeping it after §6 is fixed: **it separates the transport from everything else.** A click
+that works on the LAN and not through the rendezvous has told you which layer to look at, and
+that answer was previously a guess.
+
+Its one cost is that it is hand-written where the rendezvous half was inherited: a dozen envelope
+shapes read off `net/webrtc/protocol` and the console page, and getting one wrong produces silence
+rather than an error. So `python lan.py` stands up a producer on loopback that speaks the same
+protocol and drives a real session against it — welcome, list, `startSession`, an offer answered,
+DTLS, SCTP, the channel, a call matched to its reply. Two aiortc peers on `127.0.0.1` are not a
+duck; they are the same protocol, which is the part that fails quietly.
 
 ## 6. NAT: STUN on both ends, and the robot offers the relay — **decided**
 

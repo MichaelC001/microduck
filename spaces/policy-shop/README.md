@@ -53,22 +53,42 @@ A `perpetual` policy has no length of its own, so a one-shot made out of one is 
 unwind. `robotctl policy add` refuses without `--hold` rather than picking a number; this page asks
 instead, and that is the seconds box above the rows.
 
-## Two things that will bite before the robot does
+## Two ways in, and right now only one of them works
 
-**Media may not connect from a data centre, and that is not a fault here.** A relay candidate needs
-`turn.fastrtc.org`, which has no A record and whose zone has no NS records at all
-(`remote-access-design.md` §6), so a session falls back to host and srflx — often enough to punch
-a hole between a home router and a container, and often enough not. The control channel is SCTP
-over that same candidate pair, so when it does not punch, nothing here works and the status line
-says which stage was reached rather than "connecting…". Running this file on a laptop on the
-robot's own network is the way through:
+**From anywhere** is the rendezvous: the robot registers as a producer holding its account token,
+this signs in as the visitor, and the service pairs them. It is the path that reaches a duck behind
+its owner's router, and it needs a candidate pair that works — which today it may not have.
+`turn.fastrtc.org` has no A record and its zone has no NS records at all
+(`remote-access-design.md` §6), so neither side offers a `relay` and a session between a home
+router and a data centre falls back to host and srflx. Often that punches a hole. Often it does
+not, and because the control channel is SCTP over the same candidate pair, when it does not punch
+nothing here works at all. The status line names the stage it reached instead of saying
+"connecting…", so this failure is legible rather than mysterious.
+
+**On this network** needs none of that. `mediad` is already serving `webrtcsink`'s signalling
+server on `ws://<robot>:8443` — it is what the robot's own console talks to — and it carries the
+same gst envelopes the rendezvous carries over SSE and `POST /send`. So `lan.py` is one hop
+swapped and nothing above it changed: same `control` channel, same JSON-RPC, same buttons. No
+account, no lease, no rendezvous, no relay, and on one network both sides offer host candidates.
+
+That makes it the useful thing to reach for when a click does not work and nobody knows which
+layer to blame. **If it works on the LAN and not through the rendezvous, the transport is the
+problem** and nothing about the policy, the manifest or the robot is.
+
+A Space in a data centre cannot reach a LAN, so that tab is for running this file yourself:
 
 ```bash
-HF_TOKEN=hf_… python app.py
+uv run --with-requirements requirements.txt app.py
 ```
 
-**One consumer at a time.** The rendezvous's rule, not a simplification: while this Space holds a
-session, the robot's own console cannot open one, and neither can the vision demo.
+There is no `pyproject.toml` here on purpose — the Space's dependencies are `requirements.txt`,
+which is what Hugging Face installs, and a second copy of the same list is a second copy to get
+wrong. `DUCK_HOST` pre-fills the address box, and `HF_TOKEN` stands in for the sign-in.
+
+**One consumer at a time.** The rendezvous's rule, not a simplification: while this holds a
+session, the robot's own console cannot open one, and neither can the vision demo. The LAN
+transport is subject to the same thing for a different reason — one `webrtcsink` session per
+consumer slot — so *disconnect* before opening the console.
 
 ## Identity
 
@@ -86,5 +106,11 @@ names it does not serve. §5.1 has the other half, which is theirs.
 ## Checking it without a robot
 
 `python catalogue.py` prints what a duck would be offered — every policy on the Hub, what it
-claims, which ones are refused and why. That is the half of this Space that needs no token, no
+claims, which ones are refused and why. That is the half of this page that needs no token, no
 session and no hardware.
+
+`python lan.py` stands up a producer on loopback that speaks what `webrtcsink`'s signaller speaks
+and drives a real session against it: welcome, list, startSession, an offer answered, DTLS, SCTP,
+the `control` channel, and a call matched to its reply. Two aiortc peers on `127.0.0.1` are not a
+duck — they are the same protocol, and a dozen hand-written envelope shapes are exactly the thing
+that fails silently rather than loudly.

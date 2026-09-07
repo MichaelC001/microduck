@@ -69,7 +69,10 @@ class Rpc:
     def __init__(self, timeout: float = 30.0):
         self.timeout = timeout
         self._ids = itertools.count(1)
-        self._pending: dict[int, Future] = {}
+        # The method rides along with the future so a refusal can name what was refused: a
+        # reply carries an id and nothing else, and "call: no such method" is a worse sentence
+        # than "robot.setSkill: no such method" for the sake of one tuple.
+        self._pending: dict[int, tuple[str, Future]] = {}
         self._lock = threading.Lock()
         self._send: Callable[[dict[str, Any]], bool] | None = None
         # The last one of each notification, and a short transcript. A duck streams `robot.state`
@@ -103,7 +106,7 @@ class Rpc:
         call_id = next(self._ids)
         future: Future = Future()
         with self._lock:
-            self._pending[call_id] = future
+            self._pending[call_id] = (method, future)
         self.transcript.append(f"→ {method} {json.dumps(params or {})}")
 
         if not send({"jsonrpc": "2.0", "id": call_id, "method": method, "params": params or {}}):
@@ -141,15 +144,16 @@ class Rpc:
             return
 
         with self._lock:
-            future = self._pending.pop(call_id, None)
-        if future is None:
+            waiting = self._pending.pop(call_id, None)
+        if waiting is None:
             # A duck does not correlate replies (`remote-webrtc.md` §5), so this is ordinary:
             # a fire-and-forget intent's answer, or one that arrived after its timeout.
             return
+        method, future = waiting
         if "error" in message:
             error = message["error"] or {}
             self.transcript.append(f"← error {error.get('message')}")
-            future.set_exception(RpcError("call", error))
+            future.set_exception(RpcError(method, error))
         else:
             result = message.get("result")
             self.transcript.append(f"← {json.dumps(result)[:200]}")
@@ -160,9 +164,9 @@ class Rpc:
         with self._lock:
             pending, self._pending = self._pending, {}
             self._send = None
-        for future in pending.values():
+        for method, future in pending.values():
             if not future.done():
-                future.set_exception(RpcError("call", {"message": why}))
+                future.set_exception(RpcError(method, {"message": why}))
 
 
 class DuckConsumer(ReachyCentralConsumer):

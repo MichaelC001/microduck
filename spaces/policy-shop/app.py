@@ -34,6 +34,7 @@ Space holds a session, the robot's own console cannot open one, and the vision d
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import threading
 import time
@@ -41,12 +42,14 @@ from dataclasses import dataclass
 from typing import Any
 
 import gradio as gr
+import numpy as np
 import requests
 from reachy_mini.media.central_consumer import DEFAULT_CENTRAL_URL
 
 import catalogue
 from catalogue import Policy
 from control import DuckConsumer, Rpc, RpcError
+from lan import DEFAULT_SIGNALLING_PORT, LanConsumer
 
 # `meta.kind`, which is on the wire so that one client can list two families of robot without
 # opening a session to ask what it found. Filtering on it is §5.1's whole point: their clients
@@ -84,12 +87,16 @@ class Link:
     marshalled back onto it.
     """
 
-    consumer: DuckConsumer | None = None
+    consumer: DuckConsumer | LanConsumer | None = None
     loop: asyncio.AbstractEventLoop | None = None
     rpc: Rpc | None = None
     robot: str | None = None
     error: str | None = None
     started_at: float | None = None
+    # Which hop got us here. The two transports fail for entirely different reasons — one can be
+    # defeated by a NAT and the other cannot — so a status line that does not say which one it is
+    # describing is describing nothing.
+    over_lan: bool = False
 
     def __post_init__(self) -> None:
         self.lock = threading.Lock()
@@ -153,10 +160,52 @@ class Link:
 
     # ── the session ──────────────────────────────────────────────────────────
 
-    def connect(self, token: str, peer_id: str, label: str) -> str:
+    def through_rendezvous(self, token: str, peer_id: str, label: str) -> str:
+        """From anywhere, if a candidate pair works. §3 is the path; §6 is why it may not."""
+        return self._open(
+            label,
+            over_lan=False,
+            build=lambda rpc: DuckConsumer(
+                hf_token=token,
+                # **Pinned, not matched by name.** Their auto-pick falls back to the only visible
+                # producer whatever it is called, so a name that does not match can still hand
+                # this page somebody's mini. The listing already knows the id.
+                robot_peer_id=peer_id,
+                consumer_label=f"microduck-policy-shop/{os.environ.get('SPACE_ID', 'local')}",
+                rpc=rpc,
+            ),
+        )
+
+    def over_the_lan(self, host: str) -> str:
+        """From the robot's own network, needing no account and no relay.
+
+        The address is all this takes: `mediad` is already serving the signalling server the
+        console talks to, and on one network ICE has host candidates on both sides.
+        """
+        typed = (host or "").strip()
+        if not typed:
+            return "type the robot's address — a hostname like `olducky.local`, or its IP."
+
+        # **A pasted URL keeps its host and loses its port.** What is in somebody's clipboard is
+        # `http://olducky.local:8080/` from opening the console, and 8080 is the page's port, not
+        # the signaller's — dialling it gets an HTTP server that will not upgrade, which is a
+        # confusing way to learn you pasted the wrong thing. A bare `host:port` is somebody being
+        # deliberate, so that one is honoured.
+        pasted = typed.startswith(("http://", "https://", "ws://", "wss://"))
+        address = typed.split("//")[-1].split("/")[0]
+        port = DEFAULT_SIGNALLING_PORT
+        if ":" in address:
+            address, _, given = address.partition(":")
+            if given.isdigit() and not pasted:
+                port = int(given)
+        return self._open(
+            address, over_lan=True, build=lambda rpc: LanConsumer(address, rpc, port)
+        )
+
+    def _open(self, label: str, over_lan: bool, build: Any) -> str:
         with self.lock:
             if self.consumer is not None:
-                return f"already connected to {self.robot}"
+                return f"already connected to {self.robot} — disconnect first"
 
             self.error = None
             rpc = Rpc()
@@ -164,24 +213,25 @@ class Link:
             thread = threading.Thread(target=loop.run_forever, name="duck-consumer", daemon=True)
             thread.start()
 
-            consumer = DuckConsumer(
-                hf_token=token,
-                # **Pinned, not matched by name.** Their auto-pick falls back to the only visible
-                # producer whatever it is called, so a name that does not match can still hand
-                # this Space somebody's mini. The listing above already knows the id.
-                robot_peer_id=peer_id,
-                consumer_label=f"microduck-policy-shop/{os.environ.get('SPACE_ID', 'local')}",
-                rpc=rpc,
-            )
+            consumer = build(rpc)
+            starting = asyncio.run_coroutine_threadsafe(consumer.start(), loop)
             try:
-                asyncio.run_coroutine_threadsafe(consumer.start(), loop).result(timeout=30)
+                starting.result(timeout=30)
             except Exception as e:  # noqa: BLE001 - reported, never raised into a UI callback
-                self.error = f"{type(e).__name__}: {e}"
+                # `TimeoutError` arrives with an empty message, which would print as a colon and
+                # nothing — the type name is the whole of what it has to say.
+                self.error = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+                # Unwind before stopping the loop: a half-open connect leaves an aiohttp session
+                # behind, and stopping the loop under it is how "Unclosed client session" ends up
+                # on somebody's terminal instead of an explanation.
+                starting.cancel()
+                with contextlib.suppress(Exception):
+                    asyncio.run_coroutine_threadsafe(consumer.stop(), loop).result(timeout=5)
                 loop.call_soon_threadsafe(loop.stop)
-                return f"could not start: {self.error}"
+                return f"could not reach {label}: {self.error}"
 
             self.consumer, self.loop, self.rpc = consumer, loop, rpc
-            self.robot, self.started_at = label, time.monotonic()
+            self.robot, self.started_at, self.over_lan = label, time.monotonic(), over_lan
 
         # Blocking here rather than leaving the page to poll: nothing below the buttons can be
         # answered until the channel is open, and a page that says "connected" while every call
@@ -189,7 +239,11 @@ class Link:
         deadline = time.monotonic() + 60
         while time.monotonic() < deadline:
             if rpc.is_open():
-                return f"connected to {label}, control channel open"
+                named = (self.consumer.meta or {}).get("name") if over_lan else None
+                self.robot = named or label
+                return f"connected to {self.robot}, control channel open"
+            if getattr(consumer, "error", None):
+                return f"**{consumer.error}**"
             time.sleep(0.5)
         return self.describe()
 
@@ -197,7 +251,7 @@ class Link:
         with self.lock:
             consumer, loop, rpc = self.consumer, self.loop, self.rpc
             self.consumer, self.loop, self.rpc = None, None, None
-            self.robot, self.started_at = None, None
+            self.robot, self.started_at, self.over_lan = None, None, False
         if rpc is not None:
             rpc.abandon("disconnected")
         if consumer is None or loop is None:
@@ -238,12 +292,20 @@ class Link:
                 "one at a time, and the robot's own console counts."
             )
         if state != "connected":
+            if self.over_lan:
+                return (
+                    f"**signalling worked and the peer connection has not** — session "
+                    f"`{session[:8]}`, state `{state}` after {waited:.0f}s. On one network that is "
+                    "not a NAT problem: it is a firewall between here and the robot's UDP ports, "
+                    "or DTLS failing to agree a cipher — `journalctl -u mediad -b` is where the "
+                    "robot's half of it is."
+                )
             return (
                 f"**signalling worked and the peer connection has not** — session "
                 f"`{session[:8]}`, state `{state}` after {waited:.0f}s. This is the case a data "
                 "centre is expected to hit: neither side offers a `relay` candidate, because the "
-                "TURN credentials endpoint has no DNS (§6). Running this file on the robot's own "
-                "network is the way through."
+                "TURN credentials endpoint has no DNS (§6). *connect over the LAN* is the way "
+                "through until that is fixed."
             )
         if rpc is None or not rpc.is_open():
             return (
@@ -251,10 +313,33 @@ class Link:
                 f"{status.get('frames') or 0} frames. Media crossed and `control` did not open, "
                 "which is a duck running a daemon that opens no data channel."
             )
+        where = status.get("transport") or "the rendezvous"
         return (
-            f"**connected to {self.robot}** — session `{session[:8]}`, "
+            f"**connected to {self.robot}** over {where} — session `{session[:8]}`, "
             f"{status.get('frames') or 0} frames, control channel open."
         )
+
+    def picture(self) -> Any:
+        """The newest frame, turned the way the robot is looking.
+
+        The camera is mounted a quarter turn off and nothing on the robot rotates the pixels —
+        `media.video` carries `rotate` for exactly that, and the control channel sends it once
+        when it opens. So the angle is asked for rather than compiled in, and a robot whose
+        `--rotate` changes needs no edit here.
+        """
+        consumer, rpc = self.consumer, self.rpc
+        if consumer is None:
+            return None
+        frame = consumer.latest_frame()
+        if frame is None:
+            return None
+        picture = frame[1]
+        video = (rpc.notifications.get("media.video") if rpc else None) or {}
+        degrees = int(video.get("rotate") or 0) % 360
+        if degrees:
+            # `np.rot90` counts anticlockwise and the mount is measured clockwise.
+            picture = np.ascontiguousarray(np.rot90(picture, k=-(degrees // 90)))
+        return picture
 
     def transcript(self) -> str:
         rpc = self.rpc
@@ -553,7 +638,7 @@ def open_session(peer_id: str | None, oauth: gr.OAuthToken | None) -> str:
     token = token_of(oauth)
     if not token:
         return "sign in with Hugging Face, or set an `HF_TOKEN` secret on this Space."
-    return LINK.connect(token, peer_id, NAMES.get(peer_id, peer_id))
+    return LINK.through_rendezvous(token, peer_id, NAMES.get(peer_id, peer_id))
 
 
 with gr.Blocks(title="microduck policy shop") as demo:
@@ -570,11 +655,34 @@ with gr.Blocks(title="microduck policy shop") as demo:
         """
     )
 
+    with gr.Tab("from anywhere"):
+        gr.Markdown(
+            "Through the rendezvous, which reaches a duck behind its owner's router. It needs a "
+            "candidate pair that works, and while `turn.fastrtc.org` has no DNS (§6) there may "
+            "not be one from a data centre — the tab beside this one needs no relay at all."
+        )
+        with gr.Row():
+            gr.LoginButton()
+            find = gr.Button("find my ducks")
+            chosen = gr.Dropdown(choices=[], label="your ducks", scale=2)
+            connect = gr.Button("connect", variant="primary")
+
+    with gr.Tab("on this network"):
+        gr.Markdown(
+            "Straight to the signalling server `mediad` is already running — no account, no "
+            "rendezvous, no relay, and nothing between here and the robot. `duckctl ip` prints "
+            "the address; `.local` works wherever mDNS does."
+        )
+        with gr.Row():
+            host = gr.Textbox(
+                value=os.environ.get("DUCK_HOST", ""),
+                placeholder="olducky.local",
+                label="the robot's address on this network",
+                scale=2,
+            )
+            connect_lan = gr.Button("connect over the LAN", variant="primary")
+
     with gr.Row():
-        gr.LoginButton()
-        find = gr.Button("find my ducks")
-        chosen = gr.Dropdown(choices=[], label="your ducks", scale=2)
-        connect = gr.Button("connect", variant="primary")
         disconnect = gr.Button("disconnect")
 
     link_state = gr.Markdown("**not connected.**")
@@ -587,6 +695,10 @@ with gr.Blocks(title="microduck policy shop") as demo:
         init = gr.Button("init (power the joints, stand)")
         stop = gr.Button("stop")
         relax = gr.Button("relax (cut torque — it will collapse)")
+
+    # Small, and beside the buttons rather than above them: the point of a picture here is
+    # seeing that the thing which was just installed did something, not watching a camera.
+    view = gr.Image(label="what the duck sees", height=260)
 
     with gr.Accordion("what this duck has now", open=True):
         robot_panel = gr.Markdown("Connect, then *read this robot*.")
@@ -624,6 +736,9 @@ with gr.Blocks(title="microduck policy shop") as demo:
     connect.click(open_session, inputs=chosen, outputs=status).then(
         lambda: robot_state(), outputs=[robot_panel, installed]
     )
+    connect_lan.click(lambda where: LINK.over_the_lan(where), inputs=host, outputs=status).then(
+        lambda: robot_state(), outputs=[robot_panel, installed]
+    )
     disconnect.click(lambda: LINK.disconnect(), outputs=status)
     read.click(lambda: robot_state(), outputs=[robot_panel, installed])
     init.click(lambda: plain("robot.init"), outputs=status)
@@ -637,8 +752,14 @@ with gr.Blocks(title="microduck policy shop") as demo:
     demo.load(load_catalogue, outputs=[catalogue_note, *rows])
     # Once a second: it repaints a status line and a transcript, and the session it describes
     # changes state on its own — an ICE failure two minutes in should not need a click to appear.
+    # Ten a second for the picture and once a second for the words: the stream is 30 fps and a
+    # browser will not notice the difference, while a status line that repainted at 10 Hz would
+    # be unreadable.
+    gr.Timer(0.1).tick(lambda: LINK.picture(), outputs=view, show_progress="hidden")
     gr.Timer(1.0).tick(
-        lambda: (LINK.describe(), LINK.transcript()), outputs=[link_state, wire]
+        lambda: (LINK.describe(), LINK.transcript()),
+        outputs=[link_state, wire],
+        show_progress="hidden",
     )
 
 
