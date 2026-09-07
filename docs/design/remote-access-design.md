@@ -712,6 +712,26 @@ blocks (a `try_read` that yields nothing rather than waiting) and never fails. A
 the ordinary state for the first few seconds after boot and forever on a robot with no account,
 and it means host and srflx only, which is all anything on the same network needs.
 
+**And the endpoint is not answering, which is where this stands.** `turn.fastrtc.org` has no A
+record and `fastrtc.org` has no NS records at all, from three public resolvers and from the board
+— so the proxy both `fastrtc`'s own current code and `reachy_mini`'s #1182 point at cannot be
+reached by anybody. Their documentation describes it as a live Hugging Face–Cloudflare arrangement
+(10 GB a month free with an account), so this reads as a lapsed registration or an outage rather
+than a moved URL, and it means the mini fleet's relay path is down too. Worth telling whoever owns
+`fastrtc`.
+
+Three ways on, in the order they should be considered:
+
+- **Wait, having reported it.** The robot degrades exactly as designed — a warning every thirty
+  seconds and host/srflx candidates — so nothing is broken except reaching a robot from a network
+  that needs a relay.
+- **Our own proxy**, which is what that endpoint is: a small service holding a Cloudflare Calls key
+  and minting short-lived credentials for a caller presenting a valid HF token. `--turn-url` is
+  already the seam it plugs into, and the key stays in one place rather than on robots.
+- **A Cloudflare key on the robot**, using `TURN_KEY_ID` and `TURN_KEY_API_TOKEN` directly. Fastest
+  and worst: a long-lived API token on every board, which is the shape of mistake §2.4 exists to
+  stop making.
+
 Nothing about a relay is fatal. `add-turn-server` is checked for existence before it is emitted —
 a panic in a C closure aborts the process rather than unwinding, which `pipeline.rs` learned once
 already — a refused URI is a line in the journal, and a robot that cannot offer a relay is

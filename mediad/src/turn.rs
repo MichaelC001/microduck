@@ -197,14 +197,14 @@ async fn fetch(endpoint: &str, token: &str) -> Result<Vec<String>, String> {
         .bearer_auth(token)
         .send()
         .await
-        .map_err(|e| format!("GET {endpoint}: {e}"))?;
+        .map_err(|e| format!("GET {endpoint}: {}", because(&e)))?;
     if !response.status().is_success() {
         return Err(format!("GET {endpoint}: HTTP {}", response.status()));
     }
     let credentials: Credentials = response
         .json()
         .await
-        .map_err(|e| format!("GET {endpoint}: {e}"))?;
+        .map_err(|e| format!("GET {endpoint}: {}", because(&e)))?;
     Ok(turn_uris(&credentials.ice_servers))
 }
 
@@ -249,6 +249,29 @@ fn encode(value: &str) -> String {
             }
             other => out.push_str(&format!("%{other:02X}")),
         }
+    }
+    out
+}
+
+/// An error and everything under it, on one line.
+///
+/// **`reqwest`'s own message stops at "error sending request"**, and the half that matters is
+/// underneath: a name that does not resolve, a refused connection and a certificate that does not
+/// verify all print identically otherwise. This cost an afternoon of wondering whether a robot had
+/// no network, when the answer was that the endpoint's whole domain had no DNS records —
+/// unresolvable from the board and from three public resolvers alike.
+fn because(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        // Repeated text is worse than none: `reqwest` wraps `hyper` wraps `io`, and each layer
+        // often restates the one below it.
+        let text = cause.to_string();
+        if !out.contains(&text) {
+            out.push_str(": ");
+            out.push_str(&text);
+        }
+        source = cause.source();
     }
     out
 }
@@ -309,6 +332,19 @@ mod tests {
     fn entries_without_credentials_are_skipped() {
         assert!(turn_uris(&servers(r#"{"iceServers":[{"urls":"turn:relay:3478"}]}"#)).is_empty());
         assert!(turn_uris(&servers(r#"{"iceServers":[]}"#)).is_empty());
+    }
+
+    /// An unreachable endpoint says *why* it was unreachable.
+    #[tokio::test]
+    async fn a_failure_names_its_cause_and_not_just_itself() {
+        // A domain that cannot resolve, which is exactly what the real endpoint did.
+        let error = fetch("https://turn.invalid./credentials", "hf_abc")
+            .await
+            .expect_err("`.invalid` does not resolve, by RFC 2606");
+        assert!(
+            error.to_lowercase().contains("dns") || error.to_lowercase().contains("resolve"),
+            "the cause has to survive to the log line: {error}"
+        );
     }
 
     /// **Credentials must never reach a log line.**
