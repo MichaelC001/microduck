@@ -300,6 +300,16 @@ enum Ended {
     /// The service refused the token. Backing off does not fix this — a login does — so this
     /// waits on the token file instead of on a timer.
     Unauthorised,
+    /// The credential on disk is not the one this connection is using: a `logout`, or a
+    /// `login --force` onto another account.
+    ///
+    /// **This is what makes `account.logout` mean anything here.** The token is read once per
+    /// connection, so without this the relay would go on refreshing the lease with a credential
+    /// its owner had deleted — a robot signed out of an account and still listed under it, which
+    /// is precisely the claim `remote-access-design.md` §2.6 makes about being revocable.
+    /// Dropping the stream is the deregistration: a clean disconnect evicts the peer at once, and
+    /// the 30 s sweep is only there for sockets that never report closing.
+    CredentialChanged,
 }
 
 /// The relay, as the task that owns the outward connection.
@@ -370,6 +380,15 @@ impl Relay {
                          is what fixes it"
                     );
                     tokio::time::sleep(self.timings.no_token_poll).await;
+                }
+                Ended::CredentialChanged => {
+                    // No backoff: either there is a new token to use immediately, or there is
+                    // none and the loop above is about to wait on the file anyway.
+                    tracing::info!(
+                        "this robot's account credential changed; the rendezvous connection is \
+                         dropped, which takes the robot out of the service's listing"
+                    );
+                    backoff = self.timings.backoff_start;
                 }
                 Ended::SplitBrain => {
                     // Reconnect immediately rather than backing off: the connection looked
@@ -451,6 +470,12 @@ impl Relay {
         loop {
             tokio::select! {
                 _ = heartbeats.tick() => {
+                    // Checked here rather than on its own timer: the heartbeat is already the
+                    // fastest thing in this loop, so a `logout` takes effect within one cadence
+                    // — ten seconds — and re-reading a small file that often costs nothing.
+                    if self.token().as_deref() != Some(token) {
+                        return Ended::CredentialChanged;
+                    }
                     if let Err(ended) = self.set_peer_status(token).await {
                         return ended;
                     }
@@ -893,6 +918,11 @@ mod tests {
         posts: std::sync::Mutex<Vec<serde_json::Value>>,
         /// How many times the event stream has been opened.
         streams: std::sync::atomic::AtomicUsize,
+        /// How many times an event stream has been dropped by the client, which is what a clean
+        /// disconnect looks like from here — and what evicts a producer on the real service.
+        closed: std::sync::atomic::AtomicUsize,
+        /// The bearer token each stream was opened with, in order.
+        bearers: std::sync::Mutex<Vec<String>>,
         /// Whether `/api/robot-status` admits this robot exists.
         lists_us: std::sync::atomic::AtomicBool,
         /// What the welcome asks for, and messages to push after it.
@@ -905,6 +935,18 @@ mod tests {
     impl Fake {
         fn posts(&self) -> Vec<serde_json::Value> {
             self.posts.lock().unwrap().clone()
+        }
+
+        fn bearers(&self) -> Vec<String> {
+            self.bearers.lock().unwrap().clone()
+        }
+
+        fn closed(&self) -> usize {
+            self.closed.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn streams(&self) -> usize {
+            self.streams.load(std::sync::atomic::Ordering::SeqCst)
         }
 
         fn of_type(&self, kind: &str) -> Vec<serde_json::Value> {
@@ -923,6 +965,17 @@ mod tests {
         }
     }
 
+    /// Increments the fake's `closed` count when the stream it lives in is dropped.
+    struct Closing(std::sync::Arc<Fake>);
+
+    impl Drop for Closing {
+        fn drop(&mut self) {
+            self.0
+                .closed
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
     const PEER_ID: &str = "peer-under-test";
 
     async fn fake_service() -> FakeService {
@@ -937,9 +990,18 @@ mod tests {
         let app = axum::Router::new()
             .route(
                 "/events",
-                get(|State(fake): State<std::sync::Arc<Fake>>| async move {
+                get(|State(fake): State<std::sync::Arc<Fake>>,
+                     headers: axum::http::HeaderMap| async move {
                     fake.streams
                         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    fake.bearers.lock().unwrap().push(
+                        headers
+                            .get("authorization")
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or("")
+                            .to_owned(),
+                    );
+                    let closing = Closing(std::sync::Arc::clone(&fake));
                     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
                     *fake.push.lock().unwrap() = Some(tx);
 
@@ -959,6 +1021,9 @@ mod tests {
                     // The framing the real service uses: `data:` lines, and a comment-only ping
                     // when there is nothing to say.
                     let events = async_stream::stream! {
+                        // Moved in, so it is dropped when the client hangs up — which is how the
+                        // real service learns to evict a producer.
+                        let _closing = closing;
                         yield Ok::<_, std::io::Error>(format!("data: {welcome}\n\n"));
                         while let Some(message) = rx.recv().await {
                             yield Ok(format!("data: {message}\n\n"));
@@ -1194,6 +1259,91 @@ mod tests {
             !service.state.of_type("setPeerStatus").is_empty()
         })
         .await;
+        task.abort();
+    }
+
+    /// Signing the robot out takes it out of the service's listing, promptly.
+    ///
+    /// The token is read once per connection, so nothing about a `logout` reaches this task on its
+    /// own: without the check on the heartbeat tick the relay would go on refreshing the lease
+    /// with a credential its owner had deleted — a robot signed out of an account and still
+    /// listed under it. §2.6 claims `account.logout` is one of the three things that make a LAN
+    /// peer's login acceptable, so it has to be true here and not only in `updaterd`.
+    ///
+    /// Dropping the stream *is* the deregistration: a clean disconnect evicts the peer at once on
+    /// the real service, and the 30 s sweep exists only for sockets that never report closing.
+    #[tokio::test]
+    async fn signing_the_robot_out_drops_the_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = signed_in(&dir);
+        let service = fake_service().await;
+        *service.state.heartbeat_seconds.lock().unwrap() = Some(0.05);
+
+        let relay = Relay::new(&service.base, &path, meta())
+            .unwrap()
+            .with_timings(brisk());
+        let task = tokio::spawn(relay.run());
+        until("registration", || {
+            !service.state.of_type("setPeerStatus").is_empty()
+        })
+        .await;
+
+        // `account logout` on the robot is exactly this.
+        std::fs::remove_file(&path).unwrap();
+
+        until("the stream to be dropped", || service.state.closed() >= 1).await;
+        let posts_when_signed_out = service.state.of_type("setPeerStatus").len();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            service.state.of_type("setPeerStatus").len(),
+            posts_when_signed_out,
+            "a robot signed out must stop refreshing its lease"
+        );
+        assert_eq!(
+            service.state.streams(),
+            1,
+            "and must not reconnect: there is nothing to connect with"
+        );
+        task.abort();
+    }
+
+    /// Signing in to a *different* account moves the robot, rather than leaving it where it was.
+    ///
+    /// `login --force` is how a robot changes hands, and the connection it changes hands over is
+    /// authenticated by the old owner's token. So the same check that notices a logout has to
+    /// notice a replacement, and reconnect with the new credential.
+    #[tokio::test]
+    async fn a_relogin_reconnects_with_the_new_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = signed_in(&dir);
+        let service = fake_service().await;
+        *service.state.heartbeat_seconds.lock().unwrap() = Some(0.05);
+
+        let relay = Relay::new(&service.base, &path, meta())
+            .unwrap()
+            .with_timings(brisk());
+        let task = tokio::spawn(relay.run());
+        until("registration", || {
+            !service.state.of_type("setPeerStatus").is_empty()
+        })
+        .await;
+        assert_eq!(service.state.bearers()[0], "Bearer hf_abc");
+
+        std::fs::write(&path, r#"{"access_token":"hf_somebody_else"}"#).unwrap();
+
+        until("a reconnect on the new token", || {
+            service.state.bearers().len() >= 2
+        })
+        .await;
+        assert_eq!(
+            service.state.bearers()[1],
+            "Bearer hf_somebody_else",
+            "the second connection belongs to whoever the robot belongs to now"
+        );
+        assert!(
+            service.state.closed() >= 1,
+            "and the first one was closed, which is what un-lists the robot for the old account"
+        );
         task.abort();
     }
 

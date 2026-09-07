@@ -301,8 +301,11 @@ Three things make that acceptable rather than merely permitted:
 - **It is revocable** — `account.logout` from anywhere, and revoking the grant on Hugging Face,
   which no robot-side gate could offer.
 
-  Worth being exact about the first one, because it is weaker than it sounds: **`logout` deletes
-  the robot's copy and revokes nothing.** The robot stops being a producer, which is the effect
+  Exact about the first one, because it has two halves and only one of them is `updaterd`'s.
+  `logout` deletes the credential, and the relay notices within one heartbeat — ten seconds — and
+  drops its connection, which on this service evicts the producer at once. So a robot signed out
+  stops being listed and stops being reachable. What it does **not** do is revoke anything:
+  **`logout` deletes the robot's copy and tells Hugging Face nothing.** The robot stops being a producer, which is the effect
   somebody signing out is after — but the access token it held stays valid at Hugging Face until
   it expires, up to thirty days, for anything that already read the file. The credential is
   `0640 root:robot`, so "anything" means root or `mediad` on that board; a stolen board is the
@@ -448,6 +451,13 @@ Four, each cheap to build in now and expensive to rediscover:
   yet know the robot exists.
 - **Backoff with jitter, capped.** 5 s growing to 60 s, plus ~10%. A fleet reconnecting in lockstep
   after a service restart is a self-inflicted outage.
+- **A credential that changed under the connection.** The token is read once per connection, so
+  neither a `logout` nor a `login --force` onto another account reaches a running relay by itself
+  — it would go on refreshing the lease with a credential its owner deleted. Re-read on the
+  heartbeat tick, which makes the lag one cadence, and dropping the stream is the deregistration:
+  a clean disconnect evicts the peer immediately, and the sweep is only for sockets that never
+  report closing. There is also an explicit `roles: []` withdraw, which is for keeping the channel
+  open to re-register later and is not what this wants.
 - **A 401 is not a case for backoff.** No number of retries fixes a token the service refuses; a
   login does. So that path waits on the token file at the same 30 s cadence as a robot nobody has
   signed in, rather than posting a doomed request every five seconds into somebody else's Space.
