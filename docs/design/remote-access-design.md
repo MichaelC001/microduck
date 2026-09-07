@@ -713,8 +713,11 @@ Five slices, and the first two are independently useful and need no client:
    mobile and desktop apps, which would drive a duck with a mini's method names. So there is
    nothing to connect with that we do not write, and translating sessions first would mean
    building the half that can only be tested against a fake.
-4. **Session translation** — a remote consumer gets video and the `control` channel, verified by
-   the page above as it is written rather than after it.
+4. **Session translation** — a remote consumer gets video and the `control` channel. **Done**:
+   `relay::bridge` opens `ws://127.0.0.1:<--port>` as a consumer when a session is asked for,
+   rewrites `sessionId` per hop, reads no payload, refuses a second session by name, and tells the
+   service when a session ends however it ends — including the case where there is no producer to
+   bridge to, which is a robot whose pipeline never reached PLAYING.
 5. **STUN decided; TURN if a real network needs it.** §6.
 
 ## 9. What is open, and who can close it

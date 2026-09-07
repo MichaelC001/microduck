@@ -253,7 +253,15 @@ fn main() -> ExitCode {
                     if let Some(relay) =
                         mediad::relay::Relay::new(&args.rendezvous_url, &args.token, meta)
                     {
-                        tokio::spawn(relay.run());
+                        // The bridge is a *consumer* of the signalling server this same process
+                        // runs, so it has to be told the port `--port` chose rather than assuming
+                        // the default — a robot moved off 8443 would otherwise register happily
+                        // and fail every session.
+                        tokio::spawn(
+                            relay
+                                .with_local_signalling(format!("ws://127.0.0.1:{}", args.port))
+                                .run(),
+                        );
                     }
                 }
             }

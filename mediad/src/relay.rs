@@ -6,14 +6,16 @@
 //! shows a client only the robots its own account owns. `docs/design/remote-access-design.md` §3
 //! owns the argument; this module owns the connection.
 //!
-//! # What this slice does, and what it deliberately refuses
+//! # What it does
 //!
-//! Registration and liveness only (§8, slice 2): the robot appears in the service's listing and
-//! stays there. Translating a session — a remote peer's SDP and ICE onto the local signalling
-//! server at `ws://127.0.0.1:8443` — is the next slice, and until it exists a `startSession` is
-//! answered with `endSession` rather than ignored. That is the honest failure: a client that
-//! clicks connect gets a refusal now instead of a robot that shows as busy forever, and the
-//! service's own state stays clean.
+//! **Registration and liveness** (§8, slice 2): the robot appears in the service's listing and
+//! stays there, for as long as the account token on disk is the one it connected with.
+//!
+//! **And it carries a session** (slice 4). A remote consumer cannot reach `webrtcsink`'s
+//! signalling server — it is on a loopback address behind somebody's router — so when one asks
+//! the rendezvous for a session, [`bridge`] opens that socket *as the consumer on its behalf* and
+//! carries envelopes between the two, rewriting the `sessionId` each hop names and reading none
+//! of the payload. One session at a time; a second is refused by name.
 //!
 //! # Why the transport is HTTP, which is not what `remote-webrtc.md` §7 assumed
 //!
@@ -108,6 +110,20 @@ const BACKOFF_JITTER: f64 = 0.10;
 
 /// How long a request that is not the event stream gets.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How long the robot's own signalling server gets to hand over a session.
+///
+/// It is in this process — `webrtcsink` runs it — so this is generous rather than tuned. What it
+/// guards against is a pipeline that never reached PLAYING, which produces a server with no
+/// producer and a handshake that would otherwise wait for one forever.
+const LOCAL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Where the robot's own signalling server listens.
+///
+/// `webrtcsink` runs it in this process with `signalling-server-host` and `-port`, so this is the
+/// same 8443 `mediad`'s `--port` defaults to. Loopback, because the bridge and the server are one
+/// process — a remote peer reaches this robot through the rendezvous, never through this socket.
+pub const DEFAULT_LOCAL_SIGNALLING: &str = "ws://127.0.0.1:8443";
 
 /// Every interval this task runs on, in one place.
 ///
@@ -204,22 +220,50 @@ fn read_machine_id(path: &Path) -> Option<String> {
 ///
 /// Unknown types are a variant rather than an error: this is somebody else's service and it is
 /// allowed to grow messages we do not handle. The ones named here are the ones acted on.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(tag = "type", rename_all = "camelCase")]
+///
+/// **`Peer` carries the whole envelope rather than its fields**, and that is the design rather
+/// than laziness: an SDP or an ICE candidate passes through this process untouched, and the only
+/// thing rewritten is the `sessionId` around it. Deserialising the payload would mean owning a
+/// copy of a schema that belongs to WebRTC, and re-serialising it would mean re-encoding SDP that
+/// arrived perfectly good. §3.2 — a translator with an opaque payload.
+#[derive(Debug, Clone, PartialEq)]
 enum Inbound {
     Welcome(Welcome),
-    /// A consumer wants a session. Refused in this slice; translated in the next.
-    #[serde(rename_all = "camelCase")]
+    /// A consumer wants a session, which is what the bridge exists to serve.
     StartSession {
         session_id: String,
     },
     /// The other side gave up, or the service ended it.
-    #[serde(rename_all = "camelCase")]
     EndSession {
         session_id: Option<String>,
     },
-    #[serde(other)]
+    /// SDP or ICE for a session in flight.
+    Peer(serde_json::Value),
     Other,
+}
+
+/// Read a message off the wire far enough to route it, and no further.
+fn classify(raw: &str) -> Result<Inbound, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|e| format!("unparseable message: {e}"))?;
+    let session_id = |value: &serde_json::Value| value["sessionId"].as_str().map(str::to_owned);
+    Ok(match value["type"].as_str().unwrap_or_default() {
+        "welcome" => Inbound::Welcome(
+            serde_json::from_value(value)
+                .map_err(|e| format!("a welcome this page cannot read: {e}"))?,
+        ),
+        "startSession" => match session_id(&value) {
+            Some(session_id) => Inbound::StartSession { session_id },
+            // A `startSession` with no id is not something to answer: there is nothing to answer
+            // *about*, and inventing one would open a session the service cannot route.
+            None => return Err("a startSession with no sessionId".to_owned()),
+        },
+        "endSession" => Inbound::EndSession {
+            session_id: session_id(&value),
+        },
+        "peer" => Inbound::Peer(value),
+        _ => Inbound::Other,
+    })
 }
 
 /// The first message on a healthy stream, and the only one that has to arrive.
@@ -319,6 +363,7 @@ pub struct Relay {
     meta: Meta,
     client: reqwest::Client,
     timings: Timings,
+    local_signalling: String,
 }
 
 impl Relay {
@@ -345,7 +390,17 @@ impl Relay {
             meta,
             client,
             timings: Timings::default(),
+            local_signalling: DEFAULT_LOCAL_SIGNALLING.to_owned(),
         })
+    }
+
+    /// Point the bridge at a signalling server other than `webrtcsink`'s own.
+    ///
+    /// For tests, and for a `mediad` whose `--port` is not the default: the bridge connects to
+    /// the server this same process is running, so the two numbers have to agree.
+    pub fn with_local_signalling(mut self, url: impl Into<String>) -> Self {
+        self.local_signalling = url.into();
+        self
     }
 
     /// Run on intervals other than the shipped ones. See [`Timings`]; tests only.
@@ -460,6 +515,12 @@ impl Relay {
              network"
         );
 
+        // At most one at a time. The service gates this too (`sessionRejected` with `robot_busy`),
+        // so this is belt-and-braces — and it stays, because two remote peers writing into one
+        // intent slot is `remote-webrtc.md` §9's interleaving bug with the pad replaced by a
+        // second continent. §3.4.
+        let mut bridged: Option<Bridged> = None;
+
         let mut heartbeats = tokio::time::interval(heartbeat);
         heartbeats.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         heartbeats.tick().await; // the first tick is immediate, and registration just happened
@@ -500,6 +561,19 @@ impl Relay {
                         Err(why) => tracing::debug!(%why, "could not ask whether we are listed"),
                     }
                 }
+                // A session that ended on its own — the peer left, the pipeline stopped — is
+                // reaped here rather than being noticed the next time one is asked for, so
+                // `account.status` and the service agree about whether this robot is busy.
+                _ = async {
+                    match bridged.as_mut() {
+                        Some(session) => (&mut session.task).await.ok(),
+                        // Nothing to wait for; this branch must never be the one that fires.
+                        None => std::future::pending().await,
+                    }
+                }, if bridged.is_some() => {
+                    tracing::debug!("the bridged session finished");
+                    bridged = None;
+                }
                 event = tokio::time::timeout(self.timings.read_timeout, events.next()) => {
                     match event {
                         Err(_) => return Ended::Reconnect(format!(
@@ -514,7 +588,7 @@ impl Relay {
                             format!("the event stream failed: {e}"),
                         ),
                         Ok(Some(Ok(message))) => {
-                            if let Some(ended) = self.handle(token, message).await {
+                            if let Some(ended) = self.handle(token, message, &mut bridged).await {
                                 return ended;
                             }
                         }
@@ -559,10 +633,7 @@ impl Relay {
                     Err(e) => Some(Err(format!("{e}"))),
                     // The service's keepalive carries no data and means only "still here".
                     Ok(event) if event.data.trim().is_empty() => None,
-                    Ok(event) => Some(
-                        serde_json::from_str::<Inbound>(&event.data)
-                            .map_err(|e| format!("unparseable message: {e}")),
-                    ),
+                    Ok(event) => Some(classify(&event.data)),
                 }
             });
         Ok(Box::pin(events))
@@ -657,7 +728,12 @@ impl Relay {
     }
 
     /// One message from the service. `Some` ends the connection.
-    async fn handle(&self, token: &str, message: Inbound) -> Option<Ended> {
+    async fn handle(
+        &self,
+        token: &str,
+        message: Inbound,
+        bridged: &mut Option<Bridged>,
+    ) -> Option<Ended> {
         match message {
             // A second welcome on one stream would mean the service rebound this token, which is
             // what happens when another process registers with it. Reconnecting is how we find
@@ -666,30 +742,309 @@ impl Relay {
                 "the service sent a second welcome on the same stream".to_owned(),
             )),
             Inbound::StartSession { session_id } => {
-                // Refused rather than dropped: an unanswered `startSession` leaves this robot
-                // showing as busy to its owner with nothing on the other end. §8's slice 3 is
-                // what replaces this with a translated session.
-                tracing::info!(
-                    %session_id,
-                    "a remote session was requested; refusing it — the bridge is not built yet"
-                );
-                self.send(
-                    token,
-                    &Outbound::EndSession {
-                        session_id: &session_id,
-                        reason: "this robot cannot serve a remote session yet",
-                    },
-                )
-                .await
-                .err()
+                if bridged.as_ref().is_some_and(Bridged::live) {
+                    // Refused by name rather than dropped: an unanswered `startSession` leaves a
+                    // peer waiting on a robot that is never going to answer, and the owner
+                    // looking at a robot that reads as broken rather than busy.
+                    tracing::info!(%session_id, "refusing a second remote session");
+                    return self
+                        .send(
+                            token,
+                            &Outbound::EndSession {
+                                session_id: &session_id,
+                                reason: "this robot is already in a remote session",
+                            },
+                        )
+                        .await
+                        .err();
+                }
+
+                let (to_local, from_remote) = tokio::sync::mpsc::channel(64);
+                let hub = Hub {
+                    client: self.client.clone(),
+                    base: self.base.clone(),
+                    token: token.to_owned(),
+                };
+                let local_url = self.local_signalling.clone();
+                let remote_id = session_id.clone();
+                let task = tokio::spawn(async move {
+                    if let Err(why) = bridge(hub, local_url, remote_id, from_remote).await {
+                        tracing::warn!(%why, "a remote session could not be bridged");
+                    }
+                });
+                *bridged = Some(Bridged {
+                    remote_id: session_id,
+                    to_local,
+                    task,
+                });
+                None
+            }
+            Inbound::Peer(envelope) => {
+                // The envelope is forwarded whole and the payload is never read. What decides
+                // where it goes is the session it names — and a `peer` for a session this robot
+                // is not in is dropped rather than guessed at.
+                let Some(session) = bridged.as_ref() else {
+                    tracing::debug!("a peer message arrived with no session to carry it");
+                    return None;
+                };
+                let names_it = envelope["sessionId"].as_str() == Some(session.remote_id.as_str());
+                if !names_it {
+                    tracing::debug!(
+                        session = ?envelope["sessionId"].as_str(),
+                        "a peer message for another session; dropping it"
+                    );
+                    return None;
+                }
+                if session.to_local.send(envelope).await.is_err() {
+                    tracing::debug!("the bridged session went away before its message arrived");
+                    *bridged = None;
+                }
+                None
             }
             Inbound::EndSession { session_id } => {
-                tracing::debug!(?session_id, "the service ended a session");
+                // Dropping `Bridged` aborts the task, which closes the local socket — that is
+                // what tells `webrtcsink` the consumer is gone.
+                if bridged
+                    .as_ref()
+                    .is_some_and(|s| session_id.as_deref().is_none_or(|id| id == s.remote_id))
+                {
+                    tracing::info!(?session_id, "the service ended the bridged session");
+                    *bridged = None;
+                } else {
+                    tracing::debug!(?session_id, "the service ended a session we do not have");
+                }
                 None
             }
             Inbound::Other => None,
         }
     }
+}
+
+// ── the local half: one bridged session ──────────────────────────────────────
+//
+// A remote consumer wants a session with this robot. On the LAN that consumer would open a
+// WebSocket to `webrtcsink`'s own signalling server and ask it for one; from off the LAN it cannot
+// reach that socket at all, so **this task plays the consumer on its behalf**: it opens the local
+// WebSocket, asks for a session with the local producer, and then carries envelopes between the
+// two sides, rewriting the one field whose value differs per hop.
+//
+// The roles are inverted on the two sides, and that is the whole shape of it (§3.1): to the
+// rendezvous this process *is* the robot, and to `webrtcsink` it is a peer asking for a session.
+//
+// **One local connection per bridged session**, opened when the session starts and dropped when it
+// ends. A long-lived local socket multiplexing several sessions would need the session table §3.2
+// describes; one connection per session makes that table a single pair of ids, and the concurrent
+// session the table would have existed for is refused anyway — the service gates it, and §3.4 says
+// to keep gating it here too.
+
+/// What the bridge needs to talk to the rendezvous while a session is in flight.
+#[derive(Clone)]
+struct Hub {
+    client: reqwest::Client,
+    base: String,
+    token: String,
+}
+
+impl Hub {
+    /// `POST /send`, for a task that has no `Relay` to hand.
+    async fn send(&self, message: &serde_json::Value) -> Result<(), String> {
+        let url = format!("{}/send", self.base);
+        let response = self
+            .client
+            .post(&url)
+            .bearer_auth(&self.token)
+            .timeout(REQUEST_TIMEOUT)
+            .json(message)
+            .send()
+            .await
+            .map_err(|e| format!("POST {url}: {e}"))?;
+        if !response.status().is_success() {
+            return Err(format!("POST {url}: HTTP {}", response.status()));
+        }
+        Ok(())
+    }
+
+    /// Tell the service a session is over. Best effort: a failure here is a session that is
+    /// already gone, and the peer finds out when the media stops either way.
+    async fn end(&self, session_id: &str, reason: &str) {
+        let message = serde_json::json!({
+            "type": "endSession", "sessionId": session_id, "reason": reason,
+        });
+        if let Err(why) = self.send(&message).await {
+            tracing::debug!(%why, "could not tell the service the session ended");
+        }
+    }
+}
+
+/// A bridged session, from the rendezvous side's point of view.
+struct Bridged {
+    /// The id the *service* knows this session by.
+    remote_id: String,
+    /// Envelopes from the service, on their way to the local signalling server.
+    to_local: tokio::sync::mpsc::Sender<serde_json::Value>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Bridged {
+    /// Whether the task carrying this session is still running.
+    fn live(&self) -> bool {
+        !self.task.is_finished()
+    }
+}
+
+impl Drop for Bridged {
+    fn drop(&mut self) {
+        // The task owns a WebSocket and a channel; aborting it closes both, which is what tells
+        // `webrtcsink` the consumer went away.
+        self.task.abort();
+    }
+}
+
+/// Carry one session, and **tell the service when it is over however that happens**.
+///
+/// The wrapper exists for that second half. A consumer whose session ends without being told sits
+/// looking at a robot it believes is connecting, forever — and the failure that produces it is
+/// never the ordinary path, it is an early return from somewhere in the middle. So there is one
+/// place that posts `endSession` and every exit goes through it.
+async fn bridge(
+    hub: Hub,
+    local_url: String,
+    remote_id: String,
+    from_remote: tokio::sync::mpsc::Receiver<serde_json::Value>,
+) -> Result<(), String> {
+    let outcome = carry(&hub, &local_url, &remote_id, from_remote).await;
+    match &outcome {
+        Ok(why) => {
+            hub.end(&remote_id, why).await;
+            tracing::info!(remote = %remote_id, %why, "the bridged session ended");
+        }
+        Err(why) => {
+            tracing::warn!(remote = %remote_id, %why, "the bridged session failed");
+            hub.end(&remote_id, why).await;
+        }
+    }
+    outcome.map(|_| ())
+}
+
+/// One session, from the local handshake to whichever side stops first.
+///
+/// `Ok` carries why it ended, which is what the consumer is told.
+async fn carry(
+    hub: &Hub,
+    local_url: &str,
+    remote_id: &str,
+    mut from_remote: tokio::sync::mpsc::Receiver<serde_json::Value>,
+) -> Result<String, String> {
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let (mut socket, _) = tokio_tungstenite::connect_async(local_url)
+        .await
+        .map_err(|e| format!("{local_url}: {e}"))?;
+
+    // The consumer's own handshake against `webrtcsink`'s server: a welcome, then ask what is
+    // producing, then ask that producer for a session. Exactly what the console page does over a
+    // LAN, which is why the page was the reference for this rather than the protocol document.
+    let mut producer = None;
+    let mut local_id = None;
+    let deadline = tokio::time::Instant::now() + LOCAL_HANDSHAKE_TIMEOUT;
+    while local_id.is_none() {
+        let message = tokio::time::timeout_at(deadline, socket.next())
+            .await
+            .map_err(|_| {
+                format!("{local_url} did not start a session within {LOCAL_HANDSHAKE_TIMEOUT:?}")
+            })?
+            .ok_or_else(|| format!("{local_url} closed during the handshake"))?
+            .map_err(|e| format!("{local_url}: {e}"))?;
+        let Message::Text(text) = message else {
+            continue;
+        };
+
+        // Read as the envelope it is rather than through `classify`: two of these three types
+        // exist only on this side of the bridge, and giving them variants in the rendezvous's
+        // vocabulary would put local-only messages in a remote-only enum.
+        let value: serde_json::Value =
+            serde_json::from_str(&text).map_err(|e| format!("{local_url}: {e}"))?;
+        match value["type"].as_str().unwrap_or_default() {
+            "welcome" => {
+                socket
+                    .send(Message::text(r#"{"type":"list"}"#))
+                    .await
+                    .map_err(|e| format!("{local_url}: {e}"))?;
+            }
+            "list" => {
+                let first = value["producers"].get(0).and_then(|p| p["id"].as_str());
+                let Some(id) = first else {
+                    return Err(
+                        "the robot's own signalling server lists no producer, so there is \
+                         nothing to bridge — its pipeline has not reached PLAYING"
+                            .to_owned(),
+                    );
+                };
+                producer = Some(id.to_owned());
+                let request = serde_json::json!({ "type": "startSession", "peerId": id });
+                socket
+                    .send(Message::text(request.to_string()))
+                    .await
+                    .map_err(|e| format!("{local_url}: {e}"))?;
+            }
+            "sessionStarted" => {
+                local_id = value["sessionId"].as_str().map(str::to_owned);
+            }
+            _ => {}
+        }
+    }
+
+    let local_id = local_id.expect("the loop above does not end until it is set");
+    tracing::info!(
+        remote = %remote_id,
+        local = %local_id,
+        producer = producer.as_deref().unwrap_or("unknown"),
+        "a remote session is bridged to this robot's own signalling server"
+    );
+
+    // From here it is two directions and one rewritten field.
+    let outcome = loop {
+        tokio::select! {
+            // The local producer: SDP, ICE, or the end of the session.
+            message = socket.next() => {
+                let Some(message) = message else {
+                    break Err("the robot's signalling server closed the session".to_owned());
+                };
+                let message = message.map_err(|e| format!("{local_url}: {e}"))?;
+                let Message::Text(text) = message else { continue };
+                match classify(&text)? {
+                    Inbound::Peer(mut envelope) => {
+                        envelope["sessionId"] = serde_json::Value::String(remote_id.to_owned());
+                        hub.send(&envelope).await?;
+                    }
+                    Inbound::EndSession { .. } => {
+                        break Ok("the robot ended the session".to_owned());
+                    }
+                    _ => {}
+                }
+            }
+            // The remote consumer, by way of the event stream this session arrived on.
+            envelope = from_remote.recv() => {
+                let Some(mut envelope) = envelope else {
+                    break Ok("the rendezvous connection went away".to_owned());
+                };
+                envelope["sessionId"] = serde_json::Value::String(local_id.clone());
+                socket
+                    .send(Message::text(envelope.to_string()))
+                    .await
+                    .map_err(|e| format!("{local_url}: {e}"))?;
+            }
+        }
+    };
+
+    // The local side is told with a message rather than a dropped socket, so `webrtcsink` frees
+    // its consumer immediately instead of on a timeout. The remote side is told by the caller,
+    // which is the only place that does it.
+    let farewell = serde_json::json!({ "type": "endSession", "sessionId": local_id });
+    let _ = socket.send(Message::text(farewell.to_string())).await;
+    let _ = socket.close(None).await;
+    outcome
 }
 
 /// A duration plus up to [`BACKOFF_JITTER`] of itself, so a fleet does not reconnect in lockstep.
@@ -753,7 +1108,7 @@ mod tests {
     /// The messages this robot has to recognise, as the service spells them.
     #[test]
     fn the_wire_is_read_as_the_service_writes_it() {
-        let welcome: Inbound = serde_json::from_str(
+        let welcome = classify(
             r#"{"type":"welcome","peerId":"p-1","username":"PierreRouanet",
                 "recommended_heartbeat_interval_seconds":10.0}"#,
         )
@@ -769,14 +1124,21 @@ mod tests {
         );
 
         assert_eq!(
-            serde_json::from_str::<Inbound>(
-                r#"{"type":"startSession","peerId":"p-2","sessionId":"s-1"}"#
-            )
-            .unwrap(),
+            classify(r#"{"type":"startSession","peerId":"p-2","sessionId":"s-1"}"#).unwrap(),
             Inbound::StartSession {
                 session_id: "s-1".to_owned()
             },
         );
+        // A `peer` keeps its whole envelope, payload included — that is what makes this a
+        // translator rather than a parser.
+        let peer =
+            classify(r#"{"type":"peer","sessionId":"s-1","sdp":{"type":"offer","sdp":"v=0\r\n"}}"#)
+                .unwrap();
+        let Inbound::Peer(envelope) = &peer else {
+            panic!("{peer:?}")
+        };
+        assert_eq!(envelope["sdp"]["sdp"], "v=0\r\n");
+
         // Messages this slice does not act on must not be errors: it is somebody else's service
         // and it is allowed to grow.
         for other in [
@@ -785,11 +1147,7 @@ mod tests {
             r#"{"type":"sessionRejected","reason":"robot_busy","activeApp":"whatever"}"#,
             r#"{"type":"somethingAddedNextYear"}"#,
         ] {
-            assert_eq!(
-                serde_json::from_str::<Inbound>(other).unwrap(),
-                Inbound::Other,
-                "{other}"
-            );
+            assert_eq!(classify(other).unwrap(), Inbound::Other, "{other}");
         }
     }
 
@@ -1153,41 +1511,6 @@ mod tests {
         task.abort();
     }
 
-    /// A session this slice cannot serve is refused by name, not ignored.
-    ///
-    /// An unanswered `startSession` leaves the robot showing as busy to its owner with nothing on
-    /// the other end — the failure that looks like a broken robot rather than a missing feature.
-    #[tokio::test]
-    async fn a_session_it_cannot_serve_yet_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let service = fake_service().await;
-
-        let relay = Relay::new(&service.base, signed_in(&dir), meta())
-            .unwrap()
-            .with_timings(brisk());
-        let task = tokio::spawn(relay.run());
-        until("registration", || {
-            !service.state.of_type("setPeerStatus").is_empty()
-        })
-        .await;
-
-        service.state.push(serde_json::json!({
-            "type": "startSession", "peerId": "a-consumer", "sessionId": "session-1",
-        }));
-
-        until("a refusal", || {
-            !service.state.of_type("endSession").is_empty()
-        })
-        .await;
-        let refusal = service.state.of_type("endSession")[0].clone();
-        assert_eq!(refusal["sessionId"], "session-1");
-        assert!(
-            refusal["reason"].as_str().unwrap().contains("yet"),
-            "the reason should say this is unbuilt rather than broken: {refusal}"
-        );
-        task.abort();
-    }
-
     /// Split-brain: the stream is healthy and the service has forgotten us.
     ///
     /// Nothing in the connection notices, which is the entire problem — so the poll is what
@@ -1374,6 +1697,298 @@ mod tests {
             service.state.of_type("setPeerStatus").len(),
             1,
             "a 401 must not be retried on the reconnect timer"
+        );
+        task.abort();
+    }
+
+    // ── the local half ──────────────────────────────────────────────────────
+    //
+    // A stand-in for `webrtcsink`'s own signalling server, which is the one thing about this
+    // module that cannot be a channel: the bridge is a WebSocket client, and the framing is part
+    // of what it gets wrong if it gets anything wrong.
+
+    /// What the fake local server saw and said.
+    #[derive(Default)]
+    struct Local {
+        /// Everything the bridge sent it, in order.
+        seen: std::sync::Mutex<Vec<serde_json::Value>>,
+        /// A sender for pushing messages *to* the bridge, once it has connected.
+        push: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>,
+    }
+
+    impl Local {
+        fn seen(&self) -> Vec<serde_json::Value> {
+            self.seen.lock().unwrap().clone()
+        }
+
+        fn of_type(&self, kind: &str) -> Vec<serde_json::Value> {
+            self.seen()
+                .into_iter()
+                .filter(|m| m["type"] == kind)
+                .collect()
+        }
+
+        fn push(&self, message: serde_json::Value) {
+            let sender = self
+                .push
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("the bridge has connected");
+            sender
+                .send(message.to_string())
+                .expect("the bridge is listening");
+        }
+    }
+
+    const LOCAL_PRODUCER: &str = "the-robots-own-producer";
+    const LOCAL_SESSION: &str = "local-session-1";
+
+    /// A signalling server that answers the consumer handshake and then relays.
+    ///
+    /// `producers` controls the one interesting failure: a server with none, which is what a
+    /// pipeline that never reached PLAYING looks like from here.
+    async fn fake_signalling(producers: bool) -> (String, std::sync::Arc<Local>) {
+        use axum::extract::State;
+        use axum::extract::ws::{Message, WebSocketUpgrade};
+        use axum::routing::any;
+
+        let local = std::sync::Arc::new(Local::default());
+
+        let app = axum::Router::new()
+            .route(
+                "/",
+                any(move |upgrade: WebSocketUpgrade,
+                     State(local): State<std::sync::Arc<Local>>| async move {
+                    upgrade.on_upgrade(move |mut socket| async move {
+                        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                        *local.push.lock().unwrap() = Some(tx);
+
+                        // The welcome, unprompted, as the real server sends it.
+                        let welcome = serde_json::json!({ "type": "welcome", "peerId": "the-bridge" });
+                        if socket.send(Message::text(welcome.to_string())).await.is_err() {
+                            return;
+                        }
+
+                        loop {
+                            tokio::select! {
+                                incoming = socket.recv() => {
+                                    let Some(Ok(Message::Text(text))) = incoming else { return };
+                                    let message: serde_json::Value =
+                                        serde_json::from_str(&text).expect("the bridge sends JSON");
+                                    let kind = message["type"].as_str().unwrap_or("").to_owned();
+                                    local.seen.lock().unwrap().push(message);
+
+                                    let answer = match kind.as_str() {
+                                        "list" => Some(serde_json::json!({
+                                            "type": "list",
+                                            "producers": if producers {
+                                                serde_json::json!([{ "id": LOCAL_PRODUCER, "meta": {} }])
+                                            } else {
+                                                serde_json::json!([])
+                                            },
+                                        })),
+                                        "startSession" => Some(serde_json::json!({
+                                            "type": "sessionStarted",
+                                            "peerId": LOCAL_PRODUCER,
+                                            "sessionId": LOCAL_SESSION,
+                                        })),
+                                        _ => None,
+                                    };
+                                    if let Some(answer) = answer
+                                        && socket.send(Message::text(answer.to_string())).await.is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                                pushed = rx.recv() => {
+                                    let Some(pushed) = pushed else { return };
+                                    if socket.send(Message::text(pushed)).await.is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    })
+                }),
+            )
+            .with_state(std::sync::Arc::clone(&local));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (url, local)
+    }
+
+    /// **The whole of slice 4: a session's envelopes cross, and their ids are rewritten.**
+    ///
+    /// The two assertions that matter are the two rewrites. An offer from the robot's own
+    /// producer must reach the service carrying the *remote* session id, because that is the id
+    /// the service routes on — and the consumer's answer must reach the local server carrying the
+    /// *local* one, for the same reason on the other side. Getting either backwards produces a
+    /// session where signalling is exchanged and no media ever flows, with nothing in any log to
+    /// say why, which is why this is pinned rather than tried by hand.
+    #[tokio::test]
+    async fn a_remote_session_is_bridged_to_the_local_signalling_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = fake_service().await;
+        let (local_url, local) = fake_signalling(true).await;
+
+        let relay = Relay::new(&service.base, signed_in(&dir), meta())
+            .unwrap()
+            .with_timings(brisk())
+            .with_local_signalling(&local_url);
+        let task = tokio::spawn(relay.run());
+        until("registration", || {
+            !service.state.of_type("setPeerStatus").is_empty()
+        })
+        .await;
+
+        // A consumer asks the service for a session with this robot.
+        service.state.push(serde_json::json!({
+            "type": "startSession", "peerId": "a-consumer", "sessionId": "remote-session-1",
+        }));
+
+        // The bridge plays the consumer on the local side: welcome, list, startSession.
+        until("the local handshake", || {
+            !local.of_type("startSession").is_empty()
+        })
+        .await;
+        assert_eq!(
+            local.of_type("startSession")[0]["peerId"],
+            LOCAL_PRODUCER,
+            "the session is asked of the robot's own producer"
+        );
+
+        // The producer offers. `webrtcsink` knows what it is sending, so the offer comes from it.
+        local.push(serde_json::json!({
+            "type": "peer",
+            "sessionId": LOCAL_SESSION,
+            "sdp": { "type": "offer", "sdp": "v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\n" },
+        }));
+
+        until("the offer to reach the service", || {
+            !service.state.of_type("peer").is_empty()
+        })
+        .await;
+        let forwarded = service.state.of_type("peer")[0].clone();
+        assert_eq!(
+            forwarded["sessionId"], "remote-session-1",
+            "outbound envelopes carry the id the *service* routes on"
+        );
+        assert_eq!(
+            forwarded["sdp"]["sdp"], "v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\n",
+            "and the payload is untouched — this process never parses SDP"
+        );
+
+        // The consumer answers, by way of the service.
+        service.state.push(serde_json::json!({
+            "type": "peer",
+            "sessionId": "remote-session-1",
+            "sdp": { "type": "answer", "sdp": "v=0\r\nanswer\r\n" },
+        }));
+
+        until("the answer to reach the robot", || {
+            !local.of_type("peer").is_empty()
+        })
+        .await;
+        let delivered = local.of_type("peer")[0].clone();
+        assert_eq!(
+            delivered["sessionId"], LOCAL_SESSION,
+            "inbound envelopes carry the id the robot's own server routes on"
+        );
+        assert_eq!(delivered["sdp"]["sdp"], "v=0\r\nanswer\r\n");
+
+        task.abort();
+    }
+
+    /// A second consumer is refused by name while one is being carried.
+    ///
+    /// The service gates this itself, so this is the belt-and-braces §3.4 asks for — and the
+    /// reason it stays is that two remote peers writing into one intent slot is the interleaving
+    /// bug `remote-webrtc.md` §9 defers, with a second continent instead of a gamepad.
+    #[tokio::test]
+    async fn a_second_remote_session_is_refused_while_one_is_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = fake_service().await;
+        let (local_url, local) = fake_signalling(true).await;
+
+        let relay = Relay::new(&service.base, signed_in(&dir), meta())
+            .unwrap()
+            .with_timings(brisk())
+            .with_local_signalling(&local_url);
+        let task = tokio::spawn(relay.run());
+        until("registration", || {
+            !service.state.of_type("setPeerStatus").is_empty()
+        })
+        .await;
+
+        service.state.push(serde_json::json!({
+            "type": "startSession", "peerId": "first", "sessionId": "remote-1",
+        }));
+        until("the first session", || {
+            !local.of_type("startSession").is_empty()
+        })
+        .await;
+
+        service.state.push(serde_json::json!({
+            "type": "startSession", "peerId": "second", "sessionId": "remote-2",
+        }));
+        until("a refusal", || {
+            !service.state.of_type("endSession").is_empty()
+        })
+        .await;
+
+        let refusal = service.state.of_type("endSession")[0].clone();
+        assert_eq!(
+            refusal["sessionId"], "remote-2",
+            "the second one is what is refused"
+        );
+        assert!(
+            refusal["reason"].as_str().unwrap().contains("already"),
+            "and the reason says the robot is busy rather than broken: {refusal}"
+        );
+        assert_eq!(
+            local.of_type("startSession").len(),
+            1,
+            "the robot's own server was asked for one session, not two"
+        );
+        task.abort();
+    }
+
+    /// A robot whose pipeline never started has no producer to bridge to, and says so.
+    ///
+    /// The peer is told the session is over rather than left waiting on media that is never
+    /// coming — the failure this shape has to avoid is a client that looks connected forever.
+    #[tokio::test]
+    async fn a_robot_with_no_producer_ends_the_session_rather_than_hanging() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = fake_service().await;
+        let (local_url, _local) = fake_signalling(false).await;
+
+        let relay = Relay::new(&service.base, signed_in(&dir), meta())
+            .unwrap()
+            .with_timings(brisk())
+            .with_local_signalling(&local_url);
+        let task = tokio::spawn(relay.run());
+        until("registration", || {
+            !service.state.of_type("setPeerStatus").is_empty()
+        })
+        .await;
+
+        service.state.push(serde_json::json!({
+            "type": "startSession", "peerId": "a-consumer", "sessionId": "remote-session-1",
+        }));
+
+        until("the session to be ended", || {
+            !service.state.of_type("endSession").is_empty()
+        })
+        .await;
+        assert_eq!(
+            service.state.of_type("endSession")[0]["sessionId"],
+            "remote-session-1"
         );
         task.abort();
     }
