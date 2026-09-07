@@ -396,10 +396,36 @@ fn main() -> ExitCode {
 
         // What every peer is told about the picture. The geometry is the *encoded* frame — the
         // pipeline does not rotate, so it is the capture geometry — and the rotation is the mount.
+        // The camera's geometry, for a consumer that has to turn pixels into directions. Read
+        // *after* the pipeline is up, because which sensor mode is in force is only known once
+        // something tried to set it — and a mode nobody knows the field of view of publishes
+        // nothing rather than a plausible wrong number. `mediad::camera` has the arithmetic.
+        let intrinsics = mediad::camera::Intrinsics::published(
+            media.intrinsics.as_ref(),
+            mediad::pipeline::sensor_mode(),
+            media.quality.width(),
+            media.quality.height(),
+        );
+        match &intrinsics {
+            Some(geometry) => tracing::info!(
+                fx = geometry.fx,
+                fy = geometry.fy,
+                cx = geometry.cx,
+                cy = geometry.cy,
+                calibrated = geometry.calibrated,
+                "camera geometry"
+            ),
+            None => tracing::info!(
+                "no camera geometry to publish: the sensor is not in a mode whose field of view \
+                 is known, so a consumer is told nothing rather than something wrong"
+            ),
+        }
+
         let video = mediad::session::Video {
             width: media.quality.width(),
             height: media.quality.height(),
             rotate: args.rotate,
+            intrinsics,
         };
 
         // One session per peer, each with its own connections to the services it talks to. Per
@@ -422,7 +448,7 @@ fn main() -> ExitCode {
             // (`media.video`), which is why that path exists and this one is best-effort.
             {
                 let to_peer = channel.outbound.clone();
-                let line = mediad::session::video_notification(video);
+                let line = mediad::session::video_notification(&video);
                 tokio::spawn(async move {
                     let _ = to_peer.send(line).await;
                 });
@@ -459,7 +485,9 @@ fn main() -> ExitCode {
                 channel.inbound,
                 channel.outbound,
                 pool,
-                video,
+                // Cloned per session: it carries the camera's intrinsics now, so it is no
+                // longer a `Copy` handful of integers.
+                video.clone(),
             ));
         }
 

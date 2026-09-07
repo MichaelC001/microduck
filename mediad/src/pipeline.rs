@@ -1021,6 +1021,20 @@ fn raise_capture_buffers(src: &gst::Element) -> Result<()> {
     Ok(())
 }
 
+/// Which sensor mode this process managed to put the camera in, once it has tried.
+///
+/// A `OnceLock` rather than a value threaded up through the pipeline builder, because that is what
+/// it is: one fact about this process's camera, established while the pipeline is built and read
+/// afterwards by whatever answers `media.video`. `None` — never set, or set after a failed switch
+/// — means the geometry is unknown, and `crate::camera` publishes no intrinsics for it.
+static SENSOR_MODE: std::sync::OnceLock<Option<crate::camera::SensorMode>> =
+    std::sync::OnceLock::new();
+
+/// The sensor mode in force, or `None` when there is no camera or the switch did not take.
+pub fn sensor_mode() -> Option<crate::camera::SensorMode> {
+    *SENSOR_MODE.get().unwrap_or(&None)
+}
+
 /// Switch the IMX219 out of its boot mode, which caps capture at 21 fps.
 ///
 /// The sensor boots in 3280x2464 and the rkisp scaler will happily give us 1280x720 from it — at
@@ -1047,9 +1061,12 @@ fn pin_sensor_mode(fps: u32) -> Result<()> {
             %media, %entity,
             why = %String::from_utf8_lossy(&output.stderr).trim(),
             "media-ctl would not set the 1920x1080 sensor mode — capture stays in the boot \
-             mode, which caps it at 21 fps"
+             mode, which caps it at 21 fps, and `media.video` publishes no camera intrinsics \
+             because the field of view is then the full sensor's rather than this mode's crop"
         );
+        let _ = SENSOR_MODE.set(None);
     } else {
+        let _ = SENSOR_MODE.set(Some(crate::camera::SensorMode::PINNED));
         tracing::info!(%media, %entity, target_fps = fps, "sensor mode 1920x1080");
     }
     Ok(())

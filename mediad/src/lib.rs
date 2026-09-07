@@ -17,6 +17,9 @@
 //! signalling server in this process, `mpph264enc` in front of it, and a `control` datachannel per
 //! peer wired to [`session::run`].
 
+/// What the camera's geometry is — the intrinsics a consumer needs to turn pixels into
+/// directions, and which sensor mode they belong to.
+pub mod camera;
 pub mod config;
 /// The account credential `updaterd` writes, read by the two things here that need it.
 pub mod hf;

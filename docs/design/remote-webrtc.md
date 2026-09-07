@@ -518,6 +518,27 @@ The alternative was building `mediad` on an arm64 runner like the plugins in
 two and leaves nobody able to build `mediad` on a laptop — which for the crate that will need the
 most iteration against real hardware is the wrong trade.
 
+### `media.video` says what the picture is, geometrically
+
+Width, height, the mount rotation — and the camera's **intrinsics**, which is what a consumer needs
+to turn a pixel into a direction. Without them a monocular reconstruction is scale-free and its
+angles are wrong; SLAM, visual odometry and "how far away is that" all begin here.
+
+Four numbers and a flag: `fx`, `fy`, `cx`, `cy`, and `calibrated`. They describe the frame **as it
+is sent** — unrotated, because nothing on the robot rotates pixels — so a consumer that applies
+`rotate` has to rotate these with it, swapping `cx` with `cy`. The flag is not decoration: `false`
+means the IMX219 module's design figures (3.04 mm over a 1.12 µm pitch, principal point assumed
+central, no distortion model), which is good to a few percent and enough to map a room; `true`
+means somebody measured *this* robot and wrote it into `[media.intrinsics]`. A consumer that needs
+metrology can tell that it needs to ask.
+
+**And the key is absent when the geometry is unknown**, rather than present and wrong. That is a
+robot streaming a test pattern, or one where `media-ctl` would not set the sensor mode — in which
+case the sensor is in its 3280×2464 boot mode, whose field of view is the whole array rather than
+the 1920×1080 crop, and every intrinsic would be off by about 1.7×. `mediad::camera` has the
+arithmetic and the mode table, including the fact that reading 720p off the sensor would *narrow*
+the view to 27° rather than saving anything.
+
 ## 11. Everything on the wire should carry the time it happened — **wanted**
 
 Nothing this transport carries is timestamped at source today. A frame arrives when it arrives, a
