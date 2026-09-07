@@ -23,7 +23,7 @@ path = "src/main.rs"
 anyhow = "1"
 clap = { workspace = true, features = ["derive"] }
 duck-ipc-proto = { path = "../duck-ipc-proto" }
-bmi088 = { path = "../../bmi088-rs" }
+bmi088 = { git = "https://github.com/pollen-robotics/bmi088-rs", tag = "v0.1.1" }
 linux-embedded-hal = "0.4"
 libc = "0.2"
 serde = { workspace = true }
