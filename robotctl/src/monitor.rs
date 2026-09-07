@@ -4213,6 +4213,7 @@ mod tests {
             t_ns: 0,
             imu: None,
             frames: None,
+            skeleton: Vec::new(),
         }
     }
 }

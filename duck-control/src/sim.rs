@@ -292,6 +292,15 @@ impl RobotIo for RemoteIo {
         acked(ack, if on { "torque on" } else { "torque off" })
     }
 
+    /// A simulated servo has no latched hardware error to clear and no firmware to restart, so
+    /// there is nothing to send: the reboot succeeds at once and the caller restores the gains as
+    /// it would on a robot. Deliberately not an op on the wire — the simulator would only have to
+    /// answer it with an ack.
+    fn reboot(&mut self, id: u8) -> Result<()> {
+        tracing::debug!(id, "reboot of a simulated servo: nothing to do");
+        Ok(())
+    }
+
     fn slow_sensors(&mut self) -> Result<SlowSensors> {
         let frame: SlowFrame = self.call(&Request::Slow)?;
         Ok(SlowSensors {

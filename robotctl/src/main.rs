@@ -458,6 +458,19 @@ enum RobotCommand {
         json: bool,
     },
 
+    /// Reboot servos: every one of them, or only the ids given.
+    ///
+    /// The way back from a servo in hardware error (overload, overheating) without pulling the
+    /// battery. Torque goes off on every joint first, so hold the robot or have it down; the
+    /// rebooted servos come back with torque off and their gains restored on the next write.
+    /// Then `robot init` or Start.
+    RebootMotors {
+        /// Servo ids, space separated. None means all.
+        ids: Vec<u8>,
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Run a one-shot skill by name — `roulade`, `kick_left`, `ground_pick`, `sit_toggle`, or
     /// whatever else this robot has.
     ///
@@ -2630,6 +2643,10 @@ fn run_robot(socket: &Path, command: RobotCommand) -> Result<(), Failure> {
             }),
             *json,
         ),
+        RobotCommand::RebootMotors { ids, json } => (
+            proto::Call::RobotRebootMotors(proto::RebootMotorsParams { ids: ids.clone() }),
+            *json,
+        ),
         RobotCommand::Do { skill, json } => (
             proto::Call::RobotDo(proto::DoParams {
                 skill: skill.clone(),
@@ -2706,6 +2723,12 @@ fn run_robot(socket: &Path, command: RobotCommand) -> Result<(), Failure> {
                 .as_deref()
                 .unwrap_or("the policy has the robot")
         ),
+        RobotCommand::RebootMotors { ids, .. } if ids.is_empty() => {
+            println!("rebooting every servo, torque off — then `robot init` or Start")
+        }
+        RobotCommand::RebootMotors { ids, .. } => {
+            println!("rebooting servos {ids:?}, torque off — then `robot init` or Start")
+        }
         RobotCommand::Do { skill, .. } => println!("{skill:?} queued"),
         RobotCommand::Mode { .. } | RobotCommand::Look { .. } => unreachable!("answered above"),
     }
