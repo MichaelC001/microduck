@@ -107,6 +107,46 @@ async fn a_second_daemon_cannot_replace_the_running_service() {
     wait_until_healthy(&socket).await;
 }
 
+/// Both launches start together, before either has answered a client. Repeating the race
+/// exercises both possible winners; waiting for the first daemon to be ready would miss it.
+#[tokio::test]
+async fn simultaneous_starts_leave_exactly_one_daemon_running() {
+    for _ in 0..10 {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("robotd.sock");
+        let gate = std::sync::Barrier::new(2);
+        let (mut first, mut second) = std::thread::scope(|scope| {
+            let start = || {
+                gate.wait();
+                Robotd::spawn(&socket, &[])
+            };
+            let first = scope.spawn(start);
+            let second = scope.spawn(start);
+            (first.join().unwrap(), second.join().unwrap())
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let winner = loop {
+            match (first.0.try_wait().unwrap(), second.0.try_wait().unwrap()) {
+                (Some(_), None) => {
+                    first.assert_refused().await;
+                    break &mut second;
+                }
+                (None, Some(_)) => {
+                    second.assert_refused().await;
+                    break &mut first;
+                }
+                (Some(a), Some(b)) => panic!("both daemons exited: {a}, {b}"),
+                (None, None) => (),
+            }
+            assert!(Instant::now() < deadline, "both daemons kept running");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        wait_until_healthy(&socket).await;
+        assert!(winner.0.try_wait().unwrap().is_none());
+    }
+}
+
 /// A PID file or an unconditionally exclusive create would survive SIGKILL and prevent
 /// recovery. The kernel lock must release, and the abandoned socket must be replaceable.
 #[tokio::test]
@@ -161,6 +201,53 @@ async fn a_live_listener_without_a_lock_is_preserved() {
     daemon.assert_refused().await;
     assert_eq!(std::fs::metadata(&socket).unwrap().ino(), inode);
     UnixStream::connect(&socket).expect("original listener remains reachable");
+}
+
+/// Linux AF_UNIX can refuse a connection with EAGAIN when the accept queue is full.
+/// A busy listener must be preserved just like one that answers the liveness probe.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_live_listener_with_a_full_accept_queue_is_preserved() {
+    use std::io::ErrorKind;
+    use std::os::fd::AsRawFd;
+
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("robotd.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    // Shrink the queue on this live listener so the test needs only a few connections.
+    assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 1) }, 0);
+    let inode = std::fs::metadata(&socket).unwrap().ino();
+    let mut queued = Vec::new();
+    let mut full = false;
+    for _ in 0..8 {
+        match tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::net::UnixStream::connect(&socket),
+        )
+        .await
+        {
+            Ok(Ok(stream)) => queued.push(stream),
+            Ok(Err(e)) if e.kind() == ErrorKind::WouldBlock => {
+                full = true;
+                break;
+            }
+            Err(_) => {
+                full = true;
+                break;
+            }
+            Ok(Err(e)) => panic!("cannot fill the accept queue: {e}"),
+        }
+    }
+    assert!(full && !queued.is_empty(), "accept queue was not saturated");
+
+    let mut daemon = Robotd::spawn(&socket, &[]);
+    daemon.assert_refused().await;
+    assert_eq!(std::fs::metadata(&socket).unwrap().ino(), inode);
+    listener.set_nonblocking(true).unwrap();
+    while let Ok((stream, _)) = listener.accept() {
+        drop(stream);
+    }
+    UnixStream::connect(&socket).expect("original listener still accepts new connections");
 }
 
 /// The lock must exclude a second launch even before the first has bound its socket.
