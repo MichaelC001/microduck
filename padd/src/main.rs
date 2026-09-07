@@ -308,9 +308,9 @@ fn main() -> std::process::ExitCode {
         socket = %args.socket.display(),
         hz = args.hz,
         roller,
-        "driving — Start toggles the policy, Y head mode, B body pose, A ground pick, \
-         LB/RB kicks, DPad-Down sit, triggers mouth, DPad-Right reboot servos, DPad-Up (3s) \
-         walk/roller, Select torque off, Select (2s) shutdown"
+        "driving — Start once stands up, Start again toggles the policy, Y head mode, B body pose, \
+         A ground pick, LB/RB kicks, DPad-Down sit, triggers mouth, DPad-Right reboot servos, \
+         DPad-Up (3s) walk/roller, Select torque off, Select (2s) shutdown"
     );
 
     let period = Duration::from_secs_f64(1.0 / args.hz as f64);
@@ -335,6 +335,10 @@ fn main() -> std::process::ExitCode {
     // starts the wheee ride. The prototype's threshold.
     let mut prev_rt = 0.0f64;
     let mut prev_lt = 0.0f64;
+    // Does this pad think the robot is up (torque on, at the home pose)? When not, Start sends
+    // `robot.init` (stand up and hold) instead of enabling the policy; the next Start enables it.
+    // Starts false: padd starts with the robot, and a robotd restart restarts padd too.
+    let mut up = false;
     // The continuous intents, and the buffer this tick's are built in. Both live across
     // ticks so a steady state neither allocates nor re-sends — see [`Continuous`].
     let mut continuous = Continuous::default();
@@ -451,7 +455,16 @@ fn main() -> std::process::ExitCode {
             }
         }
 
-        if toggle_enable {
+        if toggle_enable && !up {
+            tracing::warn!("Start — robot.init: standing up. Press Start again to drive");
+            match request(&mut stream, &mut next_id, &proto::Call::RobotInit) {
+                Err(e) => {
+                    tracing::error!(error = %e, "init failed");
+                    return std::process::ExitCode::FAILURE;
+                }
+                Ok(_) => up = true,
+            }
+        } else if toggle_enable {
             // The robot owns the toggle. A local on/off belief here drifts from the
             // robot's the moment anything else moves it — robot.relax, the shutdown
             // sequence, either side restarting — and a stale belief turns Start into a
@@ -526,6 +539,9 @@ fn main() -> std::process::ExitCode {
 
         if relax {
             tracing::warn!("Select — robot.relax: torque off");
+            // Torque off leaves the robot limp, so the next Start stands it up again rather
+            // than toggling the policy on a robot that is lying on the floor.
+            up = false;
             if let Err(e) = request(&mut stream, &mut next_id, &proto::Call::RobotRelax) {
                 tracing::error!(error = %e, "relax request failed");
                 return std::process::ExitCode::FAILURE;
@@ -536,6 +552,9 @@ fn main() -> std::process::ExitCode {
             tracing::warn!(
                 "DPad-Right — asking the robot to reboot its servos (robot.rebootMotors)"
             );
+            // The reboot leaves the robot limp, so the next Start has to stand it up again
+            // rather than toggle the policy on a robot that is lying down.
+            up = false;
             let call = proto::Call::RobotRebootMotors(proto::RebootMotorsParams::default());
             if let Err(e) = request(&mut stream, &mut next_id, &call) {
                 tracing::error!(error = %e, "reboot request failed");
@@ -549,6 +568,7 @@ fn main() -> std::process::ExitCode {
             let held = select_held_since.get_or_insert(tick);
             if tick.duration_since(*held) >= SHUTDOWN_HOLD && !shutdown_sent {
                 shutdown_sent = true;
+                up = false;
                 tracing::warn!("Select held — asking the robot to sit and power off");
                 if let Err(e) = request(&mut stream, &mut next_id, &proto::Call::RobotShutdown) {
                     tracing::error!(error = %e, "shutdown request failed");

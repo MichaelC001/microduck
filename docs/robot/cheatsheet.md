@@ -468,7 +468,7 @@ mapping is the prototype's, so muscle memory carries over:
 | --- | --- |
 | left stick | drive: forward/back and strafe · head: head yaw and pitch · body pose: up and crouch |
 | right stick | drive: turn · head: neck pitch and head roll · body pose: pitch and roll |
-| **Start** | toggle the policy — nothing moves until it is on |
+| **Start** | first press: torque on and a 2 s ramp to the home pose, then hold. Second press: the policy drives. After that it toggles the policy |
 | **Y** / triangle | head mode: sticks pose the head (body holds still) |
 | **B** / circle | body-pose mode: sticks lean and crouch the standing robot |
 | **A** / cross | ground pick |
@@ -478,7 +478,7 @@ mapping is the prototype's, so muscle memory carries over:
 | **RT / LT** | mouth (either trigger) — RT also quacks; LT rides the "wheee" while held |
 | **DPad-Up**, held 3 s | switch drive mode, walk ⇄ roller |
 | **DPad-Right** | reboot every servo: the way back from a tripped overload without pulling the battery. Torque off, then Start |
-| **Select** | torque off (`robot.relax`): the emergency release. The robot drops, so hold it |
+| **Select** | torque off (`robot.relax`): the emergency release. The robot drops, so hold it. Then Start stands it up again |
 | **Select**, held 2 s | power off (the press has already cut torque) |
 
 There is no stop button: release the sticks and the robot stands, and `robotd`'s deadman stops it
