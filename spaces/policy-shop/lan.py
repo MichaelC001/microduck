@@ -29,6 +29,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import re
 from typing import Any
 
 import aiohttp
@@ -53,6 +54,18 @@ _patch_aiortc_dtls_ciphers()
 
 # What `mediad --port` defaults to, which is `webrtcsink`'s own signaller's default.
 DEFAULT_SIGNALLING_PORT = 8443
+
+
+def _log_candidates(side: str, sdp: str) -> None:
+    """How many candidates of each type one side offered.
+
+    The single most useful line when signalling crossed and media did not: `host` only on both
+    sides means nothing can work across networks, and no `relay` anywhere is §6.
+    """
+    kinds: dict[str, int] = {}
+    for kind in re.findall(r"candidate:[^\r\n]* typ (\w+)", sdp or ""):
+        kinds[kind] = kinds.get(kind, 0) + 1
+    logger.info("%s ICE candidates: %s", side, kinds or "none")
 
 
 class LanConsumer:
@@ -111,6 +124,7 @@ class LanConsumer:
         except Exception:
             await session.close()
             raise
+        logger.info("signalling socket open: %s", self.url)
         self._session = session
         self._loop = asyncio.get_running_loop()
         self._task = asyncio.create_task(self._pump(), name="lan-signalling")
@@ -183,6 +197,7 @@ class LanConsumer:
     async def _send(self, message: dict[str, Any]) -> None:
         if self._ws is None or self._ws.closed:
             raise RuntimeError("the signalling socket is closed")
+        logger.info("→ %s", json.dumps(message)[:240])
         await self._ws.send_json(message)
 
     async def _pump(self) -> None:
@@ -207,6 +222,7 @@ class LanConsumer:
 
     async def _handle(self, message: dict[str, Any]) -> None:
         kind = message.get("type")
+        logger.info("← %s", json.dumps(message)[:240])
 
         if kind == "welcome":
             # The server names us, then we ask who is producing. `list` takes no fields.
@@ -257,8 +273,10 @@ class LanConsumer:
         for candidate in pending:
             await self._add_ice(candidate)
 
+        _log_candidates("remote", sdp["sdp"])
         answer = await self._pc.createAnswer()
         await self._pc.setLocalDescription(answer)
+        _log_candidates("local", self._pc.localDescription.sdp)
         # aiortc has finished gathering by the time `setLocalDescription` returns, so the answer
         # carries every candidate we have and nothing is trickled outbound. Their consumer relies
         # on the same thing.
@@ -290,6 +308,7 @@ class LanConsumer:
             if ice.get("sdpMLineIndex") is not None:
                 candidate.sdpMLineIndex = int(ice["sdpMLineIndex"])
             await self._pc.addIceCandidate(candidate)
+            logger.debug("+remote candidate %s", text[:90])
         except Exception as e:  # noqa: BLE001 - one bad candidate is not a dead session
             logger.warning("addIceCandidate failed: %r (%r)", e, text[:80])
 
@@ -301,8 +320,22 @@ class LanConsumer:
         self._pc = pc
         self._remote_desc_set = False
 
+        # The three states that fail for unrelated reasons and look identical from outside.
+        @pc.on("connectionstatechange")
+        async def on_state() -> None:
+            logger.info("peer connection: %s", pc.connectionState)
+
+        @pc.on("iceconnectionstatechange")
+        async def on_ice_state() -> None:
+            logger.info("ice: %s", pc.iceConnectionState)
+
+        @pc.on("icegatheringstatechange")
+        async def on_gathering() -> None:
+            logger.info("ice gathering: %s", pc.iceGatheringState)
+
         @pc.on("track")
         def on_track(track: Any) -> None:
+            logger.info("track: %s", track.kind)
             if track.kind == "video":
                 asyncio.ensure_future(self._consume_video(track))
 
@@ -311,11 +344,13 @@ class LanConsumer:
             if channel.label != CONTROL_LABEL:
                 logger.info("ignoring data channel %r", channel.label)
                 return
+            logger.info("control channel attached (state=%s)", channel.readyState)
             self._cmd_channel = channel
 
             def opened() -> None:
                 self._cmd_channel_open = True
                 self._rpc.bound_to(self.send_command)
+                logger.info("control channel open (%s)", self.url)
 
             def closed() -> None:
                 self._cmd_channel_open = False

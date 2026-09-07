@@ -35,28 +35,67 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import os
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
 import gradio as gr
 import numpy as np
-import requests
-from reachy_mini.media.central_consumer import DEFAULT_CENTRAL_URL
 
 import catalogue
+import rendezvous
 from catalogue import Policy
 from control import DuckConsumer, Rpc, RpcError
 from lan import DEFAULT_SIGNALLING_PORT, LanConsumer
+from rendezvous import RendezvousError
 
-# `meta.kind`, which is on the wire so that one client can list two families of robot without
-# opening a session to ask what it found. Filtering on it is §5.1's whole point: their clients
-# select on `meta.name` with a fallback to "the only producer visible", so an account with one
-# duck and one mini can hand either side the wrong robot. This one filters, and then pins the
-# peer id rather than the name.
-DUCK = "microduck"
+
+# ── the log ──────────────────────────────────────────────────────────────────
+#
+# **Every request, every frame and every refusal, to the terminal and to the page.** Not a
+# convenience: three protocols meet here and none of them fails loudly. A rendezvous that answers
+# 401, a candidate pair that never forms, a data channel with the wrong label and a policy the
+# robot refuses on its shape all present as "the button did nothing", and the difference between
+# them is one line each. `DUCK_LOG=DEBUG` adds the streaming notifications and the individual ICE
+# candidates.
+
+
+class Ring(logging.Handler):
+    """The last few hundred log lines, for the panel at the bottom of the page.
+
+    The page shows what the terminal shows, because whoever is looking at one is usually not
+    looking at the other — a Space has logs nobody has open, and a browser has no stderr.
+    """
+
+    def __init__(self, size: int = 400):
+        super().__init__()
+        self.lines: deque[str] = deque(maxlen=size)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self.lines.append(self.format(record))
+        except Exception:  # noqa: BLE001 - a logger that raises is worse than a line lost
+            pass
+
+
+RING = Ring()
+RING.setFormatter(logging.Formatter("%(asctime)s %(name)-10s %(message)s", datefmt="%H:%M:%S"))
+
+LEVEL = os.environ.get("DUCK_LOG", "INFO").upper()
+logging.basicConfig(
+    level=LEVEL, format="%(asctime)s %(levelname)-5s %(name)-10s %(message)s", datefmt="%H:%M:%S"
+)
+logging.getLogger().addHandler(RING)
+# `aioice` logs a line per candidate pair check, which buries everything else. It is exactly what
+# is wanted when ICE is the suspect, and nothing but noise until then.
+for chatty in ("aioice", "aiortc", "aiohttp", "httpx", "urllib3"):
+    logging.getLogger(chatty).setLevel(logging.DEBUG if LEVEL == "DEBUG" else logging.WARNING)
+
+logger = logging.getLogger("shop")
 
 # How long to hold a policy that declares no length of its own. Perpetual means "until told
 # otherwise", so something has to choose, and `robotctl policy add` refuses rather than guessing —
@@ -66,6 +105,11 @@ DEFAULT_HOLD = 3.0
 # Rows drawn for the catalogue. Gradio wants its components at build time, so this is a ceiling
 # rather than a count: 23 policies were published when this was written.
 MAX_ROWS = 40
+
+# What Gradio's local login mock puts in `access_token`. A constant rather than a `SPACE_ID`
+# check, because it is the exact thing to refuse: a real token that happened to arrive outside a
+# Space should still be used, and this string should never be sent anywhere whatever set it.
+MOCK_TOKEN = "mock-oauth-token-for-local-dev"
 
 # The download happens on the robot, over the robot's wifi. Everything else here is a question
 # about state and answers in milliseconds.
@@ -107,43 +151,20 @@ class Link:
     def robots(token: str) -> tuple[list[tuple[str, str]], str]:
         """The ducks this token can reach, and a line about what else was there.
 
-        `/api/robot-status` rather than the SSE `list` push, for the reason their consumer gives:
-        `list` only re-fires on a producer *status change*, so a robot that was already online
-        before anybody connected can be absent from the stream entirely.
+        Safe to press mid-session: `/api/robot-status` is one GET and opens no event stream, so it
+        cannot supersede the peer the session is riding on. That is why it is this endpoint rather
+        than the console's `list`.
         """
         try:
-            answer = requests.get(
-                f"{DEFAULT_CENTRAL_URL}/api/robot-status",
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=15,
-            )
-        except requests.RequestException as e:
-            return [], f"the rendezvous did not answer: {type(e).__name__}: {e}"
-        if answer.status_code == 401:
-            return [], "the rendezvous refused this token. Sign in again."
-        if answer.status_code != 200:
-            return [], f"the rendezvous answered {answer.status_code}."
-        try:
-            robots = answer.json().get("robots") or []
-        except ValueError:
-            return [], "the rendezvous answered something that is not JSON."
+            found, others = rendezvous.ducks(token)
+        except RendezvousError as e:
+            return [], str(e)
 
-        ducks, others = [], []
-        for robot in robots:
-            meta = robot.get("meta") or {}
-            name = meta.get("name") or robot.get("robotName") or "a robot with no name"
-            peer = robot.get("peerId") or robot.get("id")
-            if not peer:
-                continue
-            if meta.get("kind") == DUCK:
-                release = meta.get("release") or "release unknown"
-                ducks.append((f"{name} — {release}", peer))
-            else:
-                others.append(f"{name} ({meta.get('kind') or 'kind not declared'})")
+        ducks = [(duck.label(), duck.peer_id) for duck in found]
 
         if not ducks and others:
             return [], (
-                f"{len(robots)} robot(s) on this account and none of them a duck: "
+                f"{len(others)} robot(s) on this account and none of them a duck: "
                 + ", ".join(others)
                 + ". A duck registers with `kind: microduck`."
             )
@@ -232,6 +253,7 @@ class Link:
 
             self.consumer, self.loop, self.rpc = consumer, loop, rpc
             self.robot, self.started_at, self.over_lan = label, time.monotonic(), over_lan
+            logger.info("session opening: %s over %s", label, "the LAN" if over_lan else "the rendezvous")
 
         # Blocking here rather than leaving the page to poll: nothing below the buttons can be
         # answered until the channel is open, and a page that says "connected" while every call
@@ -239,6 +261,7 @@ class Link:
         deadline = time.monotonic() + 60
         while time.monotonic() < deadline:
             if rpc.is_open():
+                logger.info("control channel usable after %.1fs", time.monotonic() - (self.started_at or 0))
                 named = (self.consumer.meta or {}).get("name") if over_lan else None
                 self.robot = named or label
                 return f"connected to {self.robot}, control channel open"
@@ -248,6 +271,7 @@ class Link:
         return self.describe()
 
     def disconnect(self) -> str:
+        logger.info("disconnecting")
         with self.lock:
             consumer, loop, rpc = self.consumer, self.loop, self.rpc
             self.consumer, self.loop, self.rpc = None, None, None
@@ -341,11 +365,12 @@ class Link:
             picture = np.ascontiguousarray(np.rot90(picture, k=-(degrees // 90)))
         return picture
 
-    def transcript(self) -> str:
-        rpc = self.rpc
-        if rpc is None or not rpc.transcript:
+    @staticmethod
+    def log() -> str:
+        """What the terminal has been saying, for whoever has no terminal."""
+        if not RING.lines:
             return ""
-        return "```\n" + "\n".join(rpc.transcript) + "\n```"
+        return "```\n" + "\n".join(RING.lines) + "\n```"
 
 
 LINK = Link()
@@ -451,6 +476,7 @@ def install_and_run(index: int, hold: float) -> str:
     if index >= len(CATALOGUE):
         return "that row is stale — reload the catalogue."
     policy = CATALOGUE[index]
+    logger.info("click: %s (hold %s)", policy.key, hold)
 
     blocked = catalogue.refusal(policy)
     if blocked:
@@ -479,6 +505,7 @@ def install_and_run(index: int, hold: float) -> str:
         return f"**downloaded, and not installed.** {late_refusal}"
 
     skill = catalogue.skill_for(fetched, hold)
+    logger.info("installing %r from the fetch answer", skill["name"])
     try:
         added = LINK.call("robot.setSkill", skill)
     except RpcError as e:
@@ -608,17 +635,43 @@ def load_catalogue(force: bool = False) -> list[Any]:
 
 
 def token_of(oauth: gr.OAuthToken | None) -> str:
-    """A visitor's token by preference, and never the robot's.
+    """A visitor's token by preference, and never the robot's — unless it is a mock.
 
     The rendezvous maps a token to one peer, so a consumer authenticating *as* the robot takes the
     robot off its owner's listing — the same fact §3.7 records about two robots sharing a
     credential. A visitor's OAuth token reaches their own robots and nobody else's, which is what
-    makes a public Space defensible. `HF_TOKEN` is the fallback for a private one, and for running
-    this file on a laptop.
+    makes a public Space defensible.
+
+    **And outside a Space that token is a placeholder**, which cost an afternoon of blaming the
+    rendezvous. Gradio mocks its own login when `SPACE_ID` is unset — the buttons behave, the
+    profile is real, and `_get_mocked_oauth_info` sets `access_token` to the literal string
+    `mock-oauth-token-for-local-dev`. Sent to a service that resolves tokens through `whoami-v2`,
+    that is a `401`, correctly, and the page's own error message said "sign in again" — the one
+    thing that could not help. So a mocked token is recognised and dropped rather than preferred,
+    and what a local run uses is `HF_TOKEN` or whatever `hf auth login` stored, which is what
+    `huggingface_hub.get_token` reads.
     """
-    if oauth is not None:
+    if oauth is not None and oauth.token and oauth.token != MOCK_TOKEN:
+        # Never the token itself, here or anywhere — which *source* it came from is the half that
+        # explains a refusal, and the half that is safe to write down.
+        logger.info("token: the visitor's Hugging Face sign-in")
         return oauth.token
-    return os.environ.get("HF_TOKEN", "").strip()
+
+    if oauth is not None and oauth.token == MOCK_TOKEN:
+        logger.info("token: Gradio's mocked sign-in, which no service accepts — using a real one")
+
+    from huggingface_hub import get_token
+
+    stored = (os.environ.get("HF_TOKEN") or get_token() or "").strip()
+    logger.info(
+        "token: %s",
+        "HF_TOKEN"
+        if os.environ.get("HF_TOKEN")
+        else "the one `hf auth login` stored"
+        if stored
+        else "none — sign in, set HF_TOKEN, or run `hf auth login`",
+    )
+    return stored
 
 
 def find_robots(oauth: gr.OAuthToken | None) -> tuple[Any, str]:
@@ -729,7 +782,11 @@ with gr.Blocks(title="microduck policy shop") as demo:
         ).then(lambda: robot_state()[0], outputs=robot_panel)
         rows.extend([row, text, button])
 
-    with gr.Accordion("the control channel, line by line", open=False):
+    with gr.Accordion("the log — every request, every frame, every refusal", open=False):
+        gr.Markdown(
+            "The same lines the terminal gets. `DUCK_LOG=DEBUG` adds the streaming "
+            "notifications and each ICE candidate."
+        )
         wire = gr.Markdown("")
 
     find.click(find_robots, outputs=[chosen, status])
@@ -757,7 +814,7 @@ with gr.Blocks(title="microduck policy shop") as demo:
     # be unreadable.
     gr.Timer(0.1).tick(lambda: LINK.picture(), outputs=view, show_progress="hidden")
     gr.Timer(1.0).tick(
-        lambda: (LINK.describe(), LINK.transcript()),
+        lambda: (LINK.describe(), LINK.log()),
         outputs=[link_state, wire],
         show_progress="hidden",
     )

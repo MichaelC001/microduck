@@ -29,7 +29,6 @@ import itertools
 import json
 import logging
 import threading
-from collections import deque
 from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FutureTimeout
 from typing import Any, Callable
@@ -75,11 +74,9 @@ class Rpc:
         self._pending: dict[int, tuple[str, Future]] = {}
         self._lock = threading.Lock()
         self._send: Callable[[dict[str, Any]], bool] | None = None
-        # The last one of each notification, and a short transcript. A duck streams `robot.state`
-        # at whatever rate it was asked for, so keeping them all is a leak and keeping the last
-        # is what a panel shows.
+        # The last one of each notification. A duck streams `robot.state` at whatever rate it was
+        # asked for, so keeping them all is a leak and keeping the last is what a panel shows.
         self.notifications: dict[str, Any] = {}
-        self.transcript: deque[str] = deque(maxlen=60)
 
     def bound_to(self, send: Callable[[dict[str, Any]], bool]) -> None:
         self._send = send
@@ -107,7 +104,7 @@ class Rpc:
         future: Future = Future()
         with self._lock:
             self._pending[call_id] = (method, future)
-        self.transcript.append(f"→ {method} {json.dumps(params or {})}")
+        logger.info("→ %s %s", method, json.dumps(params or {}))
 
         if not send({"jsonrpc": "2.0", "id": call_id, "method": method, "params": params or {}}):
             with self._lock:
@@ -130,7 +127,7 @@ class Rpc:
         try:
             message = json.loads(raw)
         except (TypeError, ValueError):
-            self.transcript.append(f"← unparseable: {str(raw)[:120]}")
+            logger.warning("← unparseable: %s", str(raw)[:160])
             return
 
         call_id = message.get("id")
@@ -141,6 +138,10 @@ class Rpc:
             method = message.get("method")
             if method:
                 self.notifications[method] = message.get("params")
+                # DEBUG, not INFO: `media.detections` arrives a couple of times a second and
+                # `robot.state` at whatever rate it was asked for, and a log that scrolls is a
+                # log nobody reads the top of.
+                logger.debug("← %s %s", method, json.dumps(message.get("params"))[:200])
             return
 
         with self._lock:
@@ -152,15 +153,16 @@ class Rpc:
         method, future = waiting
         if "error" in message:
             error = message["error"] or {}
-            self.transcript.append(f"← error {error.get('message')}")
+            logger.warning("← %s refused: %s", method, error.get("message"))
             future.set_exception(RpcError(method, error))
         else:
             result = message.get("result")
-            self.transcript.append(f"← {json.dumps(result)[:200]}")
+            logger.info("← %s %s", method, json.dumps(result)[:240])
             future.set_result(result)
 
     def abandon(self, why: str) -> None:
         """Fail everything in flight. A closed channel answers nothing, ever."""
+        logger.info("control channel gone: %s", why)
         with self._lock:
             pending, self._pending = self._pending, {}
             self._send = None
@@ -208,6 +210,7 @@ class DuckConsumer(ReachyCentralConsumer):
             def opened() -> None:
                 self._cmd_channel_open = True
                 rpc.bound_to(self.send_command)
+                logger.info("control channel open (rendezvous)")
                 self._on_cmd_ready()
 
             if channel.readyState == "open":

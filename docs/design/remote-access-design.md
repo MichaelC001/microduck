@@ -717,6 +717,38 @@ on a phase, which is plausible movement and wrong movement. That rule lives in `
 `robotctl` is not in the path of a click — so `catalogue.refusal` is the same rule written a second
 time, and any client that grows this button needs it a third.
 
+**A `401` from the rendezvous is the token and nothing else, and proving that took reading their
+`app.py` after guessing wrong.** The first version of this page listed robots with `GET
+/api/robot-status`, got a `401`, and concluded the endpoint must require an established peer —
+plausible, because `POST /send` does (§3.1's note) and because the robot only ever polls it while
+holding a stream. It does not: the route is `Depends(_resolve_hf_token)` and then
+`validate_hf_token`, which is one `whoami-v2` call with no scope check, no token-type check and no
+peer requirement, filtered to `p.username == username`. Its own docstring says it exists for
+exactly this — "a passive status indicator without consuming a session slot".
+
+Which makes it the *better* call than the console's `list`, for a reason §3.7 already stated: peers
+are keyed by token, so the `/events` stream a browser opens to list would supersede the one a
+session is riding on. A page listing that way cannot refresh its list without dropping its own
+session. `/api/robot-status` opens nothing.
+
+The `401` was **Gradio's mocked sign-in**. Outside a Space — `SPACE_ID` unset —
+`gr.LoginButton` behaves, the profile is real, and `_get_mocked_oauth_info` sets `access_token` to
+the literal string `mock-oauth-token-for-local-dev`. A service that resolves tokens through
+`whoami-v2` refuses that, correctly, and the symptom is a page saying "sign in again" beside a
+console listing the same duck. So a local run has to prefer `HF_TOKEN` or what `hf auth login`
+stored, and the mock is recognised by value rather than by an `SPACE_ID` check — a real token that
+arrives outside a Space is still a real token.
+
+**And the general lesson, which is why the page now logs everything to two places at once.** Four
+layers meet in one button — a token, a rendezvous, a candidate pair, a robot's own refusal — and
+all four fail as "nothing happened". Every HTTP status, every signalling frame, every JSON-RPC
+line and every refusal is logged, with the token's *source* named and the token never written
+down; `DUCK_LOG=DEBUG` adds the streaming notifications and the per-candidate ICE lines. The panel
+is on the page as well as the terminal because a Space has logs nobody has open and a browser has
+no stderr. Each layer is also runnable alone — `python rendezvous.py`, `python catalogue.py`,
+`python lan.py` — which is what turns "it does not work" into a line number without a
+conversation.
+
 `IntentResult` is the other thing a client gets wrong once: `robot.setSkill`, `robot.do`,
 `robot.init` and `robot.relax` answer `accepted: false` with a reason rather than a JSON-RPC
 error, deliberately — safety refusing to run a policy on a fallen robot is not a broken call. A
