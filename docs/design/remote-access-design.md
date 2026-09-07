@@ -560,35 +560,78 @@ The one thing that does not transfer is its **lock model** — `RobotAppLock`, l
 remote session, which the mini's relay gates incoming sessions on. A duck has no app, so §3.4
 takes the reconnect behaviour and leaves that part.
 
-## 5. The client, and where it is served — **open**
+## 5. The client is a static Space with a Hugging Face sign-in — **decided**
 
-The console is `include_str!`'d into `mediad` and served by the robot (`webrtc-console.md` §1), which
-works because the client is on the LAN. **A remote client cannot fetch a page from a robot it cannot
-reach**, so remote needs the page hosted off-robot *and* a second signalling transport in it.
+The console is `include_str!`'d into `mediad` and served by the robot (`webrtc-console.md` §1),
+which works because the client is on the LAN. **A remote client cannot fetch a page from a robot it
+cannot reach**, so remote needs the page hosted off-robot *and* a second signalling transport in
+it.
 
-Three ways:
+**Decided: a static Space in the `pollen-robotics` org with `hf_oauth: true`**, serving the same
+page the robot serves, with the transport chosen by how it was opened. And the deciding argument is
+not hosting, it is the **token**.
 
-- **The same file, published by CI to GitHub Pages**, with the transport chosen by the URL it is given.
-  One page, two hosts, still no build step — the constraint `webrtc-console.md` §8 defends survives.
-  The service stays a rendezvous and nothing about the client lives in it.
-- **The service serves the page.** One host and one deploy, at the cost of putting the client inside a
-  service we may not own; a page in a private repo is a page nobody here can edit.
-- **No client yet.** Prove login and the relay with the service's own dashboard, `/api/robot-status`
-  and `duckctl` — which needs no page at all, and is the whole of slices 1 and 2 in §8.
+A remote consumer authenticates to the rendezvous exactly as the robot does — a bearer token the
+service resolves through `whoami-v2`, reading `name` out of the answer. It performs no token-type
+check and no scope check, so a browser's OAuth token is accepted on the same footing as the
+robot's device-flow one. Which makes the whole question "where does a page get an HF token", and a
+Space answers it for free: `hf_oauth: true` in the README creates the OAuth app, injects
+`OAUTH_CLIENT_ID`, and registers a redirect URI targeting the Space, and `@huggingface/hub`'s
+`oauthLoginUrl` / `oauthHandleRedirectIfPresent` do the flow **client-side**, so a static Space
+needs no server for it. HF ships that example (`huggingfacejs/client-side-oauth`).
 
-**Recommendation: the third, then the first.** The proof that the token path and the lease work needs
-no UI, and deferring the hosting decision by a slice costs nothing.
+GitHub Pages, which an earlier draft of this section preferred, loses on exactly that point: the
+page would need an OAuth app registered by hand, its own redirect URI, and somewhere to keep a
+secret or a PKCE implementation — all of it maintained by us, to arrive where a line of README
+metadata arrives. It stays possible: nothing in the page depends on being a Space, and this is the
+same reasoning §2.3 used for taking Hugging Face's own device-code client rather than registering
+one.
 
-One thing to know before that page is written, and it is settled rather than a preference:
-`EventSource` **cannot set headers**, so a browser speaking the SSE wire must either put the token
-in the query string or read the stream with `fetch` and split SSE by hand. `reachy-mini-js` does
-the former. **The server is removing it** — `_resolve_hf_token` accepts `?token=` only as a
-transitional fallback, logs a deprecation warning per client IP, and says in its own docstring that
-the query form goes once the known clients ship the header. A bearer token in a query string is
-also a bearer token in the Space's access log and in every proxy in between.
+**We ask for no scopes beyond the defaults.** `openid profile` is always included and is all this
+needs — the token's whole job is proving an identity to the rendezvous, which is the argument §2.4
+makes about the robot's own credential, and it would be a poor look to fix it on the robot while
+handing a browser `write-repos`.
 
-So the page is `fetch` plus a few lines of line-splitting, not one browser API — and it should be
-written that way first rather than written twice.
+**Not a route in `reachy_mini_central`.** One host and one deploy, at the cost of putting duck UI
+inside the service the mini fleet depends on. §4's "we maintain it, so a duck-shaped need is a pull
+request" cuts both ways: the reverse of that is that our page becomes their operational risk.
+
+**The page's source lives in this repository**, next to the one the robot serves, because it has to
+track two things that live here — the signalling protocol and this project's own method names — and
+a copy in a Space repo would drift from both. It **is** the one the robot serves:
+`mediad/webclient/index.html`, one file, with the transport decided by whether its
+`{{SIGNALLING_PORT}}` token was substituted. `web.rs` substitutes it and a test asserts the served
+page has none left; the Space copy keeps it, which is how the page knows no robot served it.
+
+The Space is a deploy target — `pollen-robotics/microduck-console`, static, and
+`scripts/publish-console.sh` is what puts a page there: it substitutes the API version from
+`duck-ipc-proto`, refuses to publish a page whose port token has gone, and pushes. By hand while
+there is one Space; by CI when that stops being true.
+
+One thing settled rather than preferred, and it survives from the earlier draft: `EventSource`
+**cannot set headers**, so a browser speaking the SSE wire must either put the token in the query
+string or read the stream with `fetch` and split SSE by hand. `reachy-mini-js` does the former and
+**the server is removing it** — `_resolve_hf_token` accepts `?token=` as a transitional fallback,
+logs a deprecation per client IP, and says in its own docstring that the query form goes once the
+known clients ship the header. A bearer token in a query string is a bearer token in the Space's
+access log and in every proxy between. So the page is `fetch` plus a few lines of line-splitting,
+written that way once.
+
+What the page is, then, is the mirror of `mediad::relay`: SSE in, `POST /send` out, gst signalling
+envelopes with per-hop ids, and an opaque SDP/ICE payload — the same translation in the other
+direction, which is why §3.2's table is worth reading before writing it.
+
+### 5.1 A duck in a mini's app, which is a conversation rather than a commit
+
+Putting ducks into a rendezvous whose other clients are `reachy_mini_mobile_app` and its desktop
+counterpart means a duck can appear in somebody's mini app — and be driven as a mini, with method
+names this project does not serve. Video would arrive; nothing else would, and the failure would
+read as a broken robot.
+
+`meta.kind` is there so a client can tell the families apart (§3.7), and this page will filter on
+it. The mini's apps cannot be made to, from here: that is a conversation with whoever owns them,
+and it is the direction §4 did not consider — not "what does a duck need from the service" but
+"what does a duck arriving in the service do to its existing clients".
 
 ## 6. NAT: decide the STUN server, defer TURN
 
@@ -640,9 +683,14 @@ Five slices, and the first two are independently useful and need no client:
    it, inert until `/etc/robot/hf-token` exists and picking it up without a restart when it does.
    Verifiable with no client at all: the service's dashboard counts a producer and
    `/api/robot-status` lists the duck.
-3. **Session translation** — a remote consumer gets video and the `control` channel. The first slice
-   that needs something to connect *with*.
-4. **The client, hosted.** §5.
+3. **The client, hosted.** §5. Ahead of session translation rather than after it, which is a change
+   of order and the reason for it is verification: the service ships no front-end of its own — `GET
+   /` is a status page counting peers, producers and sessions — and its consumers are the mini's
+   mobile and desktop apps, which would drive a duck with a mini's method names. So there is
+   nothing to connect with that we do not write, and translating sessions first would mean
+   building the half that can only be tested against a fake.
+4. **Session translation** — a remote consumer gets video and the `control` channel, verified by
+   the page above as it is written rather than after it.
 5. **STUN decided; TURN if a real network needs it.** §6.
 
 ## 9. What is open, and who can close it
@@ -650,13 +698,13 @@ Five slices, and the first two are independently useful and need no client:
 | | needs |
 |---|---|
 | §2.4 the scope breadth | one public device-code client in the `pollen-robotics` HF org with `openid profile read-repos`, created by somebody with org admin. Not blocking — a scope change is a re-login — and it should not ship without it |
-| §5 where the client is served | follows the shape of §3, and is the decision that actually couples us to a service |
 | §2.6 `logout` revokes nothing | whether Hugging Face accepts a revocation for the first-party device-code client, checked rather than assumed. Not blocking — signing out stops the robot being reachable, and a stolen board is answered on hf.co — but it is the difference between "forgotten" and "revoked" |
 
 Closed since this page was written: the OAuth client (§2.3 — Hugging Face ships one), whether the
 token expires (§2.7 — thirty days, with a rotating refresh token), which rendezvous to use (§4 —
-the mini's), and whether we can read it (§4 — we maintain it; the "private repo" in an earlier
-draft was a wrong-name 401).
+the mini's), whether we can read it (§4 — we maintain it; the "private repo" in an earlier draft
+was a wrong-name 401), and where the client is served (§5 — a static Space with `hf_oauth`, because
+the question was never hosting but how a page gets a token).
 
 One item this page created rather than closed: **a golden image must not carry
 `/etc/robot/hf-token`**, because peers are keyed by token and two robots sharing one take turns
