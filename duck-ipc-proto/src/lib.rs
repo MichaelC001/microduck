@@ -733,6 +733,13 @@ pub mod method {
 
     /// One 8×8 depth frame, pushed after [`TOF_STREAM`].
     pub const TOF_FRAME: &str = "tof.frame";
+
+    /// Subscribe to the head IMU (BMI088 on the HAT, same I²C bus as the ToF). The answer
+    /// describes the sensor, then [`IMU_FRAME`] notifications arrive until the connection closes.
+    pub const IMU_STREAM: &str = "imu.stream";
+
+    /// One head-IMU sample, pushed after [`IMU_STREAM`].
+    pub const IMU_FRAME: &str = "imu.frame";
 }
 
 /// JSON-RPC error codes.
@@ -925,6 +932,8 @@ pub enum Call {
     PadInput,
     /// Subscribe to the ToF depth stream. Answered by `tofd`.
     TofStream,
+    /// Subscribe to the head IMU; see [`method::IMU_STREAM`].
+    ImuStream,
 }
 
 /// The service that owns the answer to a call.
@@ -1048,6 +1057,7 @@ impl Call {
             Call::RobotRemoveSkill(_) => method::ROBOT_REMOVE_SKILL,
             Call::PadInput => method::PAD_INPUT,
             Call::TofStream => method::TOF_STREAM,
+            Call::ImuStream => method::IMU_STREAM,
         }
     }
 
@@ -1231,6 +1241,7 @@ impl Call {
             // exists today reaches neither: what a call *is* does not depend on who may ask it.
             Call::PadInput => (Pad, Stream),
             Call::TofStream => (Tof, Stream),
+            Call::ImuStream => (Tof, Stream),
 
             // ── answered by no service ──────────────────────────────────────
             //
@@ -1334,6 +1345,7 @@ impl Call {
             | Call::RobotSkills
             | Call::PadInput
             | Call::TofStream
+            | Call::ImuStream
             | Call::ChoraleSubscribe => Value::Object(serde_json::Map::new()),
         }
     }
@@ -1426,6 +1438,7 @@ impl Call {
             method::ROBOT_REMOVE_SKILL => Call::RobotRemoveSkill(decode(params)?),
             method::PAD_INPUT => Call::PadInput,
             method::TOF_STREAM => Call::TofStream,
+            method::IMU_STREAM => Call::ImuStream,
             other => {
                 return Err(Error::new(
                     code::METHOD_NOT_FOUND,
@@ -1602,6 +1615,7 @@ pub mod test_support {
             }),
             Call::PadInput,
             Call::TofStream,
+            Call::ImuStream,
         ]
     }
 }
@@ -1699,6 +1713,24 @@ impl Request {
     /// Read a depth-frame notification back.
     pub fn as_tof_frame(&self) -> Option<TofFrame> {
         if self.method != method::TOF_FRAME {
+            return None;
+        }
+        serde_json::from_value(self.params.clone()?).ok()
+    }
+
+    /// A head-IMU sample notification: no `id`.
+    pub fn notify_imu_frame(frame: &ImuFrame) -> Self {
+        Self {
+            jsonrpc: JSONRPC_VERSION.to_owned(),
+            id: None,
+            method: method::IMU_FRAME.to_owned(),
+            params: Some(serde_json::to_value(frame).unwrap_or(Value::Null)),
+        }
+    }
+
+    /// Read a head-IMU notification back.
+    pub fn as_imu_frame(&self) -> Option<ImuFrame> {
+        if self.method != method::IMU_FRAME {
             return None;
         }
         serde_json::from_value(self.params.clone()?).ok()
@@ -4120,6 +4152,49 @@ pub struct TofFrame {
     pub status: Vec<u8>,
 }
 
+/// Answer to [`Call::ImuStream`]. Describes the head IMU rather than merely accepting, like
+/// [`TofStreamResult`]: a duck without the sensor still gets `accepted` with `sensor: None`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ImuStreamResult {
+    pub accepted: bool,
+    /// The IMU that answered, e.g. `BMI088`. `None` when there is none — see `unavailable`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sensor: Option<String>,
+    /// Why there is no IMU: not fitted, bus unreadable, chip-id mismatch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unavailable: Option<String>,
+    /// Sample rate the reader runs at, Hz.
+    pub hz: u8,
+}
+
+/// One head-IMU sample — an [`method::IMU_FRAME`] notification.
+///
+/// The BMI088 on the HAT, read by `tofd` (it owns that I²C bus). `gyro` and `accel` are the raw
+/// sensor axes; `quat` is a Madgwick fusion of them, scalar-first `[w, x, y, z]`, sensor→world
+/// with gravity down and an arbitrary yaw. All in the IMU's own frame — a consumer places it in
+/// the head via `kinematics` (the sensor is rigid to the camera). Units: rad/s, m/s², unitless.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ImuFrame {
+    /// Samples since this `tofd` started — a consumer can see a gap it did not cause.
+    pub seq: u64,
+    /// Microseconds since `tofd` started (sender's monotonic clock, like [`TofFrame::at_us`]).
+    pub at_us: u64,
+    /// `CLOCK_MONOTONIC` when the sample was read, ns — the clock [`RobotState::t_ns`] shares.
+    pub t_ns: u64,
+    /// Which IMU: `head` (the BMI088 on the HAT). Room for `body` later.
+    pub which: String,
+    /// Angular velocity, rad/s, sensor frame.
+    pub gyro: [f32; 3],
+    /// Specific force, m/s², sensor frame.
+    pub accel: [f32; 3],
+    /// Madgwick orientation, scalar-first `[w, x, y, z]`, sensor→world.
+    pub quat: [f32; 4],
+    /// Chip temperature, °C.
+    pub temp_c: f32,
+}
+
 /// See [`method::ROBOT_CHORALE`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -4770,6 +4845,7 @@ mod tests {
                             | Call::RobotSubscribe(_)
                             | Call::PadInput
                             | Call::TofStream
+                            | Call::ImuStream
                     ),
                     "{} is on the Stream lane but is not a subscription",
                     call.method()
@@ -4782,7 +4858,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            62,
+            63,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }

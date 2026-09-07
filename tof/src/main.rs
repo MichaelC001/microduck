@@ -38,7 +38,9 @@ use duck_ipc_proto as proto;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
+mod imu;
 mod status;
+use imu::ImuStatus;
 use status::Status;
 
 /// Same mode and reasoning as every other socket here: the group decides who may
@@ -94,7 +96,7 @@ const RETRY_MAX: Duration = Duration::from_secs(60);
 /// answer on a board provisioned before that rule existed. Trying both means a
 /// board that predates the rule still finds its sensor, and the log says which
 /// path answered.
-const BUS_CANDIDATES: [&str; 2] = ["/dev/i2c-pihat", "/dev/i2c-3"];
+pub(crate) const BUS_CANDIDATES: [&str; 2] = ["/dev/i2c-pihat", "/dev/i2c-3"];
 
 /// Addresses to try when none was named.
 ///
@@ -142,6 +144,14 @@ struct Args {
     ///
     /// The simulator answers `{"op":"tof"}` with the same 8x8 of distances and per-zone statuses
     /// this daemon publishes, so nothing downstream — `robotd`, `maploc`, the viewer — can tell.
+    /// Head-IMU (BMI088) sample rate, Hz. The chip's default bandwidth is 100 Hz.
+    #[arg(long, default_value_t = 100)]
+    imu_hz: u8,
+
+    /// Do not read the head IMU (e.g. a board without the HAT module, or to free the bus).
+    #[arg(long)]
+    no_imu: bool,
+
     #[arg(long, conflicts_with = "fake")]
     sim: Option<String>,
 }
@@ -203,9 +213,30 @@ async fn main() -> std::process::ExitCode {
             .expect("spawn the sensor thread")
     };
 
-    let served = serve(&args.socket, &status, &frames).await;
+    // The head IMU on its own thread and channel, on the same bus. Skipped for --sim/--fake
+    // (no real bus) and --no-imu. Its socket is the same one; subscribers pick the stream by method.
+    let imu_status = Arc::new(ImuStatus::new(args.imu_hz));
+    let (imu_frames, _) = tokio::sync::broadcast::channel(imu::FRAME_BUFFER);
+    let imu_thread = if args.no_imu || args.fake || args.sim.is_some() {
+        None
+    } else {
+        let (imu_status, imu_frames, shutdown) = (imu_status.clone(), imu_frames.clone(), shutdown.clone());
+        let bus = args.bus.clone();
+        let hz = args.imu_hz;
+        Some(
+            std::thread::Builder::new()
+                .name("head-imu".to_owned())
+                .spawn(move || imu::imu_loop(bus.as_deref(), hz, &imu_status, &imu_frames, &shutdown))
+                .expect("spawn the head-imu thread"),
+        )
+    };
+
+    let served = serve(&args.socket, &status, &frames, &imu_status, &imu_frames).await;
     shutdown.store(true, Ordering::Release);
     let _ = sensor_thread.join();
+    if let Some(t) = imu_thread {
+        let _ = t.join();
+    }
 
     match served {
         Ok(()) => std::process::ExitCode::SUCCESS,
@@ -533,6 +564,8 @@ async fn serve(
     socket: &Path,
     status: &Arc<Status>,
     frames: &tokio::sync::broadcast::Sender<proto::TofFrame>,
+    imu_status: &Arc<ImuStatus>,
+    imu_frames: &tokio::sync::broadcast::Sender<proto::ImuFrame>,
 ) -> Result<()> {
     if let Some(parent) = socket.parent() {
         // `RuntimeDirectory=tofd` has already made this on a board; tried anyway
@@ -572,9 +605,11 @@ async fn serve(
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => {
                     let status = status.clone();
+                    let imu_status = imu_status.clone();
                     let frames = frames.subscribe();
+                    let imu_frames = imu_frames.subscribe();
                     tokio::spawn(async move {
-                        if let Err(e) = subscriber(stream, &status, frames).await {
+                        if let Err(e) = subscriber(stream, &status, frames, &imu_status, imu_frames).await {
                             tracing::debug!(error = %e, "subscriber ended");
                         }
                     });
@@ -598,6 +633,8 @@ async fn subscriber(
     stream: UnixStream,
     status: &Arc<Status>,
     mut frames: tokio::sync::broadcast::Receiver<proto::TofFrame>,
+    imu_status: &Arc<ImuStatus>,
+    mut imu_frames: tokio::sync::broadcast::Receiver<proto::ImuFrame>,
 ) -> Result<()> {
     let (read, mut write) = stream.into_split();
     let mut reader = BufReader::new(read);
@@ -627,14 +664,19 @@ async fn subscriber(
             Ok(proto::Call::TofStream) => {
                 let response = proto::Response::ok(id, &status.result());
                 write_line(&mut write, &response).await?;
-                break;
+                return stream_tof(&mut write, &mut frames).await;
+            }
+            Ok(proto::Call::ImuStream) => {
+                let response = proto::Response::ok(id, &imu_status.result());
+                write_line(&mut write, &response).await?;
+                return stream_imu(&mut write, &mut imu_frames).await;
             }
             _ => {
                 let response = proto::Response::err(
                     id,
                     proto::Error::new(
                         proto::code::METHOD_NOT_FOUND,
-                        "tofd serves tof.stream and nothing else",
+                        "tofd serves tof.stream and imu.stream and nothing else",
                     ),
                 );
                 write_line(&mut write, &response).await?;
@@ -642,28 +684,46 @@ async fn subscriber(
         }
     }
 
-    // Frames, as notifications, until the socket closes or this consumer falls
-    // too far behind. A lag is not fatal: the gap shows in `seq`, and the next
-    // frame is 66 ms away.
+}
+
+/// Stream ToF frames as notifications until the socket closes or the consumer lags out. A lag is
+/// not fatal — the gap shows in `seq`, and the next frame is 66 ms away.
+async fn stream_tof(
+    write: &mut tokio::net::unix::OwnedWriteHalf,
+    frames: &mut tokio::sync::broadcast::Receiver<proto::TofFrame>,
+) -> Result<()> {
     loop {
         match frames.recv().await {
             Ok(frame) => {
                 let notification = proto::Request::notify_tof_frame(&frame);
-                if let Err(e) = write_line(&mut write, &notification).await {
-                    // A subscriber that went away mid-write is the ordinary end
-                    // of a `robotctl monitor` session, not an incident.
-                    return if e.kind() == ErrorKind::BrokenPipe {
-                        Ok(())
-                    } else {
-                        Err(e.into())
-                    };
+                if let Err(e) = write_line(write, &notification).await {
+                    return if e.kind() == ErrorKind::BrokenPipe { Ok(()) } else { Err(e.into()) };
                 }
             }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
-                tracing::debug!(missed, "a subscriber fell behind");
+                tracing::debug!(missed, "a tof subscriber fell behind");
             }
-            // The sender lives as long as the process, so this cannot happen
-            // before shutdown — at which point ending the connection is right.
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
+        }
+    }
+}
+
+/// Stream head-IMU samples as notifications; same lag/broken-pipe handling as the ToF stream.
+async fn stream_imu(
+    write: &mut tokio::net::unix::OwnedWriteHalf,
+    frames: &mut tokio::sync::broadcast::Receiver<proto::ImuFrame>,
+) -> Result<()> {
+    loop {
+        match frames.recv().await {
+            Ok(frame) => {
+                let notification = proto::Request::notify_imu_frame(&frame);
+                if let Err(e) = write_line(write, &notification).await {
+                    return if e.kind() == ErrorKind::BrokenPipe { Ok(()) } else { Err(e.into()) };
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                tracing::debug!(missed, "an imu subscriber fell behind");
+            }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
         }
     }

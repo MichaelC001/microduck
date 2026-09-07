@@ -23,6 +23,8 @@ path = "src/main.rs"
 anyhow = "1"
 clap = { workspace = true, features = ["derive"] }
 duck-ipc-proto = { path = "../duck-ipc-proto" }
+bmi088 = { path = "../../bmi088-rs" }
+linux-embedded-hal = "0.4"
 libc = "0.2"
 serde = { workspace = true }
 serde_json.workspace = true
