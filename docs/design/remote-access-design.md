@@ -670,6 +670,15 @@ The mini's clients cannot be made to, from here: that is a conversation with who
 it is the direction §4 did not consider — not "what does a duck need from the service" but "what
 does a duck arriving in the service do to its existing clients".
 
+**A non-browser consumer works today, and its one snag is the channel label.**
+`ReachyCentralConsumer` — their aiortc client — connects to a duck through the rendezvous and
+decodes frames with nothing added on either side: `pip install "reachy_mini[central-consumer]"`,
+`robot_name="olducky"`, and `latest_frame()` returns `(720, 1280, 3) uint8`. Verified. What it says
+on the way past is `ignoring unexpected data channel: 'control'`, because it looks for the label
+the mini's daemon opens and ours is `control` (`remote-webrtc.md` §5). Nothing for a perception
+consumer, which wants pixels — and the first thing to fix for one that wants to *drive* a duck,
+where the label is the smaller half of the problem and the method names are the larger.
+
 **Two of their clients select on `meta.name` and neither reads `kind`.** The host shell's picker
 lists whatever is online, and `ReachyCentralConsumer` matches `robot_name` against `meta.name` with
 a **fallback**: one visible producer for the token is used whatever it is called. So a cloud backend
