@@ -677,17 +677,46 @@ written for a mini, on an account whose only online robot is a duck, picks the d
 with method names this project does not serve. That is worth telling them before somebody meets it,
 and it is a two-line change on their side — `kind` is already on the wire.
 
-## 6. NAT: decide the STUN server, defer TURN
+## 6. NAT: STUN on both ends, and the robot offers the relay — **decided**
 
-`webrtcsink` defaults its `stun-server` to a public Google address. LAN sessions need none, so nothing
-has exercised it — and the moment remote works, **a duck's reachability quietly depends on a third
-party we do not run**. Set the property rather than inherit it, for the same reason
-`remote-webrtc.md` §0 sets `congestion-control` to the value that is already the default: the day
-upstream changes it should not be the day every robot's connectivity changes with it.
+`stun.l.google.com:19302`, which is `webrtcsink`'s own default and now also what the console asks
+for when it is remote. That second half was missing and mattered: a page offering only its
+`192.168.…` addresses to a robot on another network negotiates a session perfectly and carries
+nothing, because there is no candidate pair that can work.
 
-TURN is what makes symmetric NAT and CGNAT work at all, and it relays the *whole* session's media at
-somebody's expense. Not in the first slice, and `remote-webrtc.md` §11 is right that the decision
-belongs with whoever runs the rendezvous rather than with the daemon.
+**TURN is not optional and it is not symmetric.** Between a robot behind a home router and a
+consumer behind whatever a cloud provider gives a container, srflx-to-srflx needs both NATs to
+allow a hole to be punched — often they do, and often enough they do not. A relay always works, at
+the cost of somebody's bandwidth, which is why ICE tries it last.
+
+**Only the robot offers one**, and that is the part worth knowing before writing any of it: a
+connection needs *one* relay candidate, not two. If the robot offers one, a consumer that can
+reach the internet uses it — so credentials live on the robot and a consumer needs none. Which
+matters more than it sounds, because `aiortc`'s STUN client works where its TURN client does not,
+so a Python consumer *cannot* be the side that relays. `reachy_mini`'s #1182 established this
+arrangement and `mediad::turn` is the same one.
+
+The credentials are Cloudflare's, minted per account by a proxy Hugging Face hosts
+(`turn.fastrtc.org/credentials`) and authenticated with **the same token the relay signs in with**
+— so a robot that belongs to somebody can offer a relay and one that belongs to nobody cannot,
+which is the same line §2 draws everywhere else. They are short-lived: a task refreshes at half of
+a 600 s lifetime, and retries in thirty seconds after a *transient* failure only. A robot nobody
+has signed in has nothing to retry for, and a warning every thirty seconds for the life of the
+daemon is how a log stops being read.
+
+**Fetching them must never be in the way.** The only caller is GStreamer's `consumer-added`
+handler, where the SDP offer for that consumer is not generated until the handler returns, so an
+HTTP request there would delay every connection — including the LAN ones that will never use a
+relay — by however long the proxy takes to answer. `Relays::uris` therefore reads a cache, never
+blocks (a `try_read` that yields nothing rather than waiting) and never fails. An empty answer is
+the ordinary state for the first few seconds after boot and forever on a robot with no account,
+and it means host and srflx only, which is all anything on the same network needs.
+
+Nothing about a relay is fatal. `add-turn-server` is checked for existence before it is emitted —
+a panic in a C closure aborts the process rather than unwinding, which `pipeline.rs` learned once
+already — a refused URI is a line in the journal, and a robot that cannot offer a relay is
+reachable from most places rather than none. **And a TURN URI carries a password**, so only the
+host half is ever logged.
 
 ## 7. Authorisation, restated now that there is an account
 
@@ -738,18 +767,10 @@ Five slices, and the first two are independently useful and need no client:
    rewrites `sessionId` per hop, reads no payload, refuses a second session by name, and tells the
    service when a session ends however it ends — including the case where there is no producer to
    bridge to, which is a robot whose pipeline never reached PLAYING.
-5. **STUN decided; TURN, which a real network does need.** §6. STUN is `stun.l.google.com:19302`
-   on both ends — `webrtcsink`'s own default, and now the console's when it is remote, which it was
-   not: a page offering only `192.168.…` candidates negotiates a session perfectly and carries
-   nothing. TURN follows `reachy_mini`'s #1182, and the shape of it is the part worth knowing in
-   advance: **only the robot offers a relay candidate**, because a consumer reaches it with plain
-   STUN — so there is no consumer-side credential to manage, which matters given that `aiortc`'s
-   STUN client works where its TURN client does not. Short-lived Cloudflare credentials from HF's
-   hosted proxy (`turn.fastrtc.org/credentials`), authenticated with the daemon's own HF token,
-   refreshed at half of a 600 s TTL, handed to `webrtcbin` as `turn://user:pass@host:port`. The
-   getter must never block: its caller is GStreamer's `consumer-added` handler, where the SDP
-   offer cannot be generated until it returns, so a fetch there would delay every client including
-   the LAN ones that will never use a relay.
+5. **STUN decided; TURN offered by the robot.** §6. **Done**: `stun.l.google.com:19302` on both
+   ends, and `mediad::turn` keeps Cloudflare credentials fresh so every consumer's offer carries a
+   `relay` candidate. §6 has the argument; the two things to carry away are that only the robot
+   needs credentials, and that reading them must never block the thread building an offer.
 
 ## 9. What is open, and who can close it
 

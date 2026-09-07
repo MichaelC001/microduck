@@ -50,6 +50,14 @@ struct Args {
     #[arg(long, default_value = mediad::relay::DEFAULT_TOKEN_PATH)]
     token: PathBuf,
 
+    /// Where short-lived TURN credentials come from.
+    ///
+    /// Hugging Face hosts this proxy and mints Cloudflare credentials for the account the token
+    /// belongs to, which is why offering a relay needs no new secret on the robot. A flag for
+    /// pointing a board at a fake; there is nothing to choose on a real one.
+    #[arg(long, default_value = mediad::turn::DEFAULT_TURN_ENDPOINT)]
+    turn_url: String,
+
     /// Do not register with the rendezvous service, whatever the token file says.
     ///
     /// For a board that is signed in and being worked on: a duck registering from a bench while
@@ -232,6 +240,17 @@ fn main() -> ExitCode {
             "producing as"
         );
 
+        // Relay candidates, so a consumer on a network that cannot punch a hole to this robot
+        // still reaches it. Spawned whatever the account state — it is inert without a token and
+        // starts on its own when a login lands — and *before* the pipeline, because the first
+        // consumer's offer is built as the pipeline comes up.
+        let relays = mediad::turn::Relays::empty();
+        tokio::spawn(mediad::turn::maintain(
+            std::sync::Arc::clone(&relays),
+            args.token.clone(),
+            args.turn_url.clone(),
+        ));
+
         // The outward half of remote access, and it is deliberately *after* the producer is
         // learned: the name a client sees in the service's listing comes from the same place the
         // local `meta` gets it, and a relay that registered first would publish an unnamed robot
@@ -291,6 +310,7 @@ fn main() -> ExitCode {
             height: media.quality.height(),
             fps: media.quality.fps(),
             rotation,
+            relays: std::sync::Arc::clone(&relays),
         };
 
         // `frames` is the raw tap off the tee: the auto-exposure loop meters it, and the

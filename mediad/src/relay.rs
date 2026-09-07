@@ -464,29 +464,10 @@ impl Relay {
         }
     }
 
-    /// The access token, or `None` when this robot belongs to nobody.
-    ///
-    /// Reads the one field it needs and ignores the rest: the refresh token and the expiry are
-    /// `updaterd`'s business, and a reader that deserialised the whole record would break on a
-    /// field added there.
+    /// The access token, or `None` when this robot belongs to nobody. [`crate::hf`] owns the
+    /// reading of it, because the TURN credentials need the same token.
     fn token(&self) -> Option<String> {
-        #[derive(Deserialize)]
-        struct Credential {
-            access_token: String,
-        }
-        let bytes = std::fs::read(&self.token_path).ok()?;
-        match serde_json::from_slice::<Credential>(&bytes) {
-            Ok(credential) if !credential.access_token.is_empty() => Some(credential.access_token),
-            Ok(_) => None,
-            Err(e) => {
-                tracing::warn!(
-                    path = %self.token_path.display(),
-                    error = %e,
-                    "the account credential does not parse; treating this robot as signed out"
-                );
-                None
-            }
-        }
+        crate::hf::access_token(&self.token_path)
     }
 
     /// One connection: open the stream, register, then hold the lease until something breaks.
