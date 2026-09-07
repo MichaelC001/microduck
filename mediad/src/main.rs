@@ -310,24 +310,27 @@ fn main() -> ExitCode {
             height: media.quality.height(),
             fps: media.quality.fps(),
             rotation,
-            relays: std::sync::Arc::clone(&relays),
         };
 
         // `frames` is the raw tap off the tee: the auto-exposure loop meters it, and the
         // `get_frame` surface in `architecture.md` §5.3 is what the rest of it is for. The branch
         // runs from the start rather than being added later, because a tee inserted into a live
         // pipeline is a different and much harder problem than a tee that was always there.
-        let (_pipeline, mut channels, frames) =
-            match mediad::pipeline::start(source.clone(), &producer, &settings) {
-                Ok(started) => started,
-                Err(e) => {
-                    // The message names which step failed and what usually causes it — a missing
-                    // plugin, a missing library, or a device node nobody can open. Those look
-                    // identical from a log line that only says "failed".
-                    tracing::error!(error = %format!("{e:#}"), "mediad cannot start");
-                    return ExitCode::FAILURE;
-                }
-            };
+        let (_pipeline, mut channels, frames) = match mediad::pipeline::start(
+            source.clone(),
+            &producer,
+            &settings,
+            std::sync::Arc::clone(&relays),
+        ) {
+            Ok(started) => started,
+            Err(e) => {
+                // The message names which step failed and what usually causes it — a missing
+                // plugin, a missing library, or a device node nobody can open. Those look
+                // identical from a log line that only says "failed".
+                tracing::error!(error = %format!("{e:#}"), "mediad cannot start");
+                return ExitCode::FAILURE;
+            }
+        };
 
         // After the pipeline, because it meters the pipeline's own frames — and only with a real
         // camera, since a test pattern has no sensor to write and the loop would spend the daemon's

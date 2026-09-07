@@ -183,10 +183,6 @@ pub struct Settings {
     /// How far the *pipeline* turns the picture; see [`Rotation`]. Almost always `None` — the
     /// capture geometry above is then also what leaves the tee.
     pub rotation: Rotation,
-    /// The TURN servers to offer each consumer, kept fresh elsewhere. Empty on a robot that
-    /// belongs to nobody, and on any robot for the first few seconds after boot —
-    /// [`crate::turn`] says why that is not a problem worth solving.
-    pub relays: Arc<crate::turn::Relays>,
 }
 
 /// Where the video comes from.
@@ -361,6 +357,7 @@ pub fn start(
     source: Source,
     producer: &crate::producer::Producer,
     settings: &Settings,
+    relays: Arc<crate::turn::Relays>,
 ) -> Result<(gst::Pipeline, mpsc::Receiver<Channel>, Frames)> {
     let &Settings {
         port,
@@ -561,13 +558,7 @@ pub fn start(
 
     let consumers: Consumers = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let (channels_tx, channels_rx) = mpsc::channel::<Channel>(4);
-    wire_consumers(
-        &sink,
-        channels_tx,
-        runtime,
-        consumers.clone(),
-        Arc::clone(&settings.relays),
-    )?;
+    wire_consumers(&sink, channels_tx, runtime, consumers.clone(), relays)?;
 
     // ── the raw branch ──────────────────────────────────────────────────────
     //
