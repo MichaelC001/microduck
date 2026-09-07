@@ -898,6 +898,15 @@ async fn main() -> ExitCode {
     }
 
     if let Some(Command::Init { duration }) = args.command {
+        // init opens the motor bus itself. Keep ownership until the whole ramp returns,
+        // so neither a daemon nor another init can join it partway through.
+        let _instance_lock = match claim_lock(&args.socket) {
+            Ok(lock) => lock,
+            Err(e) => {
+                tracing::error!(path = %args.socket.display(), error = %e, "cannot claim robot IPC socket");
+                return ExitCode::FAILURE;
+            }
+        };
         duck_ipc_proto::log_startup_identity!("robotd");
         return run_init(&params, duration);
     }
@@ -3080,11 +3089,10 @@ fn publish_slow_sensors<T: RobotIo>(io: &mut Safety<T>, state: &RobotState) {
     }
 }
 
-/// Claim one daemon endpoint, including the window before there is a listener to probe.
-async fn claim_socket(socket_path: &Path) -> std::io::Result<(std::fs::File, UnixListener)> {
+/// Own an endpoint even when no listener exists, as during startup or standalone init.
+fn claim_lock(socket_path: &Path) -> std::io::Result<std::fs::File> {
     use std::fs::{OpenOptions, TryLockError};
     use std::io::{Error, ErrorKind};
-    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 
     if let Some(parent) = socket_path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)?;
@@ -3111,7 +3119,15 @@ async fn claim_socket(socket_path: &Path) -> std::io::Result<(std::fs::File, Uni
         }
         Err(TryLockError::Error(e)) => return Err(e),
     }
+    Ok(lock)
+}
 
+/// Claim one daemon endpoint, including the window before there is a listener to probe.
+async fn claim_socket(socket_path: &Path) -> std::io::Result<(std::fs::File, UnixListener)> {
+    use std::io::ErrorKind;
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+
+    let lock = claim_lock(socket_path)?;
     let listener = match UnixListener::bind(socket_path) {
         Ok(listener) => listener,
         Err(e) if e.kind() == ErrorKind::AddrInUse => {

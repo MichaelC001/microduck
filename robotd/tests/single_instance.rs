@@ -54,8 +54,16 @@ impl Robotd {
         assert_eq!(status.code(), Some(1), "{status}: {log}");
         assert!(log.contains("cannot claim robot IPC socket"), "{log}");
         assert!(
+            !log.contains("starting service="),
+            "a refused startup must not publish the loser's identity: {log}"
+        );
+        assert!(
             !log.contains("--fake: no bus, no robot"),
             "a refused startup must not start the control loop: {log}"
+        );
+        assert!(
+            !log.contains("cannot open the bus"),
+            "a refused init must not try to open the bus: {log}"
         );
     }
 
@@ -105,6 +113,48 @@ async fn a_second_daemon_cannot_replace_the_running_service() {
     assert!(first.0.try_wait().unwrap().is_none());
     assert_eq!(std::fs::metadata(&socket).unwrap().ino(), inode);
     wait_until_healthy(&socket).await;
+}
+
+/// `init` used to bypass the daemon's lock and open the motor bus itself. A missing,
+/// private port makes reaching run_init observable without ever opening real hardware.
+#[tokio::test]
+async fn init_cannot_open_the_bus_while_a_daemon_is_running() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("robotd.sock");
+    let port = dir.path().join("missing-bus");
+    let mut daemon = Robotd::spawn(&socket, &[]);
+    wait_until_healthy(&socket).await;
+    let inode = std::fs::metadata(&socket).unwrap().ino();
+
+    let mut init = Robotd::spawn(&socket, &["--port", port.to_str().unwrap(), "init"]);
+    init.assert_refused().await;
+
+    assert!(daemon.0.try_wait().unwrap().is_none());
+    assert_eq!(std::fs::metadata(&socket).unwrap().ino(), inode);
+    wait_until_healthy(&socket).await;
+}
+
+/// A failed init must release ownership just like a successful ramp: the operator may
+/// need to start the daemon to diagnose the bus. It must not create an IPC listener.
+#[tokio::test]
+async fn a_failed_init_releases_the_lock_without_creating_a_socket() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("robotd.sock");
+    let port = dir.path().join("missing-bus");
+    let lock_path = dir.path().join("robotd.sock.lock");
+    let mut init = Robotd::spawn(&socket, &["--port", port.to_str().unwrap(), "init"]);
+    let (status, log) = init.wait_for_exit().await;
+    assert_eq!(status.code(), Some(1), "{status}: {log}");
+    #[cfg(target_os = "linux")]
+    assert!(log.contains("cannot open the bus"), "{log}");
+    #[cfg(not(target_os = "linux"))]
+    assert!(log.contains("init needs a real bus"), "{log}");
+    assert!(!socket.exists(), "init must not bind a listener");
+    let inode = std::fs::metadata(&lock_path).unwrap().ino();
+
+    let _daemon = Robotd::spawn(&socket, &[]);
+    wait_until_healthy(&socket).await;
+    assert_eq!(std::fs::metadata(&lock_path).unwrap().ino(), inode);
 }
 
 /// Both launches start together, before either has answered a client. Repeating the race
@@ -259,8 +309,12 @@ async fn a_held_lock_refuses_startup_before_a_socket_exists() {
     let lock = std::fs::File::create(dir.path().join("robotd.sock.lock")).unwrap();
     lock.try_lock().unwrap();
 
-    let mut daemon = Robotd::spawn(&socket, &[]);
-    daemon.assert_refused().await;
+    let port = dir.path().join("missing-bus");
+    // `init` has no listener at all, so both entry points must respect the lock alone.
+    for command in [vec![], vec!["--port", port.to_str().unwrap(), "init"]] {
+        let mut process = Robotd::spawn(&socket, &command);
+        process.assert_refused().await;
+    }
     assert!(!socket.exists());
 }
 
