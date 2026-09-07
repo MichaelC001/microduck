@@ -301,7 +301,16 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// already come from here. It is a per-hardware-revision calibration: the camera and lens are one
 /// part, so every `alpha` unit shares the one the build embeds. Additive: `Option`, absent from a
 /// daemon predating it and `None` from a build that ships no calibration.
-pub const API_VERSION: u32 = 25;
+///
+/// # v26 — the whole skeleton's pose, for a viewer
+///
+/// [`RobotState::skeleton`] carries every body's pose in the trunk frame this tick, and
+/// [`ModelResult::skeleton`] the matching static tree (each link's name and parent). Together they
+/// let a viewer draw the robot moving for real — the full kinematics, of which
+/// [`RobotState::frames`] (camera, ToF, head IMU) is a few leaves — without carrying a copy of the
+/// kinematics, the same reason `frames` and `tof_beams` come from the robot. Both from the same FK
+/// `robot.look` uses. Additive: the `Vec`s are empty from a daemon predating it.
+pub const API_VERSION: u32 = 26;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -3337,6 +3346,11 @@ pub struct RobotState {
     /// with a pose never carries its own copy of the kinematics. (v24)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frames: Option<FramesState>,
+    /// Every body's pose in the trunk frame this tick, in [`ModelResult::skeleton`] order, from the
+    /// same head FK `robot.look` uses — the whole skeleton, so a viewer can draw the robot moving
+    /// for real. `frames` is a few leaves of this. Empty from a daemon predating it. (v26)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skeleton: Vec<PoseState>,
 }
 
 /// The trunk IMU, in [`RobotState::imu`]. Trunk frame: x forward, y left, z up.
@@ -3404,6 +3418,21 @@ pub struct ModelResult {
     /// calibration. See [`CameraModel`]. (v25)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub camera: Option<CameraModel>,
+    /// The body tree the per-tick [`RobotState::skeleton`] poses are stated in: each link's name
+    /// and parent, in the same order. Empty from a daemon predating it. (v26)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skeleton: Vec<SkeletonLink>,
+}
+
+/// One link in the body tree — a name and its parent — so a viewer can match a
+/// [`RobotState::skeleton`] pose to a link and draw the edge to its parent. (v26)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkeletonLink {
+    /// The MJCF body name, e.g. `trunk_base`, `upper_leg_left`.
+    pub name: String,
+    /// Index of this link's parent in [`ModelResult::skeleton`], or `None` for the root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<usize>,
 }
 
 /// The head camera's intrinsics, so a mapper reads them from the robot rather than carrying its
@@ -5491,6 +5520,7 @@ mod tests {
             t_ns: 0,
             imu: None,
             frames: None,
+            skeleton: Vec::new(),
             movement: MoveState {
                 requested: [0.0; 3],
                 applied: [0.0; 3],
@@ -5551,6 +5581,7 @@ mod tests {
             t_ns: 0,
             imu: None,
             frames: None,
+            skeleton: Vec::new(),
             movement: MoveState {
                 requested: [0.4, 0.0, 0.0],
                 applied: [0.15, 0.0, 0.0],

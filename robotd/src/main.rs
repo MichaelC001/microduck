@@ -2911,6 +2911,7 @@ async fn control_loop<T: RobotIo>(
                 frames: Some(mapping::frames_at(mapping::head_joints_of(
                     &sensors.positions,
                 ))),
+                skeleton: mapping::skeleton_at(&sensors.positions),
             });
         }
 
@@ -4354,6 +4355,37 @@ mod mapping {
         }
     }
 
+    /// Every body's pose in the trunk frame, in [`Model::body_names`] order, from the full measured
+    /// joint vector — the whole skeleton for a viewer. The model's joint order is the MJCF's, not
+    /// the wire's, so the angles are gathered by name from [`proto::JOINT_NAMES`]-ordered positions.
+    pub fn skeleton_at(positions: &[f64]) -> Vec<proto::PoseState> {
+        let model = kinematics::Model::alpha();
+        let angles: Vec<f64> = model
+            .joint_names()
+            .map(|n| {
+                proto::JOINT_NAMES
+                    .iter()
+                    .position(|w| *w == n)
+                    .and_then(|i| positions.get(i).copied())
+                    .unwrap_or(0.0)
+            })
+            .collect();
+        model.body_poses(&angles).into_iter().map(pose).collect()
+    }
+
+    fn skeleton_links() -> Vec<proto::SkeletonLink> {
+        let model = kinematics::Model::alpha();
+        let parents = model.body_parents();
+        model
+            .body_names()
+            .enumerate()
+            .map(|(i, name)| proto::SkeletonLink {
+                name: name.to_owned(),
+                parent: parents[i],
+            })
+            .collect()
+    }
+
     pub fn frames_at(head: [f64; 4]) -> proto::FramesState {
         proto::FramesState {
             camera: pose(FK.camera_in_trunk_cv2(head)),
@@ -4373,6 +4405,7 @@ mod mapping {
             tof_fov_deg: kinematics::tof::FOV_DEG,
             frames_at_zero: frames_at([0.0; 4]),
             camera: Some(CAMERA.clone()),
+            skeleton: skeleton_links(),
         }
     }
 
@@ -4414,6 +4447,30 @@ mod mapping {
             assert!(cam.fx > 0.0 && cam.fy > 0.0);
             assert!(cam.cx > 0.0 && cam.cx < f64::from(cam.width));
             assert!(cam.cy > 0.0 && cam.cy < f64::from(cam.height));
+        }
+
+        #[test]
+        fn the_skeleton_topology_and_poses_line_up() {
+            let links = model().skeleton;
+            assert!(!links.is_empty(), "a skeleton is served");
+            assert_eq!(links[0].parent, None, "the root has no parent");
+            assert!(links[1..].iter().all(|l| l.parent.is_some()), "every other link has a parent");
+            // A pose per link, in the same order, and every parent precedes its child.
+            let poses = skeleton_at(&[0.0; 15]);
+            assert_eq!(poses.len(), links.len(), "one pose per link");
+            assert!(links.iter().enumerate().all(|(i, l)| l.parent.is_none_or(|p| p < i)));
+        }
+
+        #[test]
+        fn the_skeleton_moves_with_a_leg_joint() {
+            let mut bent = [0.0; 15];
+            let knee = proto::JOINT_NAMES.iter().position(|n| n.contains("knee")).expect("a knee joint");
+            bent[knee] = 0.8;
+            // Bending a knee moves some body, but never the root (trunk_base sits at identity).
+            let rest = skeleton_at(&[0.0; 15]);
+            let moved = skeleton_at(&bent);
+            assert_eq!(rest[0].pos, moved[0].pos, "the root does not move");
+            assert!(rest.iter().zip(&moved).any(|(a, b)| a.pos != b.pos), "a leg body moved");
         }
 
         #[test]
