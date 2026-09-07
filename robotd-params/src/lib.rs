@@ -329,12 +329,22 @@ pub struct MediaParams {
     /// Whether the send rate adapts to the link, and by what. [`CongestionControl`] has the
     /// trade — it is the largest single CPU consumer in this process.
     pub congestion_control: CongestionControl,
-    /// This robot's measured camera geometry, when somebody has measured it.
+    /// The camera's measured geometry: this robot's own calibration when somebody has written one
+    /// here, and the hardware family's otherwise.
     ///
-    /// Absent on every robot until then, and absence is not a gap to fill with silence: `mediad`
-    /// publishes the module's design figures instead, marked as not calibrated, so a consumer can
-    /// tell a datasheet from a measurement. See [`CameraIntrinsics`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// **The default is a real calibration, not the datasheet** — [`CameraIntrinsics::alpha`]. The
+    /// camera module and its M12 lens are one part on every alpha unit, so one unit's solve is a
+    /// far better description of another's than the module's design figures (the principal point
+    /// alone sits 60 px off the frame's centre, which no nominal record can know). Still a
+    /// family-wide figure rather than this unit's own: a per-robot `[media.intrinsics]` overrides it,
+    /// which is what a fresh solve on that robot should be written as. `mediad` scales whichever it
+    /// gets to the streamed size and publishes it with `calibrated: true`; the design figures,
+    /// marked as not calibrated, are only what a build for a camera nobody has solved would fall
+    /// back to. See [`CameraIntrinsics`].
+    ///
+    /// No field-level `default`: an absent key takes [`MediaParams::default`]'s value, the family
+    /// calibration, rather than `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub intrinsics: Option<CameraIntrinsics>,
 }
 
@@ -363,6 +373,31 @@ pub struct CameraIntrinsics {
     pub distortion: Vec<f64>,
 }
 
+impl CameraIntrinsics {
+    /// The alpha family's camera calibration: the head camera module and M12 lens every alpha unit
+    /// carries, solved on unit *graphite* on 2026-09-07 — ChArUco board, 80 views, 0.84 px RMS,
+    /// on the 1280×720 frame as `mediad` sends it (unrotated). Re-solve with `duckslam calib
+    /// intrinsics` in the `microduck_vslam` repo; `duckslam calib export-toml` prints a solve in
+    /// this table's shape.
+    pub fn alpha() -> Self {
+        Self {
+            width: 1280,
+            height: 720,
+            fx: 1055.0757340956482,
+            fy: 1052.5750599438943,
+            cx: 580.5571737758394,
+            cy: 471.909759909458,
+            distortion: vec![
+                -0.33431259713233824,
+                0.08049158630172265,
+                -0.0013134275558036792,
+                -0.0009183827993299791,
+                0.06483154138827026,
+            ],
+        }
+    }
+}
+
 impl Default for MediaParams {
     fn default() -> Self {
         Self {
@@ -371,9 +406,8 @@ impl Default for MediaParams {
             camera: true,
             quality: Quality::default(),
             bitrate: None,
-            // Nobody has measured this robot's camera. `mediad` says so on the wire rather than
-            // implying a measurement that did not happen.
-            intrinsics: None,
+            // The family's calibration, until this robot has its own — see the field.
+            intrinsics: Some(CameraIntrinsics::alpha()),
             // `webrtcsink`'s own default, named rather than inherited: what the element defaults
             // to is a fact about a plugin we ship from a pinned release, and the day it changes
             // should not be the day every robot's send rate changes with it.
@@ -2641,6 +2675,29 @@ mod tests {
     /// [`QUALITY_LABELS`] is what the registry offers and what the file may contain, and
     /// [`Quality::ALL`] is what the daemon can do — a rung in one and not the other is either a
     /// choice the editor writes and `mediad` cannot read, or a mode nobody can select.
+    /// **An absent `[media.intrinsics]` is the family's calibration, not `None`.** `MediaParams`
+    /// carries a struct-level `#[serde(default)]`, and a field-level `default` on `intrinsics`
+    /// would silently win over it with `None` — which is how this would regress to publishing the
+    /// datasheet on every robot while looking configured. A per-robot table still overrides.
+    #[test]
+    fn an_absent_intrinsics_table_is_the_family_calibration() {
+        let alpha = CameraIntrinsics::alpha();
+        assert_eq!(MediaParams::default().intrinsics.as_ref(), Some(&alpha));
+
+        let parsed: Params = toml::from_str("[media]\nbitrate = 2000\n").expect("parses");
+        assert_eq!(parsed.media.intrinsics.as_ref(), Some(&alpha), "absent key");
+        let parsed: Params = toml::from_str("").expect("parses");
+        assert_eq!(parsed.media.intrinsics.as_ref(), Some(&alpha), "absent table");
+
+        let parsed: Params = toml::from_str(
+            "[media.intrinsics]\nwidth = 640\nheight = 360\nfx = 500.0\nfy = 501.0\ncx = 320.0\ncy = 180.0\n",
+        )
+        .expect("parses");
+        let own = parsed.media.intrinsics.expect("this robot's own");
+        assert_eq!((own.width, own.fx), (640, 500.0), "a written table overrides the family's");
+        assert!(own.distortion.is_empty());
+    }
+
     #[test]
     fn every_quality_label_round_trips() {
         assert_eq!(QUALITY_LABELS.len(), Quality::ALL.len());

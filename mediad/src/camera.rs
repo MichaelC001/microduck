@@ -42,9 +42,10 @@
 //! Everything above is the *design* of the camera, not a measurement of the one on this robot:
 //! lens focal lengths vary by a few percent unit to unit, the principal point is never exactly the
 //! centre, and nothing here models distortion at all. That is enough for a room-scale map and not
-//! enough for photogrammetry, so the published record carries `calibrated: false` until somebody
-//! measures a particular robot and puts the result in `[media.intrinsics]`. A consumer that needs
-//! better can then tell that it needs to ask.
+//! enough for photogrammetry, so a record built from them carries `calibrated: false`. In practice
+//! every alpha robot publishes a measurement: `robotd-params` ships the family's solve as the
+//! `[media.intrinsics]` default (the camera and lens are one part), and a robot with its own solve
+//! written there publishes that. The nominal path is the fallback for a camera nobody has solved.
 
 /// The pixel pitch of the IMX219, from its datasheet.
 const PIXEL_PITCH_UM: f64 = 1.12;
