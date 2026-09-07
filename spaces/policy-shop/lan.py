@@ -386,7 +386,7 @@ class LanConsumer:
 
 # ── checking it without a duck ────────────────────────────────────────────────
 #
-# `python lan.py` stands up a producer on loopback that speaks what `webrtcsink`'s signaller
+# `uv run lan.py` stands up a producer on loopback that speaks what `webrtcsink`'s signaller
 # speaks, and drives a real session against it: welcome, list, startSession, an offer answered,
 # DTLS, SCTP, the `control` channel, and a JSON-RPC call matched to its reply.
 #

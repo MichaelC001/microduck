@@ -87,15 +87,26 @@ That makes it the useful thing to reach for when a click does not work and nobod
 layer to blame. **If it works on the LAN and not through the rendezvous, the transport is the
 problem** and nothing about the policy, the manifest or the robot is.
 
-A Space in a data centre cannot reach a LAN, so that tab is for running this file yourself:
+A Space in a data centre cannot reach a LAN, so that tab is for running this yourself. Once:
 
 ```bash
-uv run --with-requirements requirements.txt app.py
+uv venv && uv pip install -r requirements.txt
 ```
 
-There is no `pyproject.toml` here on purpose — the Space's dependencies are `requirements.txt`,
-which is what Hugging Face installs, and a second copy of the same list is a second copy to get
-wrong. `DUCK_HOST` pre-fills the address box, and `HF_TOKEN` stands in for the sign-in.
+Then, and every time after:
+
+```bash
+uv run app.py
+```
+
+`uv run` picks up the `.venv` beside it, so nothing has to be activated and no flags are needed.
+There is deliberately no `pyproject.toml`: `requirements.txt` is what Hugging Face installs, and a
+second copy of one dependency list is a second copy to get wrong — which is the whole reason the
+install step is a separate line rather than something inferred from a manifest.
+
+`DUCK_HOST` pre-fills the address box. `HF_TOKEN` stands in for the sign-in, and so does whatever
+`hf auth login` stored — see **Identity** for why a local run needs one of those rather than the
+login button.
 
 **One consumer at a time.** The rendezvous's rule, not a simplification: while this holds a
 session, the robot's own console cannot open one, and neither can the vision demo. The LAN
@@ -131,7 +142,7 @@ every signalling frame, every JSON-RPC line and every refusal, with the token's 
 the token itself never written down.
 
 ```bash
-DUCK_LOG=DEBUG uv run --with-requirements requirements.txt app.py
+DUCK_LOG=DEBUG uv run app.py
 ```
 
 adds the streaming notifications and each ICE candidate — which is what to reach for when
@@ -140,20 +151,20 @@ signalling crossed and media did not, and nothing else.
 Each layer is also checkable on its own, in the order the failures happen:
 
 ```bash
-python rendezvous.py
+uv run rendezvous.py
 ```
 
 lists the account's robots with their `kind` and their `busy` state. A `401` here is the token and
 nothing else. This needs no Gradio and no robot.
 
 ```bash
-python catalogue.py
+uv run catalogue.py
 ```
 
 prints the whole Hub catalogue with what each policy claims and which are refused. Needs no token.
 
 ```bash
-python lan.py
+uv run lan.py
 ```
 
 drives a real session against a producer on loopback. If this passes and a duck does not, the

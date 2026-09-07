@@ -17,7 +17,7 @@ is what will actually run.
 the top level; the official set carries nine files and the same fields once per entry under
 `policies`. `policy.fetch` takes a `file`, so an entry out of the set is one click like any other.
 
-Runnable on its own — `python catalogue.py` prints what a duck would be offered — which is how
+Runnable on its own — `uv run catalogue.py` prints what a duck would be offered — which is how
 this is checked without a robot, a token or a Space.
 """
 

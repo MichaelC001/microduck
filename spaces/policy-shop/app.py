@@ -25,7 +25,8 @@ being a pipe to the existing API.
 needs `turn.fastrtc.org`, which has no DNS at all right now (§6), so the session falls back to
 host and srflx — often enough to punch a hole, and often enough not. The control channel is SCTP
 over that same candidate pair, so when it does not punch, nothing here works. Running this file on
-a laptop on the robot's own network is the way through: `HF_TOKEN=… python app.py`.
+a laptop on the robot's own network is the way through — `uv run app.py`, and the README's
+local-run section is the two lines that get there.
 
 **One consumer at a time.** That is the rendezvous's rule, not a simplification here: while this
 Space holds a session, the robot's own console cannot open one, and the vision demo cannot either.

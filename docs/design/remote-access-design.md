@@ -745,8 +745,8 @@ all four fail as "nothing happened". Every HTTP status, every signalling frame, 
 line and every refusal is logged, with the token's *source* named and the token never written
 down; `DUCK_LOG=DEBUG` adds the streaming notifications and the per-candidate ICE lines. The panel
 is on the page as well as the terminal because a Space has logs nobody has open and a browser has
-no stderr. Each layer is also runnable alone — `python rendezvous.py`, `python catalogue.py`,
-`python lan.py` — which is what turns "it does not work" into a line number without a
+no stderr. Each layer is also runnable alone — `uv run rendezvous.py`, `uv run catalogue.py`,
+`uv run lan.py` — which is what turns "it does not work" into a line number without a
 conversation.
 
 `IntentResult` is the other thing a client gets wrong once: `robot.setSkill`, `robot.do`,
@@ -776,7 +776,7 @@ that answer was previously a guess.
 
 Its one cost is that it is hand-written where the rendezvous half was inherited: a dozen envelope
 shapes read off `net/webrtc/protocol` and the console page, and getting one wrong produces silence
-rather than an error. So `python lan.py` stands up a producer on loopback that speaks the same
+rather than an error. So `uv run lan.py` stands up a producer on loopback that speaks the same
 protocol and drives a real session against it — welcome, list, `startSession`, an offer answered,
 DTLS, SCTP, the channel, a call matched to its reply. Two aiortc peers on `127.0.0.1` are not a
 duck; they are the same protocol, which is the part that fails quietly.
