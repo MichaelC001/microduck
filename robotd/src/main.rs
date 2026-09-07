@@ -26,7 +26,7 @@ mod soc;
 mod sound;
 mod theremin;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
@@ -878,8 +878,6 @@ async fn main() -> ExitCode {
         .with_writer(std::io::stderr)
         .init();
 
-    duck_ipc_proto::log_startup_identity!("robotd");
-
     let explicit = args.params.is_some();
     let params_path = args
         .params
@@ -900,8 +898,29 @@ async fn main() -> ExitCode {
     }
 
     if let Some(Command::Init { duration }) = args.command {
+        // init opens the motor bus itself. Keep ownership until the whole ramp returns,
+        // so neither a daemon nor another init can join it partway through.
+        let _instance_lock = match claim_lock(&args.socket) {
+            Ok(lock) => lock,
+            Err(e) => {
+                tracing::error!(path = %args.socket.display(), error = %e, "cannot claim robot IPC socket");
+                return ExitCode::FAILURE;
+            }
+        };
+        duck_ipc_proto::log_startup_identity!("robotd");
         return run_init(&params, duration);
     }
+
+    // Own the endpoint before publishing an identity or starting a thread that can touch
+    // the motors. Keep the lock through control-thread shutdown and socket cleanup.
+    let (_instance_lock, listener) = match claim_socket(&args.socket).await {
+        Ok(owned) => owned,
+        Err(e) => {
+            tracing::error!(path = %args.socket.display(), error = %e, "cannot claim robot IPC socket");
+            return ExitCode::FAILURE;
+        }
+    };
+    duck_ipc_proto::log_startup_identity!("robotd");
 
     let state = Arc::new(RobotState::new(
         &params,
@@ -947,6 +966,7 @@ async fn main() -> ExitCode {
     let serving = serve(
         Arc::clone(&state),
         Arc::clone(&intents),
+        listener,
         args.socket.clone(),
     );
     let mut code = ExitCode::SUCCESS;
@@ -3096,25 +3116,81 @@ fn publish_slow_sensors<T: RobotIo>(io: &mut Safety<T>, state: &RobotState) {
     }
 }
 
+/// Own an endpoint even when no listener exists, as during startup or standalone init.
+fn claim_lock(socket_path: &Path) -> std::io::Result<std::fs::File> {
+    use std::fs::{OpenOptions, TryLockError};
+    use std::io::{Error, ErrorKind};
+
+    if let Some(parent) = socket_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    // Append, rather than replace the extension: distinct --socket paths need distinct
+    // locks. Never unlink this file, even at shutdown — a waiter could already have the
+    // old inode open. The kernel releases the lock on exit, including SIGKILL.
+    let mut lock_path = socket_path.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    let lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(lock_path)?;
+    match lock.try_lock() {
+        Ok(()) => (),
+        Err(TryLockError::WouldBlock) => {
+            return Err(Error::new(
+                ErrorKind::AddrInUse,
+                "another robotd owns this socket",
+            ));
+        }
+        Err(TryLockError::Error(e)) => return Err(e),
+    }
+    Ok(lock)
+}
+
+/// Claim one daemon endpoint, including the window before there is a listener to probe.
+async fn claim_socket(socket_path: &Path) -> std::io::Result<(std::fs::File, UnixListener)> {
+    use std::io::ErrorKind;
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+
+    let lock = claim_lock(socket_path)?;
+    let listener = match UnixListener::bind(socket_path) {
+        Ok(listener) => listener,
+        Err(e) if e.kind() == ErrorKind::AddrInUse => {
+            // An older daemon may own the socket without holding our new lock. Only a
+            // real socket that refuses connections is stale; a timeout, permission error,
+            // regular file or symlink is not permission to remove somebody else's path.
+            if !std::fs::symlink_metadata(socket_path)?
+                .file_type()
+                .is_socket()
+            {
+                return Err(e);
+            }
+            match tokio::time::timeout(Duration::from_secs(1), UnixStream::connect(socket_path))
+                .await
+            {
+                Ok(Err(probe)) if probe.kind() == ErrorKind::ConnectionRefused => {
+                    tracing::warn!(path = %socket_path.display(), "removing stale socket");
+                    std::fs::remove_file(socket_path)?;
+                    UnixListener::bind(socket_path)?
+                }
+                Ok(Err(probe)) => return Err(probe),
+                _ => return Err(e),
+            }
+        }
+        Err(e) => return Err(e),
+    };
+    std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(SOCKET_MODE))?;
+    Ok((lock, listener))
+}
+
 async fn serve(
     state: Arc<RobotState>,
     intents: Arc<Intents>,
+    listener: UnixListener,
     socket_path: PathBuf,
 ) -> std::io::Result<()> {
-    // A leftover socket from a killed process must not stop us coming up.
-    if socket_path.exists() {
-        tracing::warn!(path = %socket_path.display(), "removing stale socket");
-        let _ = std::fs::remove_file(&socket_path);
-    }
-    if let Some(parent) = socket_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-
-    let listener = UnixListener::bind(&socket_path)?;
-
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(SOCKET_MODE))?;
-
     tracing::info!(
         path = %socket_path.display(),
         mode = format!("{SOCKET_MODE:o}"),
