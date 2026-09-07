@@ -565,7 +565,7 @@ async fn serve(
     status: &Arc<Status>,
     frames: &tokio::sync::broadcast::Sender<proto::TofFrame>,
     imu_status: &Arc<ImuStatus>,
-    imu_frames: &tokio::sync::broadcast::Sender<proto::ImuFrame>,
+    imu_frames: &tokio::sync::broadcast::Sender<proto::HeadImuFrame>,
 ) -> Result<()> {
     if let Some(parent) = socket.parent() {
         // `RuntimeDirectory=tofd` has already made this on a board; tried anyway
@@ -634,7 +634,7 @@ async fn subscriber(
     status: &Arc<Status>,
     mut frames: tokio::sync::broadcast::Receiver<proto::TofFrame>,
     imu_status: &Arc<ImuStatus>,
-    mut imu_frames: tokio::sync::broadcast::Receiver<proto::ImuFrame>,
+    mut imu_frames: tokio::sync::broadcast::Receiver<proto::HeadImuFrame>,
 ) -> Result<()> {
     let (read, mut write) = stream.into_split();
     let mut reader = BufReader::new(read);
@@ -666,7 +666,7 @@ async fn subscriber(
                 write_line(&mut write, &response).await?;
                 return stream_tof(&mut write, &mut frames).await;
             }
-            Ok(proto::Call::ImuStream) => {
+            Ok(proto::Call::HeadImuStream) => {
                 let response = proto::Response::ok(id, &imu_status.result());
                 write_line(&mut write, &response).await?;
                 return stream_imu(&mut write, &mut imu_frames).await;
@@ -711,12 +711,12 @@ async fn stream_tof(
 /// Stream head-IMU samples as notifications; same lag/broken-pipe handling as the ToF stream.
 async fn stream_imu(
     write: &mut tokio::net::unix::OwnedWriteHalf,
-    frames: &mut tokio::sync::broadcast::Receiver<proto::ImuFrame>,
+    frames: &mut tokio::sync::broadcast::Receiver<proto::HeadImuFrame>,
 ) -> Result<()> {
     loop {
         match frames.recv().await {
             Ok(frame) => {
-                let notification = proto::Request::notify_imu_frame(&frame);
+                let notification = proto::Request::notify_head_imu_frame(&frame);
                 if let Err(e) = write_line(write, &notification).await {
                     return if e.kind() == ErrorKind::BrokenPipe { Ok(()) } else { Err(e.into()) };
                 }

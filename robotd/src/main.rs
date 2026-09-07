@@ -4350,6 +4350,7 @@ mod mapping {
         proto::FramesState {
             camera: pose(FK.camera_in_trunk_cv2(head)),
             tof: pose(FK.tof_in_trunk(head)),
+            head_imu: FK.head_imu_in_trunk(head).map(pose),
         }
     }
 

@@ -208,7 +208,7 @@ fn permits(call: &proto::Call) -> bool {
         // annotates".
         TofStream => true,
         // The head IMU rides the same video path, for the same reason: it annotates the frames.
-        ImuStream => true,
+        HeadImuStream => true,
 
         // ── reading the robot's software ─────────────────────────────────────
         //
@@ -437,7 +437,7 @@ mod tests {
                     | proto::Call::RobotStop
                     | proto::Call::RobotSubscribe(_)
                     | proto::Call::TofStream
-                    | proto::Call::ImuStream
+                    | proto::Call::HeadImuStream
                     | proto::Call::PadInput
             );
             if wanted {

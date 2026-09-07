@@ -390,7 +390,7 @@ fn permits(call: &proto::Call) -> bool {
         // (`architecture.md` §5.2), where depth belongs next to the frame it annotates.
         TofStream => false,
         // Same as the ToF: the head IMU is tofd's, reached over mediad's video path, not BLE.
-        ImuStream => false,
+        HeadImuStream => false,
     }
 }
 

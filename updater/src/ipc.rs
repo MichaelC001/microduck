@@ -816,7 +816,7 @@ impl Server {
             ),
 
             // Same story one namespace over: `tofd` owns the sensor and answers for it.
-            Call::TofStream | Call::ImuStream => Response::err(
+            Call::TofStream | Call::HeadImuStream => Response::err(
                 Some(id),
                 proto::Error::new(
                     proto::code::METHOD_NOT_FOUND,

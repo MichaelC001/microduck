@@ -76,9 +76,9 @@ impl ImuStatus {
         inner.unavailable = Some(why);
     }
 
-    pub fn result(&self) -> proto::ImuStreamResult {
+    pub fn result(&self) -> proto::HeadImuStreamResult {
         let inner = self.inner.lock().unwrap();
-        proto::ImuStreamResult {
+        proto::HeadImuStreamResult {
             accepted: true,
             sensor: inner.sensor.clone(),
             unavailable: inner.unavailable.clone(),
@@ -87,12 +87,12 @@ impl ImuStatus {
     }
 }
 
-/// Read the BMI088 forever, broadcasting [`proto::ImuFrame`]. Returns only at shutdown.
+/// Read the BMI088 forever, broadcasting [`proto::HeadImuFrame`]. Returns only at shutdown.
 pub fn imu_loop(
     bus: Option<&Path>,
     hz: u8,
     status: &ImuStatus,
-    frames: &tokio::sync::broadcast::Sender<proto::ImuFrame>,
+    frames: &tokio::sync::broadcast::Sender<proto::HeadImuFrame>,
     shutdown: &Arc<AtomicBool>,
 ) {
     let started = Instant::now();
@@ -133,11 +133,10 @@ pub fn imu_loop(
                         }
                     }
                     seq += 1;
-                    let _ = frames.send(proto::ImuFrame {
+                    let _ = frames.send(proto::HeadImuFrame {
                         seq,
                         at_us: started.elapsed().as_micros() as u64,
                         t_ns: proto::clock::monotonic_ns(),
-                        which: "head".to_owned(),
                         gyro,
                         accel: [accel.0, accel.1, accel.2],
                         quat,
