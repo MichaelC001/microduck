@@ -411,6 +411,7 @@ sudo robotctl robot init
 
 ```
 sudo robotctl robot relax --yes
+sudo robotctl robot reboot-motors           # every servo; or `reboot-motors 3 11` for just those. Torque off, then init / Start
 ```
 
 `init` powers the joints and ramps to the home pose over about two seconds — **it moves every joint**,
@@ -476,6 +477,7 @@ mapping is the prototype's, so muscle memory carries over:
 | **DPad-Down** | sit ↔ stand |
 | **RT / LT** | mouth (either trigger) — RT also quacks; LT rides the "wheee" while held |
 | **DPad-Up**, held 3 s | switch drive mode, walk ⇄ roller |
+| **DPad-Right** | reboot every servo: the way back from a tripped overload without pulling the battery. Torque off, then Start |
 | **Select** | torque off (`robot.relax`): the emergency release. The robot drops, so hold it |
 | **Select**, held 2 s | power off (the press has already cut torque) |
 
