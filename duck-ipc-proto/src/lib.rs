@@ -292,7 +292,16 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// same instant, so a peer can put RTP timestamps (whose RTCP sender reports are wall-clock)
 /// onto the same monotonic axis. Additive everywhere: an older client ignores fields it does
 /// not know, and an older daemon leaves them at their defaults (zero, or absent).
-pub const API_VERSION: u32 = 24;
+///
+/// # v25 — the camera's intrinsics, from the robot
+///
+/// [`ModelResult::camera`] ([`CameraModel`]) carries the head camera's calibration — focal
+/// lengths, principal point, distortion — so a mapper reads them from the robot instead of
+/// shipping its own copy, the same reason [`ModelResult::tof_beams`] and [`RobotState::frames`]
+/// already come from here. It is a per-hardware-revision calibration: the camera and lens are one
+/// part, so every `alpha` unit shares the one the build embeds. Additive: `Option`, absent from a
+/// daemon predating it and `None` from a build that ships no calibration.
+pub const API_VERSION: u32 = 25;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -3391,6 +3400,40 @@ pub struct ModelResult {
     /// Sensor poses at every head joint zero — a fixed reference; the live ones are in
     /// [`RobotState::frames`].
     pub frames_at_zero: FramesState,
+    /// The head camera's intrinsics for this hardware revision, or `None` when this build ships no
+    /// calibration. See [`CameraModel`]. (v25)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub camera: Option<CameraModel>,
+}
+
+/// The head camera's intrinsics, so a mapper reads them from the robot rather than carrying its
+/// own copy — the same reason [`ModelResult::tof_beams`] and [`RobotState::frames`] come from the
+/// robot. A per-hardware-revision calibration: the camera and lens are one part, so every unit of
+/// a revision shares it. Solved in the sensor's native landscape frame at `width`×`height`;
+/// `rotate` is the clockwise rotation `mediad` applies to deliver the frame upright, so a consumer
+/// scales K for its own resolution and then rotates by `rotate`. Distances in pixels. (v25)
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CameraModel {
+    /// Hardware revision the calibration was solved for, e.g. `alpha` — matches [`ModelResult::asset`].
+    pub revision: String,
+    /// Width of the frames it was solved on (native landscape), pixels.
+    pub width: u32,
+    /// Height of the frames it was solved on (native landscape), pixels.
+    pub height: u32,
+    /// Clockwise rotation `mediad` applies to deliver the frame upright, degrees (0/90/180/270).
+    pub rotate: i32,
+    /// Horizontal focal length, pixels.
+    pub fx: f64,
+    /// Vertical focal length, pixels.
+    pub fy: f64,
+    /// Principal point x, pixels.
+    pub cx: f64,
+    /// Principal point y, pixels.
+    pub cy: f64,
+    /// OpenCV distortion coefficients `[k1, k2, p1, p2, k3]`.
+    pub distortion: Vec<f64>,
+    /// Reprojection RMS of the solve, pixels — provenance, not used in projection.
+    pub rms_px: f64,
 }
 
 /// What the duck chorale is doing, in [`RobotState`].
