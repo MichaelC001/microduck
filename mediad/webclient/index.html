@@ -437,18 +437,34 @@ let token = null, stream = null, chosen = null;
 // stale — and a robot ending a session *is* such a change. Without a flag, that listing walks
 // straight back into `startSession`, gets refused, and the refusal produces the next listing.
 let wanted = false;
+// Whether a `startSession` is already out. The service answers a `list` twice over — once as a
+// push after the welcome, once as the reply to our own — so without this the second listing opens
+// a second session against a robot that is about to accept the first.
+let starting = false;
 
 function send(msg) {
   log("out", "→", JSON.stringify(msg));
   if (REMOTE) {
-    // Fire and forget, like `ws.send`. A failure here is reported by the stream going away
-    // rather than by this call, which is what keeps every caller below transport-agnostic.
+    // **The reply to a `POST /send` can be a message, and dropping it costs the session.**
+    // On a WebSocket every answer comes back on the socket; here `startSession` is answered in
+    // the HTTP response body — `{"type":"sessionStarted","sessionId":…}` — and so is `list`,
+    // while everything else arrives on the event stream. A page that treated this as
+    // fire-and-forget got the robot's offer for a session it had never been told the id of, and
+    // failed on a null peer connection. So the body goes through the same handler as the stream.
     fetch(`${RENDEZVOUS}/send`, {
       method: "POST",
       headers: { "authorization": `Bearer ${token}`, "content-type": "application/json" },
       body: JSON.stringify(msg),
-    }).then((response) => {
-      if (!response.ok) log("bad", `!! POST /send: HTTP ${response.status}`);
+    }).then(async (response) => {
+      if (!response.ok) {
+        log("bad", `!! POST /send: HTTP ${response.status}`);
+        return;
+      }
+      const answer = await response.json().catch(() => null);
+      // `{"status":"ok"}` is the answer to everything the service handles on the stream.
+      if (answer && answer.type) {
+        await onSignalling(JSON.stringify(answer));
+      }
     }).catch((e) => log("bad", "!! POST /send:", e.message));
     return;
   }
@@ -667,7 +683,8 @@ $("robots").onchange = () => {
 function teardown() {
   setState("closed", "bad"); setDc("no control channel");
   $("connect").textContent = "connect";
-  ws = null; stream = null; sessionId = null; control = null; wanted = false;
+  ws = null; stream = null; sessionId = null; control = null;
+  wanted = false; starting = false;
   stopTelemetry();
   if (pc) { pc.close(); pc = null; }
 }
@@ -799,7 +816,7 @@ async function onSignalling(raw) {
         // A session already exists, or nobody asked for one: this listing is a robot appearing
         // or going away, not an invitation to open a session. Two consumers on one robot is
         // `remote-webrtc.md` §9's interleaving bug, and the service refuses it anyway.
-        if (sessionId || !wanted) break;
+        if (sessionId || starting || !wanted) break;
 
         chosen = (REMOTE && producers.length > 1 && $("robots").value) || producers[0].id;
         const producer = producers.find((p) => p.id === chosen) || producers[0];
@@ -813,11 +830,13 @@ async function onSignalling(raw) {
         if (meta.api_version) $("api").textContent = `api v${meta.api_version}`;
         // No `offer`, so the producer offers and we answer. That is the direction webrtcsink
         // wants: it knows what it is sending.
+        starting = true;
         send({ type: "startSession", peerId: producer.id });
         break;
       }
 
       case "sessionStarted":
+        starting = false;
         sessionId = msg.sessionId;
         setState("negotiating");
         newPeerConnection();
@@ -829,6 +848,12 @@ async function onSignalling(raw) {
       // one mistake that produces silence rather than an error, so they are read off
       // net/webrtc/protocol rather than guessed.
       case "peer":
+        if (!pc) {
+          log("bad", "!! a peer message arrived before this page had a session to put it in",
+                     `(sessionId ${msg.sessionId}).`,
+                     "That is `sessionStarted` having been missed, not the robot misbehaving.");
+          break;
+        }
         if (msg.sdp) {
           await pc.setRemoteDescription(msg.sdp);
           const answer = await pc.createAnswer();
@@ -849,6 +874,7 @@ async function onSignalling(raw) {
         // just declined.
         sessionId = null;
         wanted = false;
+        starting = false;
         if (pc) { pc.close(); pc = null; }
         setState("signalling"); setDc("no control channel");
         stopTelemetry();

@@ -394,6 +394,16 @@ is not, in three ways:
 | auth | none (§4 of `remote-webrtc.md`) | `Authorization: Bearer <hf token>` |
 | ids | its own `peerId`, its own `sessionId` | different ones, per hop |
 | our role | `listener` | `producer` |
+| where a reply arrives | on the socket, always | **`sessionStarted` and `list` in the `POST` response body**; everything else on the stream |
+
+That last row cost an afternoon and belongs in a table rather than in somebody's memory. On a
+WebSocket every answer comes back on the socket, so a client naturally treats a send as
+fire-and-forget. Here `handle_start_session` *returns* `{"type":"sessionStarted","sessionId":…}` to
+the caller of `POST /send` — the producer is notified over SSE, the consumer is answered in the
+response — and a page that discarded that body got the robot's offer for a session whose id it had
+never been told, then failed on a null peer connection. `list` is answered the same way, and is
+*also* pushed over the stream after the welcome, which is why the listing half looked healthy while
+the session half was broken.
 
 So the bridge keeps a session table both ways and rewrites `sessionId` on every `peer` message. That
 is where `reachy_mini`'s relay has needed most of its scar tissue (§3.4), and it is the honest
