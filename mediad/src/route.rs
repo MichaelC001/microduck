@@ -207,6 +207,8 @@ fn permits(call: &proto::Call) -> bool {
         // "it will be through `mediad`'s video path, where depth belongs next to the frame it
         // annotates".
         TofStream => true,
+        // The head IMU rides the same video path, for the same reason: it annotates the frames.
+        ImuStream => true,
 
         // ── reading the robot's software ─────────────────────────────────────
         //
@@ -435,6 +437,7 @@ mod tests {
                     | proto::Call::RobotStop
                     | proto::Call::RobotSubscribe(_)
                     | proto::Call::TofStream
+                    | proto::Call::ImuStream
                     | proto::Call::PadInput
             );
             if wanted {

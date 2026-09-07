@@ -389,6 +389,8 @@ fn permits(call: &proto::Call) -> bool {
         // reason to see what the robot sees, it will be through `mediad`'s video path
         // (`architecture.md` §5.2), where depth belongs next to the frame it annotates.
         TofStream => false,
+        // Same as the ToF: the head IMU is tofd's, reached over mediad's video path, not BLE.
+        ImuStream => false,
     }
 }
 

@@ -816,11 +816,11 @@ impl Server {
             ),
 
             // Same story one namespace over: `tofd` owns the sensor and answers for it.
-            Call::TofStream => Response::err(
+            Call::TofStream | Call::ImuStream => Response::err(
                 Some(id),
                 proto::Error::new(
                     proto::code::METHOD_NOT_FOUND,
-                    "tof.stream is served by tofd itself, on /run/tofd/tof.sock",
+                    "tof.stream and imu.stream are served by tofd itself, on /run/tofd/tof.sock",
                 ),
             ),
 
