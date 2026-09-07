@@ -45,6 +45,10 @@ reqwest = { version = "0.13.4", default-features = false, features = ["rustls", 
 eventsource-stream = "0.2.3"
 # `StreamExt`, for the byte stream `reqwest` hands over. Already in the lock via `updater`.
 futures-util = "0.3.33"
+# The local half of the bridge: a WebSocket client to `webrtcsink`'s own signalling server on
+# 127.0.0.1:8443, where this daemon is a *consumer* — the same role the console page plays on a
+# LAN. `ws://` only, on loopback, so no TLS: `connect` and `handshake` and nothing else.
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake"] }
 # Jitter on the reconnect backoff, so a fleet coming back after a service restart does not arrive
 # in lockstep. Already in the lock.
 rand = "0.10.2"
@@ -89,5 +93,7 @@ tempfile = "3"
 # The fake rendezvous service the relay is tested against: `axum` needs a `Stream` to serve SSE
 # from, and one `async_stream::stream!` is what a hand-written `Stream` impl would be.
 async-stream = "0.3.6"
-axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "json"] }
+# `ws` for the fake signalling server the bridge is tested against — the local side of a session
+# is a WebSocket, and a test that faked it with a channel would not exercise the framing.
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "json", "ws"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
