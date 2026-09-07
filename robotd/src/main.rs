@@ -4436,14 +4436,6 @@ mod mapping {
     static TOF: LazyLock<kinematics::tof::Reprojector> =
         LazyLock::new(kinematics::tof::Reprojector::alpha);
 
-    /// The alpha camera calibration, embedded (see `robotd/assets/alpha/README.md`). One part
-    /// across all alpha units, so one file; served over `robot.model` so a mapper reads it from
-    /// the robot. Parsed once — a malformed asset is a build bug, so panic rather than serve `None`.
-    static CAMERA: LazyLock<proto::CameraModel> = LazyLock::new(|| {
-        serde_json::from_str(include_str!("../assets/alpha/camera_intrinsics.json"))
-            .expect("embedded alpha camera_intrinsics.json parses into CameraModel")
-    });
-
     /// The head joints, in [`kinematics::head::HeadFk`]'s order, out of a full joint vector.
     const HEAD: [&str; 4] = ["neck_pitch", "head_pitch", "head_yaw", "head_roll"];
 
@@ -4513,7 +4505,6 @@ mod mapping {
             tof_beams: TOF.beams().to_vec(),
             tof_fov_deg: kinematics::tof::FOV_DEG,
             frames_at_zero: frames_at([0.0; 4]),
-            camera: Some(CAMERA.clone()),
             skeleton: skeleton_links(),
         }
     }
@@ -4545,17 +4536,6 @@ mod mapping {
                 .sum::<f64>()
                 .sqrt();
             assert!(d > 0.01 && d < 0.05, "camera-tof distance {d}");
-        }
-
-        #[test]
-        fn the_model_serves_the_alpha_camera_calibration() {
-            let cam = model().camera.expect("alpha build ships a camera calibration");
-            assert_eq!(cam.revision, "alpha", "calibration is for the served asset revision");
-            assert_eq!(cam.distortion.len(), 5, "OpenCV [k1,k2,p1,p2,k3]");
-            // Focal lengths and principal point sit inside the frame they were solved on.
-            assert!(cam.fx > 0.0 && cam.fy > 0.0);
-            assert!(cam.cx > 0.0 && cam.cx < f64::from(cam.width));
-            assert!(cam.cy > 0.0 && cam.cy < f64::from(cam.height));
         }
 
         #[test]

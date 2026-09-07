@@ -127,10 +127,10 @@ pub fn imu_loop(
             match ahrs.update(dt) {
                 Ok((gyro, quat)) => {
                     let accel = ahrs.imu().read_accelerometer_ms2().unwrap_or((0.0, 0.0, 0.0));
-                    if seq % TEMP_EVERY == 0 {
-                        if let Ok(t) = ahrs.imu().read_temperature() {
-                            temp_c = t;
-                        }
+                    if seq.is_multiple_of(TEMP_EVERY)
+                        && let Ok(t) = ahrs.imu().read_temperature()
+                    {
+                        temp_c = t;
                     }
                     seq += 1;
                     let _ = frames.send(proto::HeadImuFrame {
