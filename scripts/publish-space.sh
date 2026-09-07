@@ -40,7 +40,7 @@ STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT
 
 echo "space:  https://huggingface.co/spaces/$SPACE"
-echo "files:  $(cd "$SOURCE" && ls | tr '\n' ' ')"
+echo "files:  $(find "$SOURCE" -maxdepth 1 -type f -exec basename {} \; | sort | tr '\n' ' ')"
 
 if [ -n "$DRY_RUN" ]; then
     echo "--dry-run: nothing pushed"
@@ -53,7 +53,12 @@ git clone --depth 1 "https://huggingface.co/spaces/$SPACE" "$CLONE"
 # Copied rather than synced: a file deleted here stays in the Space until somebody removes it
 # there. Deliberate — a `--delete` that ran against the wrong Space id would remove somebody's
 # work, and these are hand-run.
-cp "$SOURCE"/* "$CLONE/"
+#
+# Files only, and `find` rather than a glob for one reason: running a Space locally leaves a
+# `__pycache__` beside its source (gitignored, so it stays there), and `cp` without `-r` fails on
+# a directory instead of skipping it — which under `set -e` aborts the publish after the clone,
+# for a reason that has nothing to do with the Space.
+find "$SOURCE" -maxdepth 1 -type f -exec cp {} "$CLONE/" \;
 
 cd "$CLONE"
 if git diff --quiet; then

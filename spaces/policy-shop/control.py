@@ -1,0 +1,219 @@
+"""The control channel, and the one line of somebody else's client that hides it.
+
+`ReachyCentralConsumer` connects to the rendezvous, negotiates the session and decodes the
+video with nothing added on either side — verified against `olducky`, and
+`docs/design/remote-access-design.md` §5.1 records it. It also refuses the data channel a duck
+opens: its handler is `if channel.label != "data": ignoring unexpected data channel`, and ours
+is `control` (`remote-webrtc.md` §5). So a Space that wants pixels needs nothing from this file
+and a Space that wants to *drive* a duck cannot start without it.
+
+**A second listener, not a patched one.** `RTCPeerConnection` is a pyee emitter, so `pc.on(...)`
+appends rather than replaces: their handler still runs, still warns about a label it does not
+know, and ours takes the channel it dropped. Nothing in their package is rewritten, which is what
+makes this survive the version bump that fixes §5.1 on their side — the day their handler takes
+`control`, this one stops being the first to claim it and the shim can be deleted.
+
+Their `send_command` is reused as-is rather than reimplemented: `RTCDataChannel.send` is not
+thread-safe, they already marshal every send onto the loop that owns the peer connection, and a
+Gradio callback runs in whichever worker thread the request landed in.
+
+What rides the channel is JSON-RPC 2.0, one object per line — `duck-ipc-proto`'s own wire, the
+same lines `robotctl` sends over a unix socket and the console page sends over this channel. Ids
+are handed out here and answers matched to them, which is what lets a UI callback block on one.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import itertools
+import json
+import logging
+import threading
+from collections import deque
+from concurrent.futures import Future
+from concurrent.futures import TimeoutError as FutureTimeout
+from typing import Any, Callable
+
+from aiortc import RTCDataChannel
+from reachy_mini.media.central_consumer import ReachyCentralConsumer
+
+logger = logging.getLogger(__name__)
+
+# What `mediad` calls the channel it opens on every consumer's peer connection.
+CONTROL_LABEL = "control"
+
+
+class RpcError(Exception):
+    """A refusal from the robot, carrying the code it refused with.
+
+    Distinct from a transport failure on purpose: `policy.fetch` answering "obs_len 51, this
+    robot is 61" is the robot working correctly and is the most useful thing this Space can
+    show, while "no answer in 30s" means something else entirely.
+    """
+
+    def __init__(self, method: str, error: dict[str, Any]):
+        self.method = method
+        self.code = error.get("code")
+        self.message = error.get("message") or "refused, with nothing said about why"
+        super().__init__(f"{method}: {self.message}")
+
+
+class Rpc:
+    """Requests out, answers and notifications in, over one data channel.
+
+    Not a session and not a connection — those are the consumer's. This owns the id space and
+    the pending table, and it survives a channel closing: the futures are failed rather than
+    left for a caller to time out on one at a time.
+    """
+
+    def __init__(self, timeout: float = 30.0):
+        self.timeout = timeout
+        self._ids = itertools.count(1)
+        self._pending: dict[int, Future] = {}
+        self._lock = threading.Lock()
+        self._send: Callable[[dict[str, Any]], bool] | None = None
+        # The last one of each notification, and a short transcript. A duck streams `robot.state`
+        # at whatever rate it was asked for, so keeping them all is a leak and keeping the last
+        # is what a panel shows.
+        self.notifications: dict[str, Any] = {}
+        self.transcript: deque[str] = deque(maxlen=60)
+
+    def bound_to(self, send: Callable[[dict[str, Any]], bool]) -> None:
+        self._send = send
+
+    def is_open(self) -> bool:
+        return self._send is not None
+
+    def call(
+        self, method: str, params: dict[str, Any] | None = None, timeout: float | None = None
+    ) -> Any:
+        """Send one request and wait for its answer.
+
+        Blocking, because every caller here is a Gradio callback with nothing else to do. The
+        timeout is not a budget on the robot's behalf: a promise nobody settles is a leak, and a
+        method that never answers is worth seeing rather than a panel that quietly stopped.
+        `policy.fetch` is the one call that wants its own — it is a download over the robot's
+        wifi, not a question about state.
+        """
+        budget = self.timeout if timeout is None else timeout
+        send = self._send
+        if send is None:
+            raise RpcError(method, {"message": "no control channel — connect first"})
+
+        call_id = next(self._ids)
+        future: Future = Future()
+        with self._lock:
+            self._pending[call_id] = future
+        self.transcript.append(f"→ {method} {json.dumps(params or {})}")
+
+        if not send({"jsonrpc": "2.0", "id": call_id, "method": method, "params": params or {}}):
+            with self._lock:
+                self._pending.pop(call_id, None)
+            raise RpcError(method, {"message": "the control channel would not take the request"})
+
+        try:
+            return future.result(timeout=budget)
+        except FutureTimeout:
+            with self._lock:
+                self._pending.pop(call_id, None)
+            raise RpcError(
+                method, {"message": f"no answer in {budget:.0f}s"}
+            ) from None
+
+    def on_message(self, raw: Any) -> None:
+        """One line off the channel. Runs on the consumer's event loop, so it does not block."""
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", "replace")
+        try:
+            message = json.loads(raw)
+        except (TypeError, ValueError):
+            self.transcript.append(f"← unparseable: {str(raw)[:120]}")
+            return
+
+        call_id = message.get("id")
+        if call_id is None:
+            # A notification. `robot.state` streams, `media.video` arrives once when the channel
+            # opens, and `media.detections` a couple of times a second — none of them answer
+            # anything anybody asked for.
+            method = message.get("method")
+            if method:
+                self.notifications[method] = message.get("params")
+            return
+
+        with self._lock:
+            future = self._pending.pop(call_id, None)
+        if future is None:
+            # A duck does not correlate replies (`remote-webrtc.md` §5), so this is ordinary:
+            # a fire-and-forget intent's answer, or one that arrived after its timeout.
+            return
+        if "error" in message:
+            error = message["error"] or {}
+            self.transcript.append(f"← error {error.get('message')}")
+            future.set_exception(RpcError("call", error))
+        else:
+            result = message.get("result")
+            self.transcript.append(f"← {json.dumps(result)[:200]}")
+            future.set_result(result)
+
+    def abandon(self, why: str) -> None:
+        """Fail everything in flight. A closed channel answers nothing, ever."""
+        with self._lock:
+            pending, self._pending = self._pending, {}
+            self._send = None
+        for future in pending.values():
+            if not future.done():
+                future.set_exception(RpcError("call", {"message": why}))
+
+
+class DuckConsumer(ReachyCentralConsumer):
+    """Their consumer, plus the channel a duck actually opens.
+
+    `robot_peer_id` should be pinned rather than left to `robot_name`: their auto-pick falls back
+    to the only visible producer whatever it is called, so an account whose one online robot is a
+    mini would hand this Space a mini to drive with method names it does not serve. §5.1 records
+    that as a two-line change on their side; pinning the id is this side's half, and this Space
+    knows the id because it listed the robots itself.
+    """
+
+    def __init__(self, *args: Any, rpc: Rpc, **kwargs: Any):
+        super().__init__(*args, **kwargs)
+        self._rpc = rpc
+
+    async def _build_pc(self) -> None:
+        await super()._build_pc()
+        pc = self._pc
+        if pc is None:  # pragma: no cover - their method always sets it
+            return
+
+        rpc = self._rpc
+
+        @pc.on("datachannel")
+        def _on_control(channel: RTCDataChannel) -> None:
+            if channel.label != CONTROL_LABEL:
+                return
+
+            # Their own bookkeeping, filled in here so `send_command` works unchanged: it reads
+            # exactly these three and marshals the send onto this loop.
+            self._cmd_channel = channel
+            try:
+                self._cmd_loop = asyncio.get_running_loop()
+            except RuntimeError:  # pragma: no cover - aiortc fires this inside its loop
+                self._cmd_loop = asyncio.get_event_loop()
+            logger.info("control channel attached (state=%s)", channel.readyState)
+
+            def opened() -> None:
+                self._cmd_channel_open = True
+                rpc.bound_to(self.send_command)
+                self._on_cmd_ready()
+
+            if channel.readyState == "open":
+                opened()
+
+            channel.on("open")(opened)
+
+            def closed() -> None:
+                self._cmd_channel_open = False
+                rpc.abandon("the control channel closed")
+
+            channel.on("close")(closed)
+            channel.on("message")(rpc.on_message)

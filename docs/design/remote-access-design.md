@@ -677,7 +677,8 @@ decodes frames with nothing added on either side: `pip install "reachy_mini[cent
 on the way past is `ignoring unexpected data channel: 'control'`, because it looks for the label
 the mini's daemon opens and ours is `control` (`remote-webrtc.md` §5). Nothing for a perception
 consumer, which wants pixels — and the first thing to fix for one that wants to *drive* a duck,
-where the label is the smaller half of the problem and the method names are the larger.
+where the label is the smaller half of the problem and the method names are the larger. §5.2 is
+both halves, on this side.
 
 **Two of their clients select on `meta.name` and neither reads `kind`.** The host shell's picker
 lists whatever is online, and `ReachyCentralConsumer` matches `robot_name` against `meta.name` with
@@ -685,6 +686,48 @@ a **fallback**: one visible producer for the token is used whatever it is called
 written for a mini, on an account whose only online robot is a duck, picks the duck and drives it
 with method names this project does not serve. That is worth telling them before somebody meets it,
 and it is a two-line change on their side — `kind` is already on the wire.
+
+### 5.2 A consumer that drives a duck, and the one line of theirs it has to get past
+
+`spaces/policy-shop` is the second consumer in this repository and the first that *sends*
+anything: sign in, list the account's ducks, and put a policy from the Hub onto one in a click —
+`policy.fetch`, `robot.setSkill`, `robot.policies`, `robot.do`, which is `robotctl policy add`'s
+own order over a datachannel instead of over a unix socket.
+
+The whole cost of "drive" over "watch" is a label. `ReachyCentralConsumer` handles
+`pc.on("datachannel")` with `if channel.label != "data": ignoring unexpected data channel`, and
+`mediad` opens `control` (`remote-webrtc.md` §5) — so a consumer that wants pixels needs nothing
+and a consumer that wants to send a call gets no channel at all. `RTCPeerConnection` is a pyee
+emitter, so `pc.on` *appends* rather than replaces: a subclass overriding `_build_pc` registers a
+second listener, theirs still runs and still warns about a label it does not know, and ours takes
+the channel it dropped. Nothing in their package is rewritten, which is what makes it survive the
+version that fixes their side — the day their handler takes `control`, ours stops being the first
+to claim it and the shim becomes a deletion.
+
+Their `send_command` is reused rather than reimplemented, and that is not laziness:
+`RTCDataChannel.send` is not thread-safe, they already marshal every send onto the loop that owns
+the peer connection, and a Gradio callback runs in whichever worker thread the request landed in.
+
+**Two refusals, and which side owns them is most of what writing this settled.** `policy.fetch`
+checks the claims that are about the robot — `obs_len`, `action_len`, `model_api`, `robot.model` —
+and it checks them *before* the download, so a client should not repeat them and should show what
+the robot said. `robot.setSkill` checks nothing about the command encoding: a phase policy
+installed as a one-shot is **accepted**, and the robot then feeds a constant to a network trained
+on a phase, which is plausible movement and wrong movement. That rule lives in `robotctl`, and
+`robotctl` is not in the path of a click — so `catalogue.refusal` is the same rule written a second
+time, and any client that grows this button needs it a third.
+
+`IntentResult` is the other thing a client gets wrong once: `robot.setSkill`, `robot.do`,
+`robot.init` and `robot.relax` answer `accepted: false` with a reason rather than a JSON-RPC
+error, deliberately — safety refusing to run a policy on a fallen robot is not a broken call. A
+page that only catches errors reports every one of those as a success and leaves a motionless
+robot unexplained.
+
+**And the transport is the one thing this cannot prove from a Space yet.** The control channel is
+SCTP over the same candidate pair as the media, so §6's dead TURN endpoint takes the click with
+it: from a data centre the session negotiates and may then carry nothing. It works from a laptop
+on the robot's own network, which is what the file's `__main__` is for, and it is why the status
+line names the stage it reached rather than saying "connecting…".
 
 ## 6. NAT: STUN on both ends, and the robot offers the relay — **decided**
 
