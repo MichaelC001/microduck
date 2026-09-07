@@ -112,6 +112,10 @@ MAX_ROWS = 40
 # Space should still be used, and this string should never be sent anywhere whatever set it.
 MOCK_TOKEN = "mock-oauth-token-for-local-dev"
 
+# Whether this process *is* a Space, which changes what two of the tabs can honestly promise. Set
+# by the platform, and the same variable Gradio checks to decide whether to mock its login.
+ON_A_SPACE = bool(os.environ.get("SPACE_ID"))
+
 # The download happens on the robot, over the robot's wifi. Everything else here is a question
 # about state and answers in milliseconds.
 FETCH_TIMEOUT = 180.0
@@ -711,9 +715,19 @@ with gr.Blocks(title="microduck policy shop") as demo:
 
     with gr.Tab("from anywhere"):
         gr.Markdown(
-            "Through the rendezvous, which reaches a duck behind its owner's router. It needs a "
-            "candidate pair that works, and while `turn.fastrtc.org` has no DNS (§6) there may "
-            "not be one from a data centre — the tab beside this one needs no relay at all."
+            "Through the rendezvous, which reaches a duck behind its owner's router. **Nothing "
+            "is configured on the robot for this** — it connects outward to "
+            "`reachy_mini_central` holding its own account token and registers as a producer, "
+            "this page signs in as you, and the service introduces the two. The video and the "
+            "control channel then run directly between here and the duck.\n\nWhat it needs is a "
+            "candidate pair that works, and while `turn.fastrtc.org` has no DNS (§6) neither "
+            "side offers a relay"
+            + (
+                ", which is the failure a data centre is most likely to hit. If signalling "
+                "crosses and nothing else does, the log's ICE lines say so."
+                if ON_A_SPACE
+                else " — the tab beside this one needs none."
+            )
         )
         with gr.Row():
             gr.LoginButton()
@@ -726,6 +740,18 @@ with gr.Blocks(title="microduck policy shop") as demo:
             "Straight to the signalling server `mediad` is already running — no account, no "
             "rendezvous, no relay, and nothing between here and the robot. `duckctl ip` prints "
             "the address; `.local` works wherever mDNS does."
+            + (
+                # The confusion this exists to prevent: a duck is reached by the *rendezvous*
+                # introducing two peers, not by anything being pointed at this page's URL — so
+                # there is nothing to type here that would make a data centre reach a LAN.
+                "\n\n**This tab cannot work from a Space.** This page is running in a data "
+                "centre and your robot is behind your router; no address typed here is "
+                "reachable from here. It is for running this same file on the robot's own "
+                "network — the README's local-run section is two commands. Use *from "
+                "anywhere* instead, which is what the rendezvous is for."
+                if ON_A_SPACE
+                else ""
+            )
         )
         with gr.Row():
             host = gr.Textbox(
