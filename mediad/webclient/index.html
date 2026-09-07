@@ -429,6 +429,14 @@ let ws = null, pc = null, sessionId = null, control = null;
 // The rendezvous half: the account token, a handle on the open event stream, and which robot of
 // the account's this page is driving.
 let token = null, stream = null, chosen = null;
+// Whether a session is wanted. Set by a person — the connect button, or picking another robot —
+// and cleared when the robot ends one.
+//
+// **This is what stops a refusal loop.** The rendezvous pushes a `peerStatusChanged` whenever a
+// producer's state changes, which this page answers with a fresh `list` so the picker cannot go
+// stale — and a robot ending a session *is* such a change. Without a flag, that listing walks
+// straight back into `startSession`, gets refused, and the refusal produces the next listing.
+let wanted = false;
 
 function send(msg) {
   log("out", "→", JSON.stringify(msg));
@@ -467,12 +475,22 @@ async function openRendezvous(onMessage, onClosed) {
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  let chunks = 0;
   (async () => {
     try {
       for (;;) {
         const { value, done } = await reader.read();
         if (done) break;
-        buffer += decoder.decode(value, { stream: true });
+        // **CRLF, because the framing is not ours.** SSE permits `\r\n` line endings and a
+        // proxy is free to rewrite them; splitting on `\n\n` alone then matches nothing and
+        // every message is swallowed in silence — a stream that looks connected and says
+        // nothing, which is the worst shape a bug can take here. Normalised once, on arrival.
+        buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
+        if (chunks++ === 0) {
+          // The first thing off the wire, verbatim and bounded. If the frames are not what this
+          // parser expects, this line is what says so instead of a silent stream.
+          log("dim", "first bytes from the stream:", JSON.stringify(buffer.slice(0, 200)));
+        }
         // Events are separated by a blank line; a single event may carry several `data:` lines.
         let split;
         while ((split = buffer.indexOf("\n\n")) !== -1) {
@@ -489,6 +507,7 @@ async function openRendezvous(onMessage, onClosed) {
     } catch (e) {
       log("bad", "!! the event stream failed:", e.message);
     }
+    log("dim", "the event stream ended");
     onClosed();
   })();
   return reader;
@@ -633,6 +652,7 @@ async function signIn() {
 $("robots").onchange = () => {
   if (!stream) return;
   chosen = $("robots").value;
+  wanted = true;
   if (sessionId) {
     send({ type: "endSession", sessionId });
     sessionId = null;
@@ -647,7 +667,7 @@ $("robots").onchange = () => {
 function teardown() {
   setState("closed", "bad"); setDc("no control channel");
   $("connect").textContent = "connect";
-  ws = null; stream = null; sessionId = null; control = null;
+  ws = null; stream = null; sessionId = null; control = null; wanted = false;
   stopTelemetry();
   if (pc) { pc.close(); pc = null; }
 }
@@ -662,6 +682,7 @@ $("connect").onclick = async () => {
   }
 
   if (REMOTE) {
+    wanted = true;
     try {
       if (!token) {
         setState("signing in…");
@@ -674,11 +695,23 @@ $("connect").onclick = async () => {
       }
       setState("connecting…");
       log("dim", "opening the rendezvous event stream…");
+      let spoke = false;
       stream = await openRendezvous((data) => {
+        spoke = true;
         onSignalling(data).catch((e) => log("bad", "!!", e.message));
       }, teardown);
       setState("signalling");
       $("connect").textContent = "disconnect";
+      // The welcome is the first thing on a healthy stream and it arrives at once. A stream that
+      // is open and mute for this long is a parser or a proxy, not a slow server, and saying so
+      // beats a page that sits on "signalling" forever.
+      setTimeout(() => {
+        if (!spoke && stream) {
+          log("bad", "!! the stream is open and has said nothing for 10s.",
+                     "The welcome should arrive immediately — so this is the framing being read",
+                     "wrongly, or something between here and the Space buffering it.");
+        }
+      }, 10000);
     } catch (e) {
       // `e.message` alone can be empty — a rejected dynamic import in some browsers is one — and
       // a red pill with an empty log is the worst thing this page can do to somebody.
@@ -692,6 +725,7 @@ $("connect").onclick = async () => {
     return;
   }
 
+  wanted = true;
   ws = new WebSocket(SIGNALLING_URL);
   setState("connecting…");
 
@@ -762,10 +796,10 @@ async function onSignalling(raw) {
           picker.hidden = false;
         }
 
-        // A session already exists: this listing is a robot appearing or going away, not an
-        // invitation to open a second one. Two consumers on one robot is `remote-webrtc.md` §9's
-        // interleaving bug, and the service refuses it anyway.
-        if (sessionId) break;
+        // A session already exists, or nobody asked for one: this listing is a robot appearing
+        // or going away, not an invitation to open a session. Two consumers on one robot is
+        // `remote-webrtc.md` §9's interleaving bug, and the service refuses it anyway.
+        if (sessionId || !wanted) break;
 
         chosen = (REMOTE && producers.length > 1 && $("robots").value) || producers[0].id;
         const producer = producers.find((p) => p.id === chosen) || producers[0];
@@ -809,7 +843,12 @@ async function onSignalling(raw) {
         break;
 
       case "endSession":
-        log("dim", "session ended by the robot");
+        log("dim", "session ended by the robot", msg.reason ? `— ${msg.reason}` : "");
+        // Both, and both matter: a stale `sessionId` would be sent on the next `peer` message,
+        // and leaving `wanted` set turns the next listing into another request the robot has
+        // just declined.
+        sessionId = null;
+        wanted = false;
         if (pc) { pc.close(); pc = null; }
         setState("signalling"); setDc("no control channel");
         stopTelemetry();
