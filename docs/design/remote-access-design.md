@@ -560,32 +560,54 @@ The one thing that does not transfer is its **lock model** — `RobotAppLock`, l
 remote session, which the mini's relay gates incoming sessions on. A duck has no app, so §3.4
 takes the reconnect behaviour and leaves that part.
 
-## 5. The client is a static Space with a Hugging Face sign-in — **decided**
+## 5. The client is a Space with a Hugging Face sign-in — **decided**
 
 The console is `include_str!`'d into `mediad` and served by the robot (`webrtc-console.md` §1),
 which works because the client is on the LAN. **A remote client cannot fetch a page from a robot it
 cannot reach**, so remote needs the page hosted off-robot *and* a second signalling transport in
 it.
 
-**Decided: a static Space in the `pollen-robotics` org with `hf_oauth: true`**, serving the same
-page the robot serves, with the transport chosen by how it was opened. And the deciding argument is
-not hosting, it is the **token**.
+**Decided: a Space in the `pollen-robotics` org with `hf_oauth: true`** — `microduck-console` —
+serving the same page the robot serves, with the transport chosen by how it was opened. And the
+deciding argument is not hosting, it is the **token**.
 
 A remote consumer authenticates to the rendezvous exactly as the robot does — a bearer token the
 service resolves through `whoami-v2`, reading `name` out of the answer. It performs no token-type
 check and no scope check, so a browser's OAuth token is accepted on the same footing as the
 robot's device-flow one. Which makes the whole question "where does a page get an HF token", and a
-Space answers it for free: `hf_oauth: true` in the README creates the OAuth app, injects
-`OAUTH_CLIENT_ID`, and registers a redirect URI targeting the Space, and `@huggingface/hub`'s
-`oauthLoginUrl` / `oauthHandleRedirectIfPresent` do the flow **client-side**, so a static Space
-needs no server for it. HF ships that example (`huggingfacejs/client-side-oauth`).
+Space answers it: `hf_oauth: true` in the README creates the OAuth app and registers a redirect URI
+targeting the Space, and `@huggingface/hub`'s `oauthLoginUrl` / `oauthHandleRedirectIfPresent` do
+the rest of the flow **client-side**, PKCE, with no secret in the page.
 
-GitHub Pages, which an earlier draft of this section preferred, loses on exactly that point: the
-page would need an OAuth app registered by hand, its own redirect URI, and somewhere to keep a
-secret or a PKCE implementation — all of it maintained by us, to arrive where a line of README
-metadata arrives. It stays possible: nothing in the page depends on being a Space, and this is the
-same reasoning §2.3 used for taking Hugging Face's own device-code client rather than registering
-one.
+### 5.0 It is a Docker Space, and that cost an afternoon
+
+There are two documented ways for a Space to hand its page that client id, and the tidy one did
+not work. A **static** Space is supposed to inject `window.huggingface.variables.OAUTH_CLIENT_ID`
+— `huggingface.js` reads exactly that (`oauth-login-url.ts`), `reachy_mini_website` reads exactly
+that, and HF ships `huggingfacejs/client-side-oauth` as the example. On `microduck-console` it
+never appeared: not after a metadata change, not after the Space went public, not after a
+delete-and-recreate, and not after the page was given a real `<html><head>` for an injector to
+work on — a page that had been a bare doctype for its whole life until then. Hugging Face's own
+API reported our Space and a working one as indistinguishable: both `sdk: static`, both public,
+both `hf_oauth: true`, both `RUNNING`.
+
+So the console is a **Docker** Space: `hf_oauth: true` puts `OAUTH_CLIENT_ID` in the container's
+environment — the documented path for anything that is not static, and the one the `grabette-*`
+Spaces use — and eight lines of `sh` substitute it into the page as it is served. A page that
+needs no server has one, for that reason and no other. `OAUTH_CLIENT_SECRET` is in the same
+environment and never goes near the page.
+
+Two things that came out of chasing it are worth keeping. The page **logs its own build stamp**
+(revision plus a hash of the page), because a static host caches and a browser caches harder, and
+an hour went into a fix that was never being loaded. And every step of the sign-in **races a
+timeout**: a spent `?code=` left in the address bar leaves `oauthHandleRedirectIfPresent` pending
+forever, and everything a page would say about that is on the far side of the `await`.
+
+GitHub Pages, which an earlier draft of this section preferred, loses on the same point: the page
+would need an OAuth app registered by hand and its own redirect URI, maintained by us, to arrive
+where a line of README metadata arrives. It stays possible — the page takes a client id from
+`?client_id=` as well, which is how one is tried before it is written down — and this is the same
+reasoning §2.3 used for taking Hugging Face's own device-code client rather than registering one.
 
 **We ask for no scopes beyond the defaults.** `openid profile` is always included and is all this
 needs — the token's whole job is proving an identity to the rendezvous, which is the argument §2.4
@@ -603,10 +625,12 @@ a copy in a Space repo would drift from both. It **is** the one the robot serves
 `{{SIGNALLING_PORT}}` token was substituted. `web.rs` substitutes it and a test asserts the served
 page has none left; the Space copy keeps it, which is how the page knows no robot served it.
 
-The Space is a deploy target — `pollen-robotics/microduck-console`, static, and
-`scripts/publish-console.sh` is what puts a page there: it substitutes the API version from
-`duck-ipc-proto`, refuses to publish a page whose port token has gone, and pushes. By hand while
-there is one Space; by CI when that stops being true.
+The Space is a deploy target — `pollen-robotics/microduck-console` — and
+`scripts/publish-console.sh` is what puts a page there, along with the `Dockerfile` and
+`entrypoint.sh` that serve it. It substitutes the API version from `duck-ipc-proto`, stamps the
+build, and refuses to publish a page that has lost either the port token (which would make the
+Space's copy try to open a WebSocket) or the client-id token (which would leave it unable to sign
+anybody in). By hand while there is one Space; by CI when that stops being true.
 
 One thing settled rather than preferred, and it survives from the earlier draft: `EventSource`
 **cannot set headers**, so a browser speaking the SSE wire must either put the token in the query

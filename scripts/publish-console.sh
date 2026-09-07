@@ -36,9 +36,10 @@ done
 
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 PAGE="$REPO_ROOT/mediad/webclient/index.html"
-CARD="$REPO_ROOT/mediad/webclient/space/README.md"
+SPACE_DIR="$REPO_ROOT/mediad/webclient/space"
+CARD="$SPACE_DIR/README.md"
 
-for file in "$PAGE" "$CARD"; do
+for file in "$PAGE" "$CARD" "$SPACE_DIR/Dockerfile" "$SPACE_DIR/entrypoint.sh"; do
     [ -f "$file" ] || { echo "missing: $file" >&2; exit 1; }
 done
 
@@ -50,8 +51,26 @@ API_VERSION=$(sed -n 's/^pub const API_VERSION: u32 = \([0-9]*\);.*/\1/p' \
 STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT
 
-sed "s/{{API_VERSION}}/$API_VERSION/g" "$PAGE" > "$STAGE/index.html"
+# Which build this is, logged by the page as its first line. A static host caches and a browser
+# caches harder, so "is the fix even loaded" has to be answerable without guessing.
+# The revision *and* a hash of the page itself. The revision alone is not enough: a page edited
+# but not yet committed publishes under its parent's revision, so two different pages can carry
+# the same stamp — which is exactly the confusion this stamp exists to end.
+REVISION=$(cd "$REPO_ROOT" && git rev-parse --short HEAD)
+PAGE_HASH=$(shasum "$PAGE" | cut -c1-8)
+STAMP=$(date -u +%Y-%m-%dT%H:%MZ)
+sed -e "s/{{API_VERSION}}/$API_VERSION/g" \
+    -e "s|{{CONSOLE_BUILD}}|$REVISION/$PAGE_HASH $STAMP|g" "$PAGE" > "$STAGE/index.html"
 cp "$CARD" "$STAGE/README.md"
+# The Space is a Docker Space: it serves the page and substitutes its own OAuth client id into it.
+cp "$SPACE_DIR/Dockerfile" "$SPACE_DIR/entrypoint.sh" "$STAGE/"
+
+# The client id is substituted by the container at start, not here, so the token must survive
+# this staging — and the secret that comes with it must never appear in the page at all.
+grep -q '{{OAUTH_CLIENT_ID}}' "$STAGE/index.html" || {
+    echo "the OAuth token is gone from the page; the Space could not fill in its client id" >&2
+    exit 1
+}
 
 grep -q '{{SIGNALLING_PORT}}' "$STAGE/index.html" || {
     echo "the port token is gone from the page; the Space copy would try to open a WebSocket" >&2
@@ -69,7 +88,7 @@ fi
 
 CLONE="$STAGE/space"
 git clone --depth 1 "https://huggingface.co/spaces/$SPACE" "$CLONE"
-cp "$STAGE/index.html" "$STAGE/README.md" "$CLONE/"
+cp "$STAGE/index.html" "$STAGE/README.md" "$STAGE/Dockerfile" "$STAGE/entrypoint.sh" "$CLONE/"
 
 cd "$CLONE"
 if git diff --quiet; then
@@ -77,8 +96,7 @@ if git diff --quiet; then
     exit 0
 fi
 
-REVISION=$(cd "$REPO_ROOT" && git rev-parse --short HEAD)
-git add index.html README.md
+git add index.html README.md Dockerfile entrypoint.sh
 git commit -q -m "Console from microduck $REVISION (api v$API_VERSION)"
 git push
 echo "pushed. The Space rebuilds in a few seconds."
