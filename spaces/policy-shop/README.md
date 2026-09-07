@@ -37,6 +37,18 @@ pipe to the API the robot already serves.
 can say what a policy claims to be before anybody clicks it, but the skill that gets written comes
 from `policy.fetch`'s answer, which is about the bytes that were actually downloaded.
 
+## The picture
+
+The session carries the camera as well as the channel, so the newest frame is shown beside the
+buttons — decoded from H.264 by `aiortc`, on whichever transport is connected, and repainted ten
+times a second. Watching the thing you installed do something is most of the point of installing
+it from here rather than from a terminal.
+
+It is put the right way up by asking. The camera is mounted a quarter turn off and nothing on the
+robot rotates the pixels; `media.video` carries `rotate` and the control channel sends it once
+when it opens, so there is no angle written down anywhere in this Space. `vision-demo` has to
+compile one in, because it has no control channel to ask on.
+
 ## What it refuses, and why it is this side's job
 
 A policy whose command the daemon generates — a phase for a ground pick, a flag for a sit↔stand —
@@ -111,6 +123,8 @@ session and no hardware.
 
 `python lan.py` stands up a producer on loopback that speaks what `webrtcsink`'s signaller speaks
 and drives a real session against it: welcome, list, startSession, an offer answered, DTLS, SCTP,
-the `control` channel, and a call matched to its reply. Two aiortc peers on `127.0.0.1` are not a
-duck — they are the same protocol, and a dozen hand-written envelope shapes are exactly the thing
-that fails silently rather than loudly.
+the `control` channel, a call matched to its reply, and a video track decoded to check that frames
+arrive at all and arrive as RGB. Two aiortc peers on `127.0.0.1` are not a duck — they are the
+same protocol, and a dozen hand-written envelope shapes are exactly the thing that fails silently
+rather than loudly. The producer there sends VP8 where a duck sends H.264, because the codec is
+aiortc's to pick and the plumbing under test is the same one either way.

@@ -365,7 +365,25 @@ class LanConsumer:
 async def _selfcheck(port: int = 8443) -> None:  # pragma: no cover - a script, not a test suite
     import json as _json
 
+    import av
     from aiohttp import WSMsgType, web
+    from aiortc import VideoStreamTrack
+
+    class Stripes(VideoStreamTrack):
+        """A picture with a top and a bottom, and wider than it is tall.
+
+        Both on purpose: an upside-down frame and an unrotated one have the same shape, so the
+        asymmetry is what makes `rotate` checkable at all — 180×320 turned a quarter is 320×180,
+        and the red half moves to a side.
+        """
+
+        async def recv(self) -> av.VideoFrame:
+            pts, time_base = await self.next_timestamp()
+            picture = np.zeros((180, 320, 3), dtype=np.uint8)
+            picture[:90] = (255, 0, 0)
+            frame = av.VideoFrame.from_ndarray(picture, format="rgb24")
+            frame.pts, frame.time_base = pts, time_base
+            return frame
 
     answers = {"robot.policies": {"mode": "walk", "enabled": True, "slots": []}}
     calls: list[str] = []
@@ -396,6 +414,11 @@ async def _selfcheck(port: int = 8443) -> None:  # pragma: no cover - a script, 
                 # The robot opens the channel, which is why a consumer that opens its own gets an
                 # unrouted one: `mediad` calls create-data-channel per consumer.
                 channel = pc.createDataChannel(CONTROL_LABEL)
+                # And it sends pixels, which is the half of "run it" that a table cannot show.
+                # VP8 here where a duck sends H.264 — the codec is aiortc's to pick and the
+                # plumbing under test is the same: a track offered, answered, decoded, and the
+                # newest frame kept.
+                pc.addTrack(Stripes())
 
                 @channel.on("message")
                 def _on_call(text: str) -> None:
@@ -433,23 +456,49 @@ async def _selfcheck(port: int = 8443) -> None:  # pragma: no cover - a script, 
     rpc = Rpc(timeout=15)
     consumer = LanConsumer("127.0.0.1", rpc, port)
     await consumer.start()
+    try:
+        await _exercise(consumer, rpc, calls)
+    finally:
+        # Torn down whatever happened: a check that fails should print why, not print why and
+        # then bury it under "Unclosed client session".
+        await consumer.stop()
+        await runner.cleanup()
+    print("\nok — the protocol this file writes is the protocol a duck answers")
+
+
+async def _exercise(  # pragma: no cover - the body of the script above
+    consumer: LanConsumer, rpc: Rpc, calls: list[str]
+) -> None:
     for _ in range(120):
         if rpc.is_open():
             break
         await asyncio.sleep(0.25)
 
     assert rpc.is_open(), f"no control channel: {consumer.error}"
+
+    for _ in range(80):
+        if consumer.latest_frame() is not None:
+            break
+        await asyncio.sleep(0.25)
+    frame = consumer.latest_frame()
+    assert frame is not None, "the control channel opened and no frame ever arrived"
+    identifier, picture = frame
+    assert picture.shape == (180, 320, 3), picture.shape
+    # `rgb24`, which is what their consumer promises `latest_frame`'s callers — so the red half
+    # has to come back red rather than blue, or the page shows a duck in the wrong colours.
+    # Dominance rather than equality: the codec is lossy, and pure red arrives as (251, 1, 0).
+    red, green, blue = (int(channel) for channel in picture[0, 0])
+    assert red > 200 and green < 40 and blue < 40, (red, green, blue)
+
     print("session:", consumer.status())
     print("meta:   ", consumer.meta)
+    print(f"frame:   #{identifier} {picture.shape} rgb, top-left {tuple(picture[0, 0])}")
     print("call:   ", await asyncio.to_thread(rpc.call, "robot.policies"))
     try:
         await asyncio.to_thread(rpc.call, "robot.nonsense")
     except Exception as e:  # noqa: BLE001 - the refusal is the thing being shown
         print("refusal:", e)
     assert calls == ["robot.policies", "robot.nonsense"], calls
-    await consumer.stop()
-    await runner.cleanup()
-    print("\nok — the protocol this file writes is the protocol a duck answers")
 
 
 if __name__ == "__main__":
