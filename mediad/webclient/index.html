@@ -902,10 +902,22 @@ async function onSignalling(raw) {
 }
 
 function newPeerConnection() {
-  // No ICE servers: this is a LAN client talking to a robot on the same network, which is the
-  // case §3 exists for. Reaching a robot elsewhere goes through the bridge (§7) and would need
-  // STUN, which is that design's problem rather than this page's.
-  pc = new RTCPeerConnection();
+  // **STUN only when it is needed, which is when this page is not on the robot's network.**
+  //
+  // On a LAN both ends offer host candidates and they pair immediately; asking a public STUN
+  // server about a robot two metres away would add a round trip to somebody else's service for a
+  // candidate nothing will use. Remotely there are no host candidates in common, so the browser
+  // has to learn its own reflexive address — and until it did, this page offered only
+  // `192.168.…` to a robot on another network and the session negotiated perfectly and carried
+  // nothing.
+  //
+  // `stun.l.google.com` is what `webrtcsink` already defaults to on the robot side, so the two
+  // ends use one server rather than two. TURN is the next thing this needs — see
+  // `remote-access-design.md` §6, and `reachy_mini`'s #1182, where the *robot* fetches
+  // short-lived Cloudflare credentials with its own HF token.
+  pc = new RTCPeerConnection(REMOTE
+    ? { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] }
+    : undefined);
 
   pc.ontrack = (event) => {
     log("dim", "track:", event.track.kind);
