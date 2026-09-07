@@ -308,16 +308,32 @@ mod tests {
         // Shoulder at 90°: upper's origin does not move (a hinge turns the frame
         // in place), but lower swings out along +y.
         let p = model.body_poses(&[std::f64::consts::FRAC_PI_2, 0.0]);
-        assert!((p[1].pos[0] - 1.0).abs() < 1e-12, "upper x: {}", p[1].pos[0]);
-        assert!((p[2].pos[0] - 1.0).abs() < 1e-12, "lower x: {}", p[2].pos[0]);
-        assert!((p[2].pos[1] - 1.0).abs() < 1e-12, "lower y: {}", p[2].pos[1]);
+        assert!(
+            (p[1].pos[0] - 1.0).abs() < 1e-12,
+            "upper x: {}",
+            p[1].pos[0]
+        );
+        assert!(
+            (p[2].pos[0] - 1.0).abs() < 1e-12,
+            "lower x: {}",
+            p[2].pos[0]
+        );
+        assert!(
+            (p[2].pos[1] - 1.0).abs() < 1e-12,
+            "lower y: {}",
+            p[2].pos[1]
+        );
 
         // The body under a site agrees with the site FK, minus the site offset.
         let tip = model.site("tip").expect("tip");
         let s = model.site_pose(tip, &[0.3, -0.4]);
         let lower = model.body_poses(&[0.3, -0.4])[2];
         // The tip site sits [1,0,0] out in `lower`; walking it back lands on lower's origin.
-        let back = lower * Pose { pos: [1.0, 0.0, 0.0], quat: Quat::IDENTITY };
+        let back = lower
+            * Pose {
+                pos: [1.0, 0.0, 0.0],
+                quat: Quat::IDENTITY,
+            };
         assert!((s.pos[0] - back.pos[0]).abs() < 1e-12 && (s.pos[1] - back.pos[1]).abs() < 1e-12);
     }
 

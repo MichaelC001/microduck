@@ -4543,23 +4543,37 @@ mod mapping {
             let links = model().skeleton;
             assert!(!links.is_empty(), "a skeleton is served");
             assert_eq!(links[0].parent, None, "the root has no parent");
-            assert!(links[1..].iter().all(|l| l.parent.is_some()), "every other link has a parent");
+            assert!(
+                links[1..].iter().all(|l| l.parent.is_some()),
+                "every other link has a parent"
+            );
             // A pose per link, in the same order, and every parent precedes its child.
             let poses = skeleton_at(&[0.0; 15]);
             assert_eq!(poses.len(), links.len(), "one pose per link");
-            assert!(links.iter().enumerate().all(|(i, l)| l.parent.is_none_or(|p| p < i)));
+            assert!(
+                links
+                    .iter()
+                    .enumerate()
+                    .all(|(i, l)| l.parent.is_none_or(|p| p < i))
+            );
         }
 
         #[test]
         fn the_skeleton_moves_with_a_leg_joint() {
             let mut bent = [0.0; 15];
-            let knee = proto::JOINT_NAMES.iter().position(|n| n.contains("knee")).expect("a knee joint");
+            let knee = proto::JOINT_NAMES
+                .iter()
+                .position(|n| n.contains("knee"))
+                .expect("a knee joint");
             bent[knee] = 0.8;
             // Bending a knee moves some body, but never the root (trunk_base sits at identity).
             let rest = skeleton_at(&[0.0; 15]);
             let moved = skeleton_at(&bent);
             assert_eq!(rest[0].pos, moved[0].pos, "the root does not move");
-            assert!(rest.iter().zip(&moved).any(|(a, b)| a.pos != b.pos), "a leg body moved");
+            assert!(
+                rest.iter().zip(&moved).any(|(a, b)| a.pos != b.pos),
+                "a leg body moved"
+            );
         }
 
         #[test]

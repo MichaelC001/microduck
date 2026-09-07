@@ -220,13 +220,16 @@ async fn main() -> std::process::ExitCode {
     let imu_thread = if args.no_imu || args.fake || args.sim.is_some() {
         None
     } else {
-        let (imu_status, imu_frames, shutdown) = (imu_status.clone(), imu_frames.clone(), shutdown.clone());
+        let (imu_status, imu_frames, shutdown) =
+            (imu_status.clone(), imu_frames.clone(), shutdown.clone());
         let bus = args.bus.clone();
         let hz = args.imu_hz;
         Some(
             std::thread::Builder::new()
                 .name("head-imu".to_owned())
-                .spawn(move || imu::imu_loop(bus.as_deref(), hz, &imu_status, &imu_frames, &shutdown))
+                .spawn(move || {
+                    imu::imu_loop(bus.as_deref(), hz, &imu_status, &imu_frames, &shutdown)
+                })
                 .expect("spawn the head-imu thread"),
         )
     };
@@ -683,7 +686,6 @@ async fn subscriber(
             }
         }
     }
-
 }
 
 /// Stream ToF frames as notifications until the socket closes or the consumer lags out. A lag is
@@ -697,7 +699,11 @@ async fn stream_tof(
             Ok(frame) => {
                 let notification = proto::Request::notify_tof_frame(&frame);
                 if let Err(e) = write_line(write, &notification).await {
-                    return if e.kind() == ErrorKind::BrokenPipe { Ok(()) } else { Err(e.into()) };
+                    return if e.kind() == ErrorKind::BrokenPipe {
+                        Ok(())
+                    } else {
+                        Err(e.into())
+                    };
                 }
             }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
@@ -718,7 +724,11 @@ async fn stream_imu(
             Ok(frame) => {
                 let notification = proto::Request::notify_head_imu_frame(&frame);
                 if let Err(e) = write_line(write, &notification).await {
-                    return if e.kind() == ErrorKind::BrokenPipe { Ok(()) } else { Err(e.into()) };
+                    return if e.kind() == ErrorKind::BrokenPipe {
+                        Ok(())
+                    } else {
+                        Err(e.into())
+                    };
                 }
             }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {

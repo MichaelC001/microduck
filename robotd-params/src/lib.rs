@@ -2687,14 +2687,22 @@ mod tests {
         let parsed: Params = toml::from_str("[media]\nbitrate = 2000\n").expect("parses");
         assert_eq!(parsed.media.intrinsics.as_ref(), Some(&alpha), "absent key");
         let parsed: Params = toml::from_str("").expect("parses");
-        assert_eq!(parsed.media.intrinsics.as_ref(), Some(&alpha), "absent table");
+        assert_eq!(
+            parsed.media.intrinsics.as_ref(),
+            Some(&alpha),
+            "absent table"
+        );
 
         let parsed: Params = toml::from_str(
             "[media.intrinsics]\nwidth = 640\nheight = 360\nfx = 500.0\nfy = 501.0\ncx = 320.0\ncy = 180.0\n",
         )
         .expect("parses");
         let own = parsed.media.intrinsics.expect("this robot's own");
-        assert_eq!((own.width, own.fx), (640, 500.0), "a written table overrides the family's");
+        assert_eq!(
+            (own.width, own.fx),
+            (640, 500.0),
+            "a written table overrides the family's"
+        );
         assert!(own.distortion.is_empty());
     }
 
