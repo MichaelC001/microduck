@@ -1167,7 +1167,8 @@ fn pin_sensor_mode(fps: u32) -> Result<()> {
             why = %String::from_utf8_lossy(&output.stderr).trim(),
             "media-ctl would not set the 1920x1080 sensor mode — capture stays in the boot \
              mode, which caps it at 21 fps, and `media.video` publishes no camera intrinsics \
-             because the field of view is then the full sensor's rather than this mode's crop"
+             because the exact framing is then the boot mode's (same ~62 deg field, different \
+             4:3->16:9 crop) rather than the pinned mode the calibration is for"
         );
         let _ = SENSOR_MODE.set(None);
     } else {

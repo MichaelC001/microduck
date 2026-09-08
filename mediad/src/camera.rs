@@ -5,37 +5,30 @@
 //! where the optical axis crosses the image. Without them a monocular reconstruction is
 //! scale-free and its angles are wrong; with them it maps a room.
 //!
-//! # Derived from two physical numbers, so they can be checked rather than trusted
+//! # Derived from the field of view, so it can be checked rather than trusted
 //!
-//! The sensor is an IMX219 with a 1.12 µm pixel pitch behind a 3.04 mm lens (Pi Camera v2), and
-//! those two give the focal length in pixels at the sensor's native scale:
+//! The IMX219's full array is 3280×2464 at a 1.12 µm pitch — 3.67 mm wide — behind the head
+//! camera's ~3.05 mm M12 lens, a **horizontal field of view of ~62°** across the full width. On
+//! this board's Rockchip driver the production **1920×1080@30** mode is a *scaled full-frame
+//! readout* (the whole 62° width, downscaled and cropped to 16:9), **not** the native-pixel 39°
+//! crop the datasheet's "1080p" implies — validated on hardware 2026-09-08: a calibration of
+//! confirmed-1920×1080 frames solves to 62°, and the family default in `robotd-params` carries it
+//! (`fx` ≈ 1062 at 1280×720). So the **field of view** — not a native focal length — is what the
+//! nominal geometry rests on, because the field of view is what stays fixed as the ISP scales the
+//! frame to whatever `[media] quality` asks for:
 //!
-//! ```text
-//! 3.04 mm / 1.12 µm = 2714 px
-//! ```
+//! - Focal length in pixels of a delivered frame `W` wide: `fx = (W/2) / tan(62°/2)`, so 1280 wide
+//!   gives `fx` ≈ 1065; a uniform scale moves `fy`, `cx`, `cy` with it.
+//! - The vertical is the 16:9 crop of that, and the principal point is *assumed* central — which is
+//!   the part a real calibration corrects (the measured `cy` sits ~110 px low).
 //!
-//! That number is a property of the optics and the sensor, not of any mode: it holds for every
-//! frame the sensor reads out at native pixel pitch. What changes per mode is **how much of the
-//! sensor is read** and **what the ISP scales it to**, and both move the intrinsics:
-//!
-//! - `pipeline::pin_sensor_mode` puts the sensor in **1920×1080**, which on this sensor is a
-//!   *crop* rather than a binning — so pixels stay native-pitch, `fx` stays 2714, and the centre
-//!   is at (960, 540).
-//! - The ISP then scales that to whatever `[media] quality` asks for. A uniform scale multiplies
-//!   `fx`, `fy`, `cx` and `cy` by the same factor: 1280/1920 gives `fx` ≈ 1810 and a centre at
-//!   (640, 360).
-//!
-//! # And when the mode is not the one we asked for, this publishes nothing
+//! # And when the pinned mode is not confirmed, this publishes nothing
 //!
 //! `pin_sensor_mode` shells out to `media-ctl` and can fail — a board without `v4l-utils`, an
-//! entity name that moved. Capture still works: the sensor stays in its 3280×2464 boot mode and
-//! the ISP scales from there. But that is the **full sensor** rather than a crop of it, so the
-//! field of view is wider and every intrinsic is wrong by about 1.7× — and 4:3 scaled into 16:9
-//! means the ISP is also cropping or squashing vertically, which changes `fy` independently.
-//!
-//! So intrinsics are published for a mode this code put the sensor in and not otherwise.
-//! **Numbers that are quietly wrong are worse than none**: a consumer told nothing knows it must
-//! calibrate, and a consumer told 2714 when the truth is 1590 builds a confident, wrong map.
+//! entity name that moved. Capture still works from the 3280×2464 boot mode (also ~62°, at 21 fps),
+//! but its exact 4:3→16:9 framing is not the pinned mode's, so this withholds nominal intrinsics
+//! rather than publish a geometry it cannot vouch for. **Numbers that are quietly wrong are worse
+//! than none**: a consumer told nothing knows it must calibrate.
 //!
 //! # Nominal is not calibrated, and the wire says which
 //!
@@ -47,65 +40,48 @@
 //! `[media.intrinsics]` default (the camera and lens are one part), and a robot with its own solve
 //! written there publishes that. The nominal path is the fallback for a camera nobody has solved.
 
-/// The pixel pitch of the IMX219, from its datasheet.
-const PIXEL_PITCH_UM: f64 = 1.12;
+/// The head camera's horizontal field of view, degrees — the full IMX219 array (3.67 mm wide)
+/// behind the ~3.05 mm M12 lens. The one physical number the nominal geometry rests on, and the one
+/// the family calibration confirms (it solves to 62.2°). See the module header.
+const FULL_FIELD_HFOV_DEG: f64 = 62.0;
 
-/// The focal length of the lens the module ships with (Pi Camera v2).
-const FOCAL_LENGTH_MM: f64 = 3.04;
-
-/// Focal length in pixels at the sensor's native pixel pitch — see the module header.
-fn native_focal_px() -> f64 {
-    FOCAL_LENGTH_MM * 1000.0 / PIXEL_PITCH_UM
+/// Horizontal focal length in pixels for a delivered frame `width` wide, from [`FULL_FIELD_HFOV_DEG`].
+/// The delivered field of view is the sensor's full width in every mode this driver offers, so this
+/// depends only on the output width, not on which sensor mode fed it.
+fn nominal_focal_px(width: u32) -> f64 {
+    f64::from(width) / 2.0 / (FULL_FIELD_HFOV_DEG / 2.0).to_radians().tan()
 }
 
-/// A sensor readout mode: how many pixels come off the sensor, and how they were read.
+/// The sensor readout mode `pipeline::pin_sensor_mode` puts the IMX219 in — carried so
+/// [`Intrinsics::nominal`] can tell "the mode we pinned" from "we could not confirm it", and refuse
+/// a delivered frame whose aspect ratio is not the mode's.
 ///
-/// # The mode decides the field of view, and the numbers are not intuitive
+/// # Both modes this driver offers are the full ~62° field
 ///
-/// The IMX219's array is 3280×2464 at a 1.12 µm pitch behind a 3.04 mm lens, which is
-/// `2·atan(3280·1.12µm / 2 / 3.04mm)` = **62°** horizontally when the whole array is read. Every
-/// other mode reads less of it, and reading less of an array behind a fixed lens is *zoom*:
+/// The IMX219's full array is 3280×2464 at a 1.12 µm pitch behind the ~3.05 mm M12 lens — `2·atan(
+/// 3280·1.12µm / 2 / 3.05mm)` ≈ **62°** horizontally. On this board's Rockchip driver `1920×1080`
+/// is a *scaled full-frame* readout, not a native crop, so it is the same 62° field (validated on
+/// hardware; see the module header):
 ///
 /// | mode | how | horizontal FOV | note |
 /// |---|---|---|---|
-/// | 3280×2464 | full, native pitch | **62°** | the boot mode, capped at 21 fps |
-/// | 1640×1232 | full, 2×2 binned | **62°** | same view, half the pixels, less noise |
-/// | 1920×1080 | crop, native pitch | **39°** | what this daemon pins, for 30 fps |
-/// | 1280×720 | crop, native pitch | **27°** | a *narrower* view, not a cheaper 720p |
+/// | 1920×1080 | full field, scaled/cropped to 16:9 | **62°** | what this daemon pins, at 30 fps |
+/// | 3280×2464 | full 4:3 array | **62°** | the boot mode, at 21 fps |
 ///
-/// So "read 720p off the sensor instead of scaling 1080p down" costs a third of the remaining
-/// field of view and gains nothing but bandwidth — and the 1080p→720p scale it replaces is
-/// averaging 2.25 pixels into one, which is free noise reduction the crop also gives up. For
-/// anything that looks at the picture rather than at a face in the middle of it — SLAM most of
-/// all — the mode to want is **1640×1232**: the whole 62°, binned, at 30 fps.
-///
-/// That is not a change this module makes; it is `pipeline::pin_sensor_mode`'s to make and a
-/// `[media] quality` to expose. It is written down here because this is the file where the
-/// consequences are arithmetic.
+/// So the field of view does not change with the mode — only the resolution and frame rate do, and
+/// the geometry a consumer needs is the same either way. `1920×1080` is pinned for the frame rate;
+/// there is no wide-vs-fast trade to make here, because the wide field is already the fast mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SensorMode {
     pub width: u32,
     pub height: u32,
-    /// How many sensor pixels were averaged per output pixel along one axis: 1 for a native
-    /// readout, 2 for a 2×2 binning. It multiplies the effective pixel pitch and therefore
-    /// divides the focal length in pixels.
-    pub binning: u32,
 }
 
 impl SensorMode {
-    /// The mode `pipeline::pin_sensor_mode` asks for, and the only one whose geometry this knows.
+    /// The mode `pipeline::pin_sensor_mode` asks for: the full field at 30 fps.
     pub const PINNED: Self = Self {
         width: 1920,
         height: 1080,
-        binning: 1,
-    };
-
-    /// The full field of view, binned — the mode a perception consumer wants. Not pinned by
-    /// anything yet; here so the arithmetic above is checkable rather than a claim.
-    pub const FULL_BINNED: Self = Self {
-        width: 1640,
-        height: 1232,
-        binning: 2,
     };
 }
 
@@ -159,24 +135,24 @@ impl Intrinsics {
             return None;
         }
 
-        // A uniform scale is the only one this can reason about. The ISP *can* scale the axes
-        // independently, and then the sensor's aspect ratio has been changed on the way out —
-        // which means part of the frame was cropped or squashed, and neither is derivable from
-        // the output size alone.
+        // The delivered frame has to be a uniform scale of the mode — the same 16:9 aspect. The ISP
+        // *can* scale the axes independently, and then part of the frame was cropped or squashed on
+        // the way out, which the output size alone cannot tell apart from a resize.
         let scale_x = f64::from(width) / f64::from(mode.width);
         let scale_y = f64::from(height) / f64::from(mode.height);
         if (scale_x - scale_y).abs() > 0.01 {
             return None;
         }
 
-        // Binning makes each output pixel cover `binning` sensor pixels, so the focal length in
-        // pixels shrinks by the same factor before the ISP's scale is applied.
-        let focal = native_focal_px() / f64::from(mode.binning.max(1)) * scale_x;
+        // The focal length is fixed by the field of view and the delivered width. The field of view
+        // is the sensor's full ~62° in every mode, so it does not depend on which mode fed the frame.
+        let focal = nominal_focal_px(width);
         Some(Self {
             fx: focal,
             fy: focal,
-            // The principal point is *assumed* central, which is what makes this nominal: on a
-            // real module it is a few pixels off, in a direction only a calibration knows.
+            // The principal point is *assumed* central, which is what makes this nominal: on a real
+            // module it is a few pixels off (the measured cy sits ~110 px low), only a calibration
+            // knows in which direction.
             cx: f64::from(width) / 2.0,
             cy: f64::from(height) / 2.0,
             calibrated: false,
@@ -239,9 +215,9 @@ impl Intrinsics {
     /// particular unit, which is why it is published as `Source::Family` rather than `Robot`.
     ///
     /// Gated on a known sensor mode for the same reason [`Intrinsics::nominal`] is: the solve was
-    /// taken in one mode, and in an unrecognised one (the sensor's boot mode, a wider field of
-    /// view) it would be as quietly wrong as the datasheet — so an unknown mode publishes nothing
-    /// rather than the family's numbers.
+    /// taken in the pinned mode, and an unconfirmed one (the boot mode — the same ~62° field, but a
+    /// different 4:3→16:9 framing and principal point) would place it slightly wrong — so an
+    /// unconfirmed mode publishes nothing rather than the family's numbers off by that framing.
     pub fn family(mode: Option<SensorMode>, width: u32, height: u32) -> Option<Self> {
         mode?;
         Self::scaled(
@@ -284,23 +260,26 @@ mod tests {
         }
     }
 
-    /// The two physical numbers, and the one they produce.
+    /// The one physical number, and the focal length it produces.
     #[test]
-    fn the_focal_length_in_pixels_comes_from_the_datasheet() {
-        // 3.04 mm over a 1.12 µm pitch. Written out so a wrong constant is a failing test rather
+    fn nominal_focal_length_comes_from_the_field_of_view() {
+        // 62° across a 1280-wide frame. Written out so a wrong constant is a failing test rather
         // than a plausible-looking number in an SDP nobody checks.
         assert!(
-            (native_focal_px() - 2714.29).abs() < 0.01,
+            (nominal_focal_px(1280) - 1065.14).abs() < 0.1,
             "{}",
-            native_focal_px()
+            nominal_focal_px(1280)
         );
+        // And it implies the 62° it was built from.
+        let hfov = 2.0 * (640.0 / nominal_focal_px(1280)).atan().to_degrees();
+        assert!((hfov - 62.0).abs() < 0.01, "{hfov}");
     }
 
-    /// 1280x720 out of the pinned 1920x1080 mode: a two-thirds scale, uniformly.
+    /// 1280x720 out of the pinned 1920x1080 mode: the 62° field at that width.
     #[test]
     fn the_pinned_mode_scales_to_what_is_streamed() {
         let at_720p = Intrinsics::nominal(Some(SensorMode::PINNED), 1280, 720).expect("known");
-        assert!((at_720p.fx - 1809.52).abs() < 0.01, "{}", at_720p.fx);
+        assert!((at_720p.fx - 1065.14).abs() < 0.1, "{}", at_720p.fx);
         assert_eq!(at_720p.fy, at_720p.fx, "square pixels, uniform scale");
         assert_eq!((at_720p.cx, at_720p.cy), (640.0, 360.0));
         assert!(
@@ -312,41 +291,30 @@ mod tests {
             "nominal models no distortion"
         );
 
-        // And at the mode's own resolution, the native figure survives untouched.
+        // The field of view is the same at the mode's own resolution — only the pixel count grows.
         let at_1080p = Intrinsics::nominal(Some(SensorMode::PINNED), 1920, 1080).expect("known");
-        assert!((at_1080p.fx - native_focal_px()).abs() < 0.01);
+        assert!((at_1080p.fx - nominal_focal_px(1920)).abs() < 0.01);
+        let hfov = 2.0 * (960.0 / at_1080p.fx).atan().to_degrees();
+        assert!((hfov - 62.0).abs() < 0.01, "{hfov}");
     }
 
-    /// Binning divides the focal length in pixels, and the full-FOV mode is the case that matters.
-    ///
-    /// 1640×1232 read 2×2-binned sees the same 62° as the full array, and its `fx` is half the
-    /// native figure — which is the arithmetic behind the mode table: a wider view is a shorter
-    /// focal length in pixels, for the same lens.
+    /// The delivered field of view is the sensor's full ~62° at every resolution — the production
+    /// 1920x1080 mode is a scaled full-frame readout, not a crop, so the FOV does not change.
     #[test]
-    fn a_binned_mode_has_a_shorter_focal_length_in_pixels() {
-        let binned = Intrinsics::nominal(Some(SensorMode::FULL_BINNED), 1640, 1232).expect("known");
-        assert!(
-            (binned.fx - native_focal_px() / 2.0).abs() < 0.01,
-            "{}",
-            binned.fx
-        );
-
-        // And the field of view it implies is the whole sensor's 62°, which is the check that the
-        // two numbers in the table agree with each other.
-        let hfov = 2.0 * (f64::from(1640_u32) / 2.0 / binned.fx).atan().to_degrees();
-        assert!((hfov - 62.2).abs() < 0.5, "{hfov}");
-
-        // Against which the pinned 1080p crop is a 39° view: same lens, less sensor.
-        let pinned = Intrinsics::nominal(Some(SensorMode::PINNED), 1920, 1080).expect("known");
-        let pinned_hfov = 2.0 * (f64::from(1920_u32) / 2.0 / pinned.fx).atan().to_degrees();
-        assert!((pinned_hfov - 38.9).abs() < 0.5, "{pinned_hfov}");
+    fn the_delivered_field_of_view_is_the_full_62_degrees() {
+        for w in [640_u32, 1280, 1920] {
+            let h = w * 9 / 16;
+            let k = Intrinsics::nominal(Some(SensorMode::PINNED), w, h).expect("known");
+            let hfov = 2.0 * (f64::from(w) / 2.0 / k.fx).atan().to_degrees();
+            assert!((hfov - 62.0).abs() < 0.5, "{w}w -> {hfov}");
+        }
     }
 
-    /// **A sensor in an unknown mode publishes nothing.**
+    /// **A sensor whose pinned mode we could not confirm publishes nothing.**
     ///
-    /// `pin_sensor_mode` can fail, and then the sensor is in its 3280x2464 boot mode: the full
-    /// frame rather than a crop of it, about 1.7× wider, and 4:3 scaled into 16:9 on top. Numbers
-    /// that are quietly wrong are worse than none — a consumer told nothing calibrates.
+    /// `pin_sensor_mode` can fail, leaving the sensor in its 3280x2464 boot mode — also ~62°, but a
+    /// different 4:3→16:9 framing than the pinned mode the calibration is for. Numbers that are
+    /// quietly wrong are worse than none — a consumer told nothing calibrates.
     #[test]
     fn an_unknown_sensor_mode_yields_no_intrinsics() {
         assert!(Intrinsics::nominal(None, 1280, 720).is_none());
@@ -438,7 +406,7 @@ mod tests {
                 .unwrap();
         assert_eq!(json["calibrated"], false);
         assert_eq!(json["source"], "nominal");
-        assert!((json["fx"].as_f64().unwrap() - 1809.52).abs() < 0.01);
+        assert!((json["fx"].as_f64().unwrap() - 1065.14).abs() < 0.1);
         assert_eq!(json["cx"], 640.0);
         assert!(
             json.get("distortion").is_none(),

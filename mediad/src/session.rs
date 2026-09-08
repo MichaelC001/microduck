@@ -458,7 +458,7 @@ mod tests {
 
         let intrinsics = &parsed["params"]["intrinsics"];
         assert!(
-            (intrinsics["fx"].as_f64().unwrap() - 1809.52).abs() < 0.01,
+            (intrinsics["fx"].as_f64().unwrap() - 1065.14).abs() < 0.1,
             "{intrinsics}"
         );
         assert_eq!(intrinsics["cx"], 640.0);
