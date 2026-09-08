@@ -781,6 +781,55 @@ protocol and drives a real session against it — welcome, list, `startSession`,
 DTLS, SCTP, the channel, a call matched to its reply. Two aiortc peers on `127.0.0.1` are not a
 duck; they are the same protocol, which is the part that fails quietly.
 
+### 5.3 Frames out of the robot, which is what §6 was blocking
+
+The goal §5.2's Space was a step towards is a Space **processing this camera on Hugging Face
+hardware**, and that is the one thing the control lane cannot carry: pixels are what a media path
+is for. Pulling them means WebRTC, WebRTC across two NATs means a relay candidate, and §6 says
+there is not one. `vision-demo` had "signalling worked and media did not" as its documented
+expected outcome for exactly this reason.
+
+**So the robot dials the Space and pushes.** `media.stream {url}` — answered by `mediad` itself,
+like `media.video`, because the pipeline is `mediad`'s and no service owns it — tells the robot a
+`wss://` to connect to; it opens it outward and sends frames. An outbound WebSocket is the one
+thing that always works, and the robot is already proving it every second it is reachable at all.
+No relay, no ICE, and **the rendezvous carries an instruction rather than payload**, which is the
+property that makes this scale where relaying pixels through a service the mini fleet depends on
+would not.
+
+    Space ──media.stream {url}──► rendezvous ──► robot
+    robot ═══════ H.264, outbound wss, direct ═══════► Space
+
+**H.264 rather than JPEG, and it was JPEG first.** The board has a hardware encoder, so the encode
+costs the VPU rather than a core, and prediction is worth an order of magnitude of bytes — 0.5 KB
+an access unit against JPEG's 6.5 KB a frame on synthetic content, less on real footage and the
+same direction. Two things had to be built to make it safe, and both are the kind that fail
+invisibly:
+
+- **A receiver that joins mid-stream can decode nothing until a keyframe**, and a Space restarts on
+  every push, so reconnecting is the common case rather than the exception. `h264parse
+  config-interval=-1` repeats SPS and PPS in front of every keyframe, and opening the valve sends
+  an upstream `force-key-unit` so the first thing a receiver gets is decodable.
+- **Dropping the oldest and keeping the newest is right for JPEG and wrong here.** A predicted
+  frame whose reference was dropped decodes to garbage that looks like a broken camera rather than
+  a broken transport. So a gap abandons the stream to the next keyframe, in two places: the
+  branch's queue and the sender's channel.
+
+JPEG stays reachable on `media.stream {"encoding": "jpeg"}`, because every frame being independent
+is worth having for a receiver that reconnects constantly.
+
+**The branch is valved, not conditional.** `webrtcsink` owns the video track's encoder and is
+handed raw video on purpose — pre-encoded input puts the encoder out of reach of its congestion
+control, which this pipeline tried and reverted — so there is nothing to tap and this is a *second*
+encoder off the same raw tee. On a board where the encoder is the budget that has to cost nothing
+when nobody is streaming, so the branch is built once behind a `valve drop=true` and opened by a
+property write. Adding and removing elements on a live pipeline was the alternative, and
+`pipeline.rs`'s history with a `videoflip` is why nobody should reach for that here.
+
+What this does **not** do is give a browser a picture of a robot, carry audio, or close a teleop
+loop. Those want WebRTC and §6 is still what they need; the frame stream is for the case where the
+consumer is a program.
+
 ## 6. NAT: STUN on both ends, and the robot offers the relay — **decided**
 
 `stun.l.google.com:19302`, which is `webrtcsink`'s own default and now also what the console asks
