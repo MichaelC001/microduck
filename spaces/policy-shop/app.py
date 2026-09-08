@@ -50,9 +50,10 @@ import numpy as np
 import catalogue
 import rendezvous
 from catalogue import Policy
-from control import DuckConsumer, Rpc, RpcError
+from control import Rpc, RpcError
 from lan import DEFAULT_SIGNALLING_PORT, LanConsumer
 from rendezvous import RendezvousError
+from wire import WireError, WsConsumer
 
 
 # ── the log ──────────────────────────────────────────────────────────────────
@@ -136,7 +137,7 @@ class Link:
     marshalled back onto it.
     """
 
-    consumer: DuckConsumer | LanConsumer | None = None
+    consumer: WsConsumer | LanConsumer | None = None
     loop: asyncio.AbstractEventLoop | None = None
     rpc: Rpc | None = None
     robot: str | None = None
@@ -187,18 +188,26 @@ class Link:
     # ── the session ──────────────────────────────────────────────────────────
 
     def through_rendezvous(self, token: str, peer_id: str, label: str) -> str:
-        """From anywhere, if a candidate pair works. §3 is the path; §6 is why it may not."""
+        """From anywhere, over the control lane — no candidate pair, so nothing §6 can defeat.
+
+        **This used to be a WebRTC consumer and is not any more.** It negotiated a session,
+        exchanged ICE, and then sat in `connecting` forever from anywhere that needed a relay,
+        which is anywhere interesting. The rendezvous relays an `rpc` key on a `peer` envelope
+        verbatim, and `mediad`'s control lane answers it out of the same routing table the
+        datachannel uses — so the calls are identical and the transport underneath them is two
+        HTTP verbs. The cost is that there is no video on it; the LAN transport is where pixels
+        live.
+        """
         return self._open(
             label,
             over_lan=False,
-            build=lambda rpc: DuckConsumer(
-                hf_token=token,
-                # **Pinned, not matched by name.** Their auto-pick falls back to the only visible
-                # producer whatever it is called, so a name that does not match can still hand
-                # this page somebody's mini. The listing already knows the id.
-                robot_peer_id=peer_id,
-                consumer_label=f"microduck-policy-shop/{os.environ.get('SPACE_ID', 'local')}",
-                rpc=rpc,
+            build=lambda rpc: WsConsumer(
+                token,
+                # **Pinned, not matched by name.** The listing already knows the id, and a name
+                # match would be the place a mini could be handed to a duck's client.
+                peer_id,
+                rpc,
+                label=f"microduck-policy-shop/{os.environ.get('SPACE_ID', 'local')}",
             ),
         )
 
@@ -240,9 +249,23 @@ class Link:
             thread.start()
 
             consumer = build(rpc)
-            starting = asyncio.run_coroutine_threadsafe(consumer.start(), loop)
+            # The LAN consumer is `aiortc` and wants the loop; the wire is `requests` and wants
+            # none. Rather than give one of them a fake shape, the two are started differently and
+            # everything after this line treats them the same.
+            starting = (
+                asyncio.run_coroutine_threadsafe(consumer.start(), loop)
+                if over_lan
+                else None
+            )
             try:
-                starting.result(timeout=30)
+                if starting is not None:
+                    starting.result(timeout=30)
+                else:
+                    consumer.start()
+            except (WireError, RendezvousError) as e:
+                self.error = str(e)
+                loop.call_soon_threadsafe(loop.stop)
+                return f"could not reach {label}: {self.error}"
             except Exception as e:  # noqa: BLE001 - reported, never raised into a UI callback
                 # `TimeoutError` arrives with an empty message, which would print as a colon and
                 # nothing — the type name is the whole of what it has to say.
@@ -250,9 +273,13 @@ class Link:
                 # Unwind before stopping the loop: a half-open connect leaves an aiohttp session
                 # behind, and stopping the loop under it is how "Unclosed client session" ends up
                 # on somebody's terminal instead of an explanation.
-                starting.cancel()
-                with contextlib.suppress(Exception):
-                    asyncio.run_coroutine_threadsafe(consumer.stop(), loop).result(timeout=5)
+                if starting is not None:
+                    starting.cancel()
+                    with contextlib.suppress(Exception):
+                        asyncio.run_coroutine_threadsafe(consumer.stop(), loop).result(timeout=5)
+                else:
+                    with contextlib.suppress(Exception):
+                        consumer.stop()
                 loop.call_soon_threadsafe(loop.stop)
                 return f"could not reach {label}: {self.error}"
 
@@ -267,6 +294,17 @@ class Link:
         while time.monotonic() < deadline:
             if rpc.is_open():
                 logger.info("control channel usable after %.1fs", time.monotonic() - (self.started_at or 0))
+                # **Asked, not waited for.** `mediad` pushes `media.video` the moment it hands
+                # over the channel, which races a consumer whose channel is not open yet — the
+                # console page carries the same note, and a dropped push is a sideways picture
+                # with nothing anywhere to say why. A question asked when we are ready cannot
+                # arrive too early. Best-effort: a transport with no video refuses it, which is
+                # the correct answer and not a failure to connect.
+                if over_lan:
+                    try:
+                        rpc.notifications["media.video"] = rpc.call("media.video", timeout=10)
+                    except RpcError as e:
+                        logger.info("no camera geometry: %s", e.message)
                 named = (self.consumer.meta or {}).get("name") if over_lan else None
                 self.robot = named or label
                 return f"connected to {self.robot}, control channel open"
@@ -286,7 +324,10 @@ class Link:
         if consumer is None or loop is None:
             return "not connected"
         try:
-            asyncio.run_coroutine_threadsafe(consumer.stop(), loop).result(timeout=10)
+            if isinstance(consumer, LanConsumer):
+                asyncio.run_coroutine_threadsafe(consumer.stop(), loop).result(timeout=10)
+            else:
+                consumer.stop()
         except Exception as e:  # noqa: BLE001 - a teardown that fails still ends the session
             return f"disconnected, with a complaint: {type(e).__name__}: {e}"
         finally:
@@ -321,6 +362,14 @@ class Link:
                 "one at a time, and the robot's own console counts."
             )
         if state != "connected":
+            if not self.over_lan:
+                # The control lane has no peer connection to be in a state about: it reports
+                # `connected` for as long as it holds a session. So this is a session that went
+                # away underneath us, which is the service ending it or the stream dropping.
+                why = self.error or "no reason given"
+                return (
+                    f"**the session ended** after {waited:.0f}s — {why}. Connect again."
+                )
             if self.over_lan:
                 return (
                     f"**signalling worked and the peer connection has not** — session "
@@ -369,6 +418,27 @@ class Link:
             # `np.rot90` counts anticlockwise and the mount is measured clockwise.
             picture = np.ascontiguousarray(np.rot90(picture, k=-(degrees // 90)))
         return picture
+
+    def shows_video(self) -> bool:
+        """Whether this transport has pixels at all."""
+        return self.consumer is not None and self.over_lan
+
+    def picture_note(self) -> str:
+        """Why the picture is missing, when it is missing for a reason rather than by failure.
+
+        **An empty box reads as broken.** The control lane carries JSON-RPC relayed as HTTP and
+        no media at all — which is the whole reason it works where WebRTC does not, since pixels
+        are exactly what a media path is for. So on that transport there is nothing to show, and
+        the panel has to say which of the two it is rather than leave a hole.
+        """
+        if self.consumer is None or self.over_lan:
+            return ""
+        return (
+            "**No video on this transport, by design.** The rendezvous relays calls, not RTP: "
+            "this tab works precisely because there is no media path to negotiate, and pixels "
+            "are what a media path is for. `robot.policies` says what the robot did; the "
+            "*on this network* tab shows it doing it."
+        )
 
     @staticmethod
     def log() -> str:
@@ -718,16 +788,14 @@ with gr.Blocks(title="microduck policy shop") as demo:
             "Through the rendezvous, which reaches a duck behind its owner's router. **Nothing "
             "is configured on the robot for this** — it connects outward to "
             "`reachy_mini_central` holding its own account token and registers as a producer, "
-            "this page signs in as you, and the service introduces the two. The video and the "
-            "control channel then run directly between here and the duck.\n\nWhat it needs is a "
-            "candidate pair that works, and while `turn.fastrtc.org` has no DNS (§6) neither "
-            "side offers a relay"
-            + (
-                ", which is the failure a data centre is most likely to hit. If signalling "
-                "crosses and nothing else does, the log's ICE lines say so."
-                if ON_A_SPACE
-                else " — the tab beside this one needs none."
-            )
+            "this page signs in as you, and the service introduces the two.\n\n"
+            "**And there is no WebRTC in this path at all.** The calls are relayed as HTTP: the "
+            "rendezvous forwards an `rpc` key on a `peer` envelope verbatim, and `mediad`'s "
+            "control lane answers it out of the same routing table the datachannel uses. No ICE, "
+            "no DTLS, no relay candidate — so nothing here can be defeated by a NAT, which the "
+            "WebRTC version was, every time, while `turn.fastrtc.org` has no DNS (§6).\n\n"
+            "The cost is pixels: video is RTP on the media path, so there is none on this tab. "
+            "`robot.policies` says what the robot did; the tab beside this one shows it."
         )
         with gr.Row():
             gr.LoginButton()
@@ -778,7 +846,10 @@ with gr.Blocks(title="microduck policy shop") as demo:
 
     # Small, and beside the buttons rather than above them: the point of a picture here is
     # seeing that the thing which was just installed did something, not watching a camera.
-    view = gr.Image(label="what the duck sees", height=260)
+    view = gr.Image(label="what the duck sees", height=260, visible=False)
+    # Why the box above is missing, when it is missing on purpose. Kept out of the image's own
+    # label because a label cannot say a paragraph and this is the paragraph somebody needs.
+    view_note = gr.Markdown("")
 
     with gr.Accordion("what this duck has now", open=True):
         robot_panel = gr.Markdown("Connect, then *read this robot*.")
@@ -839,7 +910,14 @@ with gr.Blocks(title="microduck policy shop") as demo:
     # Ten a second for the picture and once a second for the words: the stream is 30 fps and a
     # browser will not notice the difference, while a status line that repainted at 10 Hz would
     # be unreadable.
-    gr.Timer(0.1).tick(lambda: LINK.picture(), outputs=view, show_progress="hidden")
+    gr.Timer(0.1).tick(
+        lambda: (
+            gr.update(value=LINK.picture(), visible=LINK.shows_video()),
+            LINK.picture_note(),
+        ),
+        outputs=[view, view_note],
+        show_progress="hidden",
+    )
     gr.Timer(1.0).tick(
         lambda: (LINK.describe(), LINK.log()),
         outputs=[link_state, wire],

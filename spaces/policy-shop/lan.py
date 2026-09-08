@@ -536,6 +536,42 @@ async def _exercise(  # pragma: no cover - the body of the script above
     assert calls == ["robot.policies", "robot.nonsense"], calls
 
 
+async def _ask(host: str) -> None:  # pragma: no cover - a script, not a test suite
+    """Open a lane to a real duck on this network and ask it two read-only questions.
+
+    Nothing here asks the robot to move: `robot.policies` and `robot.skills` are what it is
+    running and what it could be asked to do. It does take the robot's one session slot for a few
+    seconds, so its console cannot connect while this runs.
+    """
+    rpc = Rpc(timeout=20)
+    consumer = LanConsumer(host, rpc)
+    await consumer.start()
+    for _ in range(160):
+        if rpc.is_open():
+            break
+        await asyncio.sleep(0.25)
+    if not rpc.is_open():
+        print(f"\nno control channel: {consumer.error or consumer.status()}")
+        await consumer.stop()
+        return
+    print(f"\nrobot:  {consumer.meta}")
+    print(f"session: {consumer.status()}")
+    try:
+        for method in ("robot.policies", "robot.skills", "media.video"):
+            print(f"\n{method}:\n  {await asyncio.to_thread(rpc.call, method)}")
+    finally:
+        await consumer.stop()
+    print("\ndisconnected")
+
+
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.WARNING)
-    asyncio.run(_selfcheck())
+    import sys
+
+    logging.basicConfig(level=logging.INFO, format="%(name)-6s %(message)s")
+    if len(sys.argv) > 1:
+        # A real duck on this network: `uv run lan.py olducky.local`, or its IP.
+        asyncio.run(_ask(sys.argv[1]))
+    else:
+        # No argument: the loopback producer, which needs no robot at all.
+        logging.getLogger().setLevel(logging.WARNING)
+        asyncio.run(_selfcheck())
