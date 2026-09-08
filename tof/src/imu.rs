@@ -10,34 +10,53 @@
 //! behind that. Same shape as the ToF loop otherwise — open, read at `hz`, broadcast frames,
 //! retry with backoff on error — so a BMI088 fitted later needs no reconnect.
 //!
+//! **Linux only, and quietly so**, like the vendored ULDs `build.rs` skips off a board: the bus is
+//! `/dev/i2c-*` and the driver is `linux-embedded-hal`, so on a developer's Mac there is no sensor
+//! to open and `imu_loop` says as much instead of being compiled. `tofd` still builds and still
+//! serves depth from `--fake` or `--sim` there, which is what a laptop runs it for.
+//!
 //! Orientation is a Madgwick fusion (the `bmi088` crate's `Bmi088Ahrs`); `gyro`/`accel` are the
 //! raw sensor axes. Placing the sample in the head frame (the IMU is rigid to the camera) is a
 //! `kinematics` job for the consumer, not this daemon's.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
+
+use duck_ipc_proto as proto;
+
+#[cfg(target_os = "linux")]
+use std::path::PathBuf;
+#[cfg(target_os = "linux")]
+use std::sync::atomic::Ordering;
+#[cfg(target_os = "linux")]
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "linux")]
 use bmi088::{Bmi088, Bmi088Ahrs, Config};
-use duck_ipc_proto as proto;
+#[cfg(target_os = "linux")]
 use linux_embedded_hal::I2cdev;
 
+#[cfg(target_os = "linux")]
 use crate::BUS_CANDIDATES;
 
 /// Madgwick convergence rate. 0.1 is the crate's recommended starting point: fast enough to track
 /// a walking head, slow enough not to chase gyro noise.
+#[cfg(target_os = "linux")]
 const BETA: f64 = 0.1;
 
 /// Reopen backoff after an I²C error, same reasoning as the ToF loop: a bus glitch and a missing
 /// chip look alike from here, and one backoff serves both without hammering a shared bus.
+#[cfg(target_os = "linux")]
 const RETRY_MIN: Duration = Duration::from_millis(500);
+#[cfg(target_os = "linux")]
 const RETRY_MAX: Duration = Duration::from_secs(30);
 
 /// How far an IMU subscriber may fall behind before it loses samples. At 100 Hz this is ~2.5 s.
 pub const FRAME_BUFFER: usize = 256;
 
 /// Read `temp_c` this often (every Nth sample); it barely moves and costs a bus read.
+#[cfg(target_os = "linux")]
 const TEMP_EVERY: u64 = 100;
 
 /// What the `imu.stream` answer reports — whether a BMI088 was found and at what rate.
@@ -64,6 +83,7 @@ impl ImuStatus {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn found(&self, sensor: &str) {
         let mut inner = self.inner.lock().unwrap();
         inner.sensor = Some(sensor.to_owned());
@@ -88,6 +108,7 @@ impl ImuStatus {
 }
 
 /// Read the BMI088 forever, broadcasting [`proto::HeadImuFrame`]. Returns only at shutdown.
+#[cfg(target_os = "linux")]
 pub fn imu_loop(
     bus: Option<&Path>,
     hz: u8,
@@ -160,9 +181,24 @@ pub fn imu_loop(
     }
 }
 
+/// Off Linux there is no `/dev/i2c-*` to open, so this returns at once and the status says why —
+/// the same answer `head_imu.stream` gives on a board whose HAT has no BMI088 fitted, which is the
+/// shape every consumer already handles.
+#[cfg(not(target_os = "linux"))]
+pub fn imu_loop(
+    _bus: Option<&Path>,
+    _hz: u8,
+    status: &ImuStatus,
+    _frames: &tokio::sync::broadcast::Sender<proto::HeadImuFrame>,
+    _shutdown: &Arc<AtomicBool>,
+) {
+    status.lost("the head IMU is on an I2C bus, which exists only on Linux".to_owned());
+}
+
 /// Open the BMI088 on the first bus that answers. The `bmi088` crate hardwires accel `0x19` /
 /// gyro `0x68` (the HAT's addresses), so there is nothing to sweep — a failure to read the
 /// chip-id in `Bmi088::new` is the "not fitted / bus glitch" signal.
+#[cfg(target_os = "linux")]
 fn open_imu(bus: Option<&Path>) -> anyhow::Result<Bmi088Ahrs<I2cdev>> {
     let buses: Vec<PathBuf> = match bus {
         Some(bus) => vec![bus.to_path_buf()],
@@ -192,6 +228,7 @@ fn open_imu(bus: Option<&Path>) -> anyhow::Result<Bmi088Ahrs<I2cdev>> {
     Err(last.unwrap_or_else(|| anyhow::anyhow!("no bus to look on")))
 }
 
+#[cfg(target_os = "linux")]
 fn sleep_unless_shutdown(dur: Duration, shutdown: &Arc<AtomicBool>) {
     // Slice the sleep so shutdown is prompt even during a long backoff.
     let slice = Duration::from_millis(50);
