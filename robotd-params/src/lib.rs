@@ -369,27 +369,22 @@ pub struct CameraIntrinsics {
 }
 
 impl CameraIntrinsics {
-    /// The alpha family's camera calibration: the head camera module and M12 lens every alpha unit
-    /// carries, solved on unit *graphite* on 2026-09-07 — ChArUco board, 80 views, 0.84 px RMS,
-    /// on the 1280×720 frame as `mediad` sends it (unrotated). Re-solve with `duckslam calib
-    /// intrinsics` in the `microduck_vslam` repo; `duckslam calib export-toml` prints a solve in
-    /// this table's shape.
-    pub fn alpha() -> Self {
-        Self {
-            width: 1280,
-            height: 720,
-            fx: 1055.0757340956482,
-            fy: 1052.5750599438943,
-            cx: 580.5571737758394,
-            cy: 471.909759909458,
-            distortion: vec![
-                -0.33431259713233824,
-                0.08049158630172265,
-                -0.0013134275558036792,
-                -0.0009183827993299791,
-                0.06483154138827026,
-            ],
-        }
+    /// The alpha family's shared camera calibration — or `None` until one exists.
+    ///
+    /// The head camera module and its M12 lens are one part on every alpha unit, so a single solve
+    /// is every unit's calibration: `mediad` publishes it (scaled to the streamed size, tagged
+    /// `source: "family"`) on any robot without its own `[media.intrinsics]`, and one calibration
+    /// covers the fleet — no per-robot session.
+    ///
+    /// `None` today, on purpose. The first solve (unit *graphite*, 2026-09-07) was recorded in the
+    /// **full-sensor** mode (62° FOV) by mistake, while every robot streams the **1920×1080 crop**
+    /// (39°) — validated on hardware 2026-09-08, the only two modes the IMX219 driver offers. A
+    /// 62° calibration on a 39° stream is wrong by ~1.7×, so it must not ship. Re-solve one robot in
+    /// the crop mode (`duckslam calib intrinsics`, which now refuses a wrong-mode session) and put
+    /// its numbers here — `duckslam calib export-toml` prints them in this shape — to light the
+    /// family default up for every unit at once.
+    pub fn alpha() -> Option<Self> {
+        None
     }
 }
 
@@ -2683,8 +2678,9 @@ mod tests {
         let parsed: Params = toml::from_str("").expect("parses");
         assert_eq!(parsed.media.intrinsics, None, "absent table");
 
-        // The family solve is a real calibration, just not stored here.
-        assert_eq!(CameraIntrinsics::alpha().width, 1280);
+        // No family solve ships yet (the first was the wrong sensor mode); mediad falls back to
+        // nominal until one is filled in.
+        assert!(CameraIntrinsics::alpha().is_none());
 
         let parsed: Params = toml::from_str(
             "[media.intrinsics]\nwidth = 640\nheight = 360\nfx = 500.0\nfy = 501.0\ncx = 320.0\ncy = 180.0\n",

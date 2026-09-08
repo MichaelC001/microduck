@@ -244,12 +244,10 @@ impl Intrinsics {
     /// rather than the family's numbers.
     pub fn family(mode: Option<SensorMode>, width: u32, height: u32) -> Option<Self> {
         mode?;
-        Self::scaled(
-            &robotd_params::CameraIntrinsics::alpha(),
-            width,
-            height,
-            Source::Family,
-        )
+        // `None` until a robot has been solved in the streamed sensor mode (see
+        // `CameraIntrinsics::alpha`); mediad then falls through to the datasheet nominal.
+        let solve = robotd_params::CameraIntrinsics::alpha()?;
+        Self::scaled(&solve, width, height, Source::Family)
     }
 
     /// What to publish, in order of preference: this robot's own `[media.intrinsics]` calibration;
@@ -393,40 +391,39 @@ mod tests {
         );
     }
 
-    /// A per-robot calibration that cannot be scaled falls back to the family's, not to nothing —
-    /// a real solve of the same optics, published as `family` so a consumer can see this robot's
-    /// own record was unusable and someone should fix it.
+    /// A per-robot calibration that cannot be scaled falls back — to the family solve when one is
+    /// shipped, and to the datasheet nominal otherwise. None ships today, so this lands on nominal:
+    /// a real record that is unusable is never silently kept.
     #[test]
-    fn an_unusable_robot_calibration_falls_back_to_the_family() {
+    fn an_unusable_robot_calibration_falls_back() {
         let published = Intrinsics::published(
             Some(&measured(640, 480)),
             Some(SensorMode::PINNED),
             1280,
             720,
         )
-        .expect("the family calibration");
-        assert_eq!(published.source, Source::Family);
-        assert!(
-            published.calibrated,
-            "the family solve is a real measurement"
-        );
-        // The alpha solve is 1280x720, delivered 1280x720, so it is carried across unscaled.
-        assert!((published.fx - 1055.08).abs() < 0.01, "{}", published.fx);
+        .expect("the nominal fallback");
+        // No family solve yet (`CameraIntrinsics::alpha()` is `None`), so it is the datasheet.
+        assert_eq!(published.source, Source::Nominal);
+        assert!(!published.calibrated, "the fallback is not a measurement");
     }
 
-    /// With no per-robot table, a robot in a known mode publishes the family's calibration, tagged
-    /// so a consumer can tell it is not this unit's own solve.
+    /// With no per-robot table and no family solve shipped, a robot in a known mode publishes the
+    /// datasheet nominal — the correct field of view, marked as not measured. When
+    /// `CameraIntrinsics::alpha()` is filled in, this same path yields `Source::Family` instead.
     #[test]
-    fn the_family_fills_in_when_the_robot_has_no_table() {
-        let published = Intrinsics::published(None, Some(SensorMode::PINNED), 640, 360)
-            .expect("the family calibration");
-        assert_eq!(published.source, Source::Family);
-        assert!(published.calibrated);
-        // Half of the 1280x720 solve.
-        assert!((published.fx - 527.5).abs() < 0.5, "{}", published.fx);
+    fn a_bare_robot_publishes_nominal_until_a_family_solve_exists() {
+        assert!(
+            robotd_params::CameraIntrinsics::alpha().is_none(),
+            "this test describes the no-family-solve state"
+        );
+        let published = Intrinsics::published(None, Some(SensorMode::PINNED), 1280, 720)
+            .expect("the nominal fallback");
+        assert_eq!(published.source, Source::Nominal);
+        assert!(!published.calibrated);
         let json = serde_json::to_value(&published).unwrap();
-        assert_eq!(json["source"], "family");
-        assert_eq!(json["calibrated"], true);
+        assert_eq!(json["source"], "nominal");
+        assert_eq!(json["calibrated"], false);
     }
 
     /// The shape a consumer reads. `calibrated` is not optional in the JSON: a consumer that has
