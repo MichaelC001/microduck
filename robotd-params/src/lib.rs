@@ -369,22 +369,33 @@ pub struct CameraIntrinsics {
 }
 
 impl CameraIntrinsics {
-    /// The alpha family's shared camera calibration — or `None` until one exists.
+    /// The alpha family's camera calibration: the head camera module and M12 lens every alpha unit
+    /// carries — one part across the family, so one solve is every unit's calibration.
     ///
-    /// The head camera module and its M12 lens are one part on every alpha unit, so a single solve
-    /// is every unit's calibration: `mediad` publishes it (scaled to the streamed size, tagged
-    /// `source: "family"`) on any robot without its own `[media.intrinsics]`, and one calibration
-    /// covers the fleet — no per-robot session.
-    ///
-    /// `None` today, on purpose. The first solve (unit *graphite*, 2026-09-07) was recorded in the
-    /// **full-sensor** mode (62° FOV) by mistake, while every robot streams the **1920×1080 crop**
-    /// (39°) — validated on hardware 2026-09-08, the only two modes the IMX219 driver offers. A
-    /// 62° calibration on a 39° stream is wrong by ~1.7×, so it must not ship. Re-solve one robot in
-    /// the crop mode (`duckslam calib intrinsics`, which now refuses a wrong-mode session) and put
-    /// its numbers here — `duckslam calib export-toml` prints them in this shape — to light the
-    /// family default up for every unit at once.
-    pub fn alpha() -> Option<Self> {
-        None
+    /// Solved on unit *graphite*, 2026-09-08 — ChArUco board on a screen (caliper-measured), 80
+    /// views, 0.79 px RMS, on the 1280×720 frame as `mediad` sends it (unrotated). This is the
+    /// **~62° full field of view** of the production `1920×1080@30` sensor mode: on this board's
+    /// IMX219 driver that mode is a scaled full-frame readout, not the native 1920×1080 crop the
+    /// datasheet describes — validated on hardware, the solved HFOV is 62°, not 39°. (`SensorMode`
+    /// and [`super`]'s nominal model still assume the crop; they are only the fallback this
+    /// overrides, but they are wrong for this hardware and should be corrected when touched.)
+    /// Re-solve with `duckslam calib intrinsics`; `duckslam calib export-toml` prints this shape.
+    pub fn alpha() -> Self {
+        Self {
+            width: 1280,
+            height: 720,
+            fx: 1061.8060025020175,
+            fy: 1062.193713957031,
+            cx: 596.7776848217006,
+            cy: 474.52348043048636,
+            distortion: vec![
+                -0.34695388691888,
+                0.14615866153945595,
+                -0.0007449157712424215,
+                -0.0022167170528743837,
+                -0.016437266141048814,
+            ],
+        }
     }
 }
 
@@ -2678,9 +2689,8 @@ mod tests {
         let parsed: Params = toml::from_str("").expect("parses");
         assert_eq!(parsed.media.intrinsics, None, "absent table");
 
-        // No family solve ships yet (the first was the wrong sensor mode); mediad falls back to
-        // nominal until one is filled in.
-        assert!(CameraIntrinsics::alpha().is_none());
+        // The family solve is a real calibration, just not stored here.
+        assert_eq!(CameraIntrinsics::alpha().width, 1280);
 
         let parsed: Params = toml::from_str(
             "[media.intrinsics]\nwidth = 640\nheight = 360\nfx = 500.0\nfy = 501.0\ncx = 320.0\ncy = 180.0\n",
