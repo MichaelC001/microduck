@@ -574,6 +574,89 @@ pub fn hello(config: &Config, producer: &crate::producer::Producer, rotate: u32)
     .to_string()
 }
 
+/// The linux half for H.264: take the next access unit the branch's encoder produced.
+///
+/// Nothing is converted or copied here beyond the unit itself — the VPU did the work, upstream of
+/// an appsink — which is the whole reason to prefer this over JPEG on a board. The rate was
+/// imposed by a `videorate` in the branch, so this blocks until there is something and never
+/// paces anything itself ([`Config::interval`] returns zero for it).
+///
+/// Opening the valve is [`Encoders::gate`]'s job rather than this closure's, so that a stream
+/// which stops shuts it again: a second encoder running for nobody is what the valve exists to
+/// prevent.
+#[cfg(target_os = "linux")]
+pub fn h264_encoder(branch: crate::pipeline::StreamBranch) -> Encode {
+    Arc::new(move |_config: &Config| {
+        let (bytes, keyframe) = branch.encoded.next_unit()?;
+        Some(Unit { bytes, keyframe })
+    })
+}
+
+/// The linux half: read a frame off the tee, turn it upright, and JPEG it.
+///
+/// **The only part of this module that knows a pipeline exists.** Everything above takes bytes
+/// from a channel, which is what lets the reconnect and the framing be tested on a laptop; this is
+/// four lines of pixels and a call into `duck-detect`, where the UYVY arithmetic already lives
+/// because the detector needed exactly the same conversion.
+///
+/// `next_frame` blocks on a condvar until the *next* capture, so this runs on its own thread —
+/// [`Streamer::start`] gives it one, the same way the detector and the exposure loop have theirs.
+/// A frame is asked for rather than published, which is the whole design of `Frames`: at 5 fps
+/// this copies five of thirty rather than all thirty.
+#[cfg(target_os = "linux")]
+pub fn jpeg_encoder(frames: crate::pipeline::Frames, turn: duck_detect::Turn) -> Encode {
+    // Reused across frames: at 640×480 the RGB buffer is 920 KB, and allocating that five times a
+    // second forever is a page fault storm for no reason. A `Mutex` because `Encode` is `Fn` — one
+    // thread ever takes it, so it is uncontended by construction.
+    let scratch = std::sync::Mutex::new((Vec::<u8>::new(), Vec::<u8>::new()));
+
+    Arc::new(move |config: &Config| {
+        let frame = frames.next_frame()?;
+        if frame.format != crate::pipeline::CAPTURE_FORMAT {
+            // The caps changed under us. Refusing beats encoding one format as another, which
+            // produces a picture that is wrong in a way a receiver cannot detect.
+            tracing::warn!(
+                format = frame.format,
+                expected = crate::pipeline::CAPTURE_FORMAT,
+                "not streaming a frame in a format this encoder does not know"
+            );
+            return None;
+        }
+
+        let mut held = scratch.lock().expect("not poisoned");
+        let (rgb, jpeg) = &mut *held;
+        let (width, height) = duck_detect::rgb_from_uyvy(
+            &frame.data,
+            frame.width as usize,
+            frame.height as usize,
+            config.longest as usize,
+            turn,
+            rgb,
+        );
+
+        jpeg.clear();
+        let encoder =
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut *jpeg, config.quality);
+        match encoder.write_image(
+            rgb,
+            width as u32,
+            height as u32,
+            image::ExtendedColorType::Rgb8,
+        ) {
+            // Every JPEG is a keyframe by construction, which is the property that makes this
+            // encoding worth keeping: a receiver that reconnects can decode the very next
+            // message, where H.264 has to wait for one.
+            Ok(()) => Some(Unit {
+                bytes: jpeg.clone(),
+                keyframe: true,
+            }),
+            Err(e) => {
+                tracing::warn!(error = %e, "a frame would not encode");
+                None
+            }
+        }
+    })
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -889,88 +972,4 @@ mod tests {
         );
         running.store(false, Ordering::Relaxed);
     }
-}
-
-/// The linux half for H.264: take the next access unit the branch's encoder produced.
-///
-/// Nothing is converted or copied here beyond the unit itself — the VPU did the work, upstream of
-/// an appsink — which is the whole reason to prefer this over JPEG on a board. The rate was
-/// imposed by a `videorate` in the branch, so this blocks until there is something and never
-/// paces anything itself ([`Config::interval`] returns zero for it).
-///
-/// Opening the valve is [`Encoders::gate`]'s job rather than this closure's, so that a stream
-/// which stops shuts it again: a second encoder running for nobody is what the valve exists to
-/// prevent.
-#[cfg(target_os = "linux")]
-pub fn h264_encoder(branch: crate::pipeline::StreamBranch) -> Encode {
-    Arc::new(move |_config: &Config| {
-        let (bytes, keyframe) = branch.encoded.next_unit()?;
-        Some(Unit { bytes, keyframe })
-    })
-}
-
-/// The linux half: read a frame off the tee, turn it upright, and JPEG it.
-///
-/// **The only part of this module that knows a pipeline exists.** Everything above takes bytes
-/// from a channel, which is what lets the reconnect and the framing be tested on a laptop; this is
-/// four lines of pixels and a call into `duck-detect`, where the UYVY arithmetic already lives
-/// because the detector needed exactly the same conversion.
-///
-/// `next_frame` blocks on a condvar until the *next* capture, so this runs on its own thread —
-/// [`Streamer::start`] gives it one, the same way the detector and the exposure loop have theirs.
-/// A frame is asked for rather than published, which is the whole design of `Frames`: at 5 fps
-/// this copies five of thirty rather than all thirty.
-#[cfg(target_os = "linux")]
-pub fn jpeg_encoder(frames: crate::pipeline::Frames, turn: duck_detect::Turn) -> Encode {
-    // Reused across frames: at 640×480 the RGB buffer is 920 KB, and allocating that five times a
-    // second forever is a page fault storm for no reason. A `Mutex` because `Encode` is `Fn` — one
-    // thread ever takes it, so it is uncontended by construction.
-    let scratch = std::sync::Mutex::new((Vec::<u8>::new(), Vec::<u8>::new()));
-
-    Arc::new(move |config: &Config| {
-        let frame = frames.next_frame()?;
-        if frame.format != crate::pipeline::CAPTURE_FORMAT {
-            // The caps changed under us. Refusing beats encoding one format as another, which
-            // produces a picture that is wrong in a way a receiver cannot detect.
-            tracing::warn!(
-                format = frame.format,
-                expected = crate::pipeline::CAPTURE_FORMAT,
-                "not streaming a frame in a format this encoder does not know"
-            );
-            return None;
-        }
-
-        let mut held = scratch.lock().expect("not poisoned");
-        let (rgb, jpeg) = &mut *held;
-        let (width, height) = duck_detect::rgb_from_uyvy(
-            &frame.data,
-            frame.width as usize,
-            frame.height as usize,
-            config.longest as usize,
-            turn,
-            rgb,
-        );
-
-        jpeg.clear();
-        let encoder =
-            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut *jpeg, config.quality);
-        match encoder.write_image(
-            rgb,
-            width as u32,
-            height as u32,
-            image::ExtendedColorType::Rgb8,
-        ) {
-            // Every JPEG is a keyframe by construction, which is the property that makes this
-            // encoding worth keeping: a receiver that reconnects can decode the very next
-            // message, where H.264 has to wait for one.
-            Ok(()) => Some(Unit {
-                bytes: jpeg.clone(),
-                keyframe: true,
-            }),
-            Err(e) => {
-                tracing::warn!(error = %e, "a frame would not encode");
-                None
-            }
-        }
-    })
 }
