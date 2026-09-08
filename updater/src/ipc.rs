@@ -759,6 +759,7 @@ impl Server {
             | Call::RobotMode
             | Call::RobotSetMode(_)
             | Call::RobotPolicies
+            | Call::RobotModel
             | Call::RobotLoadPolicy(_)
             | Call::RobotReloadPolicies
             | Call::RobotSubscribe(_) => Response::err(
@@ -816,11 +817,11 @@ impl Server {
             ),
 
             // Same story one namespace over: `tofd` owns the sensor and answers for it.
-            Call::TofStream => Response::err(
+            Call::TofStream | Call::HeadImuStream => Response::err(
                 Some(id),
                 proto::Error::new(
                     proto::code::METHOD_NOT_FOUND,
-                    "tof.stream is served by tofd itself, on /run/tofd/tof.sock",
+                    "tof.stream and head_imu.stream are served by tofd itself, on /run/tofd/tof.sock",
                 ),
             ),
 

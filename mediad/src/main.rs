@@ -104,12 +104,15 @@ struct Args {
 
     /// How far the camera is mounted from upright, clockwise: 0, 90, 180 or 270.
     ///
-    /// **90, because the head camera is mounted a quarter turn off**, and this is the one place that
-    /// fact is written down. It no longer means "rotate the pixels": it is told to whoever displays
-    /// the video, and they rotate for free — the console with a CSS transform on the GPU. Rotating
-    /// here cost 145% of a core and 22 fps; `pipeline::Rotation` has the numbers.
-    #[arg(long, default_value_t = 90)]
-    rotate: u32,
+    /// **90 by default, because the head camera is mounted a quarter turn off**, and this is the one
+    /// place that fact is written down. It no longer means "rotate the pixels": it is told to
+    /// whoever displays the video, and they rotate for free — the console with a CSS transform on
+    /// the GPU. Rotating here cost 145% of a core and 22 fps; `pipeline::Rotation` has the numbers.
+    ///
+    /// True of a simulated camera too: the one in MuJoCo is rolled to match the mount, so a frame
+    /// from a duck in the twin needs the same quarter turn as a frame from a duck on the desk.
+    #[arg(long)]
+    rotate: Option<u32>,
 
     /// Leave the exposure where `--exposure` and `--analogue-gain` put it, instead of metering.
     ///
@@ -122,6 +125,17 @@ struct Args {
     #[arg(long)]
     no_auto_exposure: bool,
 
+    /// Take frames from a duck in MuJoCo at `host:port` instead of a camera.
+    ///
+    /// The geometry has to match the simulator's camera — set `[media] quality` (the rung `mediad`
+    /// streams; `mediad` has no `--width`/`--height` of its own) to the resolution and rate the body
+    /// renders at — because the frames arrive raw and length-prefixed with no handshake, and a
+    /// mismatch is a picture nobody can read rather than an error the pipeline can recover from.
+    /// `mediad` says so and refuses the frame if the sizes disagree.
+    /// Takes precedence over `[media] camera`, which is a fact about a robot and not about this.
+    #[arg(long)]
+    sim_camera: Option<String>,
+
     /// Rotate in the pipeline as well, so the *encoded stream* comes out upright.
     ///
     /// **Off by default because it is expensive in a way that does not look like rotation.** It
@@ -130,6 +144,48 @@ struct Args {
     /// Worth it only for a consumer that cannot rotate for itself.
     #[arg(long)]
     flip_in_pipeline: bool,
+
+    /// Where the daemons listen, when not at `proto::socket`'s paths.
+    ///
+    /// On a robot the defaults are right and none of these is ever typed. They exist for the twin
+    /// (`scripts/duck-sim`), where every duck's `robotd` and `tofd` listen under a per-duck state
+    /// directory — without them a peer's `control` channel reaches a `mediad` whose routes all end
+    /// at `/run/*.sock`, and every call but `media.video` answers "not answering".
+    #[arg(long)]
+    robot_socket: Option<std::path::PathBuf>,
+    #[arg(long)]
+    tof_socket: Option<std::path::PathBuf>,
+    #[arg(long)]
+    config_socket: Option<std::path::PathBuf>,
+    #[arg(long)]
+    pad_socket: Option<std::path::PathBuf>,
+    #[arg(long)]
+    updater_socket: Option<std::path::PathBuf>,
+}
+
+// Gated with the `main` that calls it: off Linux there is no pipeline, so there is nothing to
+// point at a socket and `-D warnings` would call this dead.
+#[cfg(target_os = "linux")]
+impl Args {
+    fn sockets(&self) -> mediad::upstream::Sockets {
+        let mut s = mediad::upstream::Sockets::default();
+        if let Some(p) = &self.robot_socket {
+            s.robot = p.clone();
+        }
+        if let Some(p) = &self.tof_socket {
+            s.tof = p.clone();
+        }
+        if let Some(p) = &self.config_socket {
+            s.config = p.clone();
+        }
+        if let Some(p) = &self.pad_socket {
+            s.pad = p.clone();
+        }
+        if let Some(p) = &self.updater_socket {
+            s.updater = p.clone();
+        }
+        s
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -159,7 +215,12 @@ fn main() -> ExitCode {
     // should say so rather than opening a camera first.
     // Validated even when the pipeline will not use it, because it is still what every consumer is
     // told about the mount — a typo should not reach the console as a rotation nobody can apply.
-    let mount = match mediad::pipeline::Rotation::from_degrees(args.rotate) {
+    // 90 whatever the source. The head camera is mounted a quarter turn off and every consumer is
+    // told so — and the *simulated* camera is rolled the same way on purpose, so that a frame from a
+    // duck in MuJoCo needs the same turn as a frame from a duck on the desk. Overridable, because a
+    // scene could mount it differently, but there is one default and it is the robot's.
+    let rotate = args.rotate.unwrap_or(90);
+    let mount = match mediad::pipeline::Rotation::from_degrees(rotate) {
         Ok(rotation) => rotation,
         Err(e) => {
             tracing::error!(error = %e, "mediad cannot start");
@@ -189,17 +250,17 @@ fn main() -> ExitCode {
     );
     // The same angle the detector needs, in its own vocabulary: it folds the turn into the
     // resampling it already does, which is why nothing in the pipeline has to.
-    let turn = match duck_detect::Turn::from_degrees(args.rotate) {
+    let turn = match duck_detect::Turn::from_degrees(rotate) {
         Some(turn) => turn,
         None => {
-            tracing::error!(degrees = args.rotate, "mediad cannot start");
+            tracing::error!(degrees = rotate, "mediad cannot start");
             return ExitCode::FAILURE;
         }
     };
 
     let rotation = if args.flip_in_pipeline {
         tracing::warn!(
-            degrees = args.rotate,
+            degrees = rotate,
             "--flip-in-pipeline: rotating in the pipeline costs the encoder its zero-copy path"
         );
         mount
@@ -230,9 +291,9 @@ fn main() -> ExitCode {
         // producer that registered without a name would keep it until this daemon restarts. Costs a
         // unix-socket round trip on a boot where `configd` may not be up yet, which is why it is
         // bounded and why a failure is a warning rather than an exit.
+        let sockets = args.sockets();
         let producer =
-            mediad::producer::Producer::learn(Default::default(), duck_ipc_proto::build_info!())
-                .await;
+            mediad::producer::Producer::learn(sockets.clone(), duck_ipc_proto::build_info!()).await;
         tracing::info!(
             name = producer.name.as_deref().unwrap_or("unknown"),
             release = %producer.release,
@@ -286,7 +347,9 @@ fn main() -> ExitCode {
             }
         }
 
-        let source = if media.camera {
+        let source = if let Some(addr) = args.sim_camera.clone() {
+            mediad::pipeline::Source::Sim(addr)
+        } else if media.camera {
             mediad::pipeline::Source::Camera(mediad::pipeline::Camera {
                 device: args.camera_device.clone(),
                 exposure: args.exposure,
@@ -354,6 +417,8 @@ fn main() -> ExitCode {
                 None
             }
             (mediad::pipeline::Source::Test, _) => None,
+            // A simulated camera has no sensor to write, and its brightness is the renderer's.
+            (mediad::pipeline::Source::Sim(_), _) => None,
         };
 
         // **The duck detector, from the same config file as everything else.** `[detect]` lives in
@@ -424,7 +489,7 @@ fn main() -> ExitCode {
         let video = mediad::session::Video {
             width: media.quality.width(),
             height: media.quality.height(),
-            rotate: args.rotate,
+            rotate,
             intrinsics,
         };
 
@@ -433,7 +498,7 @@ fn main() -> ExitCode {
         // telemetry — which is the same reason a session keeps one connection per lane.
         while let Some(channel) = channels.recv().await {
             let (replies_tx, mut replies_rx) = tokio::sync::mpsc::channel::<String>(256);
-            let pool = mediad::upstream::Pool::new(Default::default(), replies_tx);
+            let pool = mediad::upstream::Pool::new(sockets.clone(), replies_tx);
 
             let to_peer = channel.outbound.clone();
             tokio::spawn(async move {

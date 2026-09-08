@@ -3741,6 +3741,7 @@ mod tests {
         proto::TofFrame {
             seq: 7,
             at_us: 1_000_000,
+            t_ns: 0,
             rows: 8,
             cols: 8,
             distance_mm,
@@ -4209,6 +4210,10 @@ mod tests {
             odom: proto::OdomState::default(),
             theremin: None,
             chorale: None,
+            t_ns: 0,
+            imu: None,
+            frames: None,
+            skeleton: Vec::new(),
         }
     }
 }

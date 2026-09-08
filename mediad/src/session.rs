@@ -86,6 +86,11 @@ fn video_params(video: &Video) -> serde_json::Value {
         "width": video.width,
         "height": video.height,
         "rotate": video.rotate,
+        // The two clocks at one instant: RTCP sender reports state RTP time in wall-clock
+        // (`real_ns`), `robot.state`/`tof.frame` stamp with `mono_ns`'s clock. A peer that has both
+        // can put the picture on the robot's axis.
+        "mono_ns": proto::clock::monotonic_ns(),
+        "real_ns": proto::clock::realtime_ns(),
     });
     // Absent rather than null when the geometry is unknown: a consumer reading a missing key knows
     // it must calibrate, where one reading `null` has to be told what that meant.
@@ -453,7 +458,7 @@ mod tests {
 
         let intrinsics = &parsed["params"]["intrinsics"];
         assert!(
-            (intrinsics["fx"].as_f64().unwrap() - 1809.52).abs() < 0.01,
+            (intrinsics["fx"].as_f64().unwrap() - 1065.14).abs() < 0.1,
             "{intrinsics}"
         );
         assert_eq!(intrinsics["cx"], 640.0);

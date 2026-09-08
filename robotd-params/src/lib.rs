@@ -329,11 +329,16 @@ pub struct MediaParams {
     /// Whether the send rate adapts to the link, and by what. [`CongestionControl`] has the
     /// trade — it is the largest single CPU consumer in this process.
     pub congestion_control: CongestionControl,
-    /// This robot's measured camera geometry, when somebody has measured it.
+    /// This robot's own measured camera geometry, when somebody has written a `[media.intrinsics]`
+    /// table for it — and only then.
     ///
-    /// Absent on every robot until then, and absence is not a gap to fill with silence: `mediad`
-    /// publishes the module's design figures instead, marked as not calibrated, so a consumer can
-    /// tell a datasheet from a measurement. See [`CameraIntrinsics`].
+    /// Absent is the common case and not a gap: `mediad` falls back to the hardware family's
+    /// calibration ([`CameraIntrinsics::alpha`] — the camera and lens are one part across a
+    /// revision, so it is a real solve of the same optics) and publishes it tagged `source:
+    /// "family"`, with the module's design figures (`source: "nominal"`) below that for a camera
+    /// nobody has solved at all. So this stays `Some` only for a per-robot solve, which is exactly
+    /// what lets `media.video` distinguish *this* robot's calibration from the family's. See
+    /// [`CameraIntrinsics`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intrinsics: Option<CameraIntrinsics>,
 }
@@ -363,6 +368,37 @@ pub struct CameraIntrinsics {
     pub distortion: Vec<f64>,
 }
 
+impl CameraIntrinsics {
+    /// The alpha family's camera calibration: the head camera module and M12 lens every alpha unit
+    /// carries — one part across the family, so one solve is every unit's calibration.
+    ///
+    /// Solved on unit *graphite*, 2026-09-08 — ChArUco board on a screen (caliper-measured), 80
+    /// views, 0.79 px RMS, on the 1280×720 frame as `mediad` sends it (unrotated). This is the
+    /// **~62° full field of view** of the production `1920×1080@30` sensor mode: on this board's
+    /// IMX219 driver that mode is a scaled full-frame readout, not the native 1920×1080 crop the
+    /// datasheet describes — validated on hardware, the solved HFOV is 62°, not 39°. (`SensorMode`
+    /// and [`super`]'s nominal model still assume the crop; they are only the fallback this
+    /// overrides, but they are wrong for this hardware and should be corrected when touched.)
+    /// Re-solve with `duckslam calib intrinsics`; `duckslam calib export-toml` prints this shape.
+    pub fn alpha() -> Self {
+        Self {
+            width: 1280,
+            height: 720,
+            fx: 1061.8060025020175,
+            fy: 1062.193713957031,
+            cx: 596.7776848217006,
+            cy: 474.52348043048636,
+            distortion: vec![
+                -0.34695388691888,
+                0.14615866153945595,
+                -0.0007449157712424215,
+                -0.0022167170528743837,
+                -0.016437266141048814,
+            ],
+        }
+    }
+}
+
 impl Default for MediaParams {
     fn default() -> Self {
         Self {
@@ -371,8 +407,7 @@ impl Default for MediaParams {
             camera: true,
             quality: Quality::default(),
             bitrate: None,
-            // Nobody has measured this robot's camera. `mediad` says so on the wire rather than
-            // implying a measurement that did not happen.
+            // Only a per-robot solve goes here; the family calibration is `mediad`'s fallback.
             intrinsics: None,
             // `webrtcsink`'s own default, named rather than inherited: what the element defaults
             // to is a fact about a plugin we ship from a pinned release, and the day it changes
@@ -2641,6 +2676,35 @@ mod tests {
     /// [`QUALITY_LABELS`] is what the registry offers and what the file may contain, and
     /// [`Quality::ALL`] is what the daemon can do — a rung in one and not the other is either a
     /// choice the editor writes and `mediad` cannot read, or a mode nobody can select.
+    /// **An absent `[media.intrinsics]` stays `None`.** Only a per-robot solve goes in the config;
+    /// the family calibration is `mediad`'s fallback, so that `Some` here means, unambiguously,
+    /// that this robot was measured — which is what lets `media.video` tag `source: "robot"` versus
+    /// `"family"`. `CameraIntrinsics::alpha` is still the family solve `mediad` reads.
+    #[test]
+    fn an_absent_intrinsics_table_is_none_not_the_family() {
+        assert_eq!(MediaParams::default().intrinsics, None);
+
+        let parsed: Params = toml::from_str("[media]\nbitrate = 2000\n").expect("parses");
+        assert_eq!(parsed.media.intrinsics, None, "absent key");
+        let parsed: Params = toml::from_str("").expect("parses");
+        assert_eq!(parsed.media.intrinsics, None, "absent table");
+
+        // The family solve is a real calibration, just not stored here.
+        assert_eq!(CameraIntrinsics::alpha().width, 1280);
+
+        let parsed: Params = toml::from_str(
+            "[media.intrinsics]\nwidth = 640\nheight = 360\nfx = 500.0\nfy = 501.0\ncx = 320.0\ncy = 180.0\n",
+        )
+        .expect("parses");
+        let own = parsed.media.intrinsics.expect("this robot's own");
+        assert_eq!(
+            (own.width, own.fx),
+            (640, 500.0),
+            "a written table is this robot's own solve"
+        );
+        assert!(own.distortion.is_empty());
+    }
+
     #[test]
     fn every_quality_label_round_trips() {
         assert_eq!(QUALITY_LABELS.len(), Quality::ALL.len());

@@ -141,6 +141,9 @@ fn permits(call: &proto::Call) -> bool {
         // reads below, and a remote client watching a gait misbehave has an obvious use for it.
         RobotPolicies => true,
 
+        // The robot's static geometry, for a mapper on the other end of the video: a read.
+        RobotModel => true,
+
         // Re-reading the slots goes with loading one: a client that can change what drives the
         // robot wants the case where something else changed it too.
         RobotReloadPolicies => true,
@@ -204,6 +207,8 @@ fn permits(call: &proto::Call) -> bool {
         // "it will be through `mediad`'s video path, where depth belongs next to the frame it
         // annotates".
         TofStream => true,
+        // The head IMU rides the same video path, for the same reason: it annotates the frames.
+        HeadImuStream => true,
 
         // ── reading the robot's software ─────────────────────────────────────
         //
@@ -432,6 +437,7 @@ mod tests {
                     | proto::Call::RobotStop
                     | proto::Call::RobotSubscribe(_)
                     | proto::Call::TofStream
+                    | proto::Call::HeadImuStream
                     | proto::Call::PadInput
             );
             if wanted {

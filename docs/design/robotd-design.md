@@ -976,3 +976,24 @@ path map now does. §4.4.
    has to reach the board, so prefer pure-Rust crates on that path. *Unverified on macOS:* the
    cross-build needs an aarch64 sysroot, which a Mac cannot provide, so `cargo board --bins` fails
    locally there — build the shipped set with `-p updater -p robotd -p robotctl`, or build on Linux.
+
+## Mapping telemetry (API v24)
+
+A mapper on the far end of the video — a laptop today, a server later — needs three things from
+the robot that `robot.state` did not carry: a clock shared with `tof.frame`, the IMU beyond its
+projected gravity, and where the camera and the ToF sensor are. All three are additive.
+
+- **`t_ns`** on `robot.state` and `tof.frame` is `CLOCK_MONOTONIC` in nanoseconds (`proto::clock`).
+  `t` and `at_us` stay: they are each daemon's own elapsed time, and a reader that only has one
+  stream still wants a number that starts at zero. `mediad`'s `media.video` answer reads
+  `mono_ns` and `real_ns` at one instant, so RTP timestamps — which RTCP sender reports state in
+  wall-clock — can be put on the same axis.
+- **`imu: {gyro, quat}`** is `ImuData` as the loop read it: the trunk IMU, 50 Hz, nothing above
+  it (`docs/design/robotd-design.md` §IMU). The head IMU on the prototype HAT is not read by
+  anything yet; when it is, it streams beside `tof.frame`, not here.
+- **`frames: {camera, tof}`** are trunk-frame poses at this tick's *measured* head joints from
+  `kinematics::head::HeadFk` — the same FK `robot.look` solves against — and **`robot.model`**
+  answers the static geometry (trunk height, joint order, ToF beam directions, the poses at head
+  zero). The kinematics stay in one crate; a client asks rather than transcribes.
+
+Cost: three small structs per published tick, only while someone is subscribed; the FK is ~50 ns.

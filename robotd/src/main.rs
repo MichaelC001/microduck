@@ -219,10 +219,22 @@ struct Args {
     #[arg(long)]
     port: Option<String>,
 
-    /// Run against a robot made of nothing. For laptop development and tests — there is no
-    /// simulator yet, and this is what stands in for one.
+    /// Run against a robot made of nothing. For laptop development and tests, and for the cases
+    /// `--sim` does not cover: no physics, no falling over, positions that echo back perfectly.
     #[arg(long)]
     fake: bool,
+
+    /// Run against a robot in MuJoCo, at `host:port`.
+    ///
+    /// **The same daemon, a simulated body.** Everything above `duck_control::io::RobotIo` — the
+    /// loop, the policy, safety, fall detection, odometry, kinematics, every IPC call — is the code
+    /// that runs on a robot, unchanged and unable to tell. `duck_control::sim` has the protocol and
+    /// the reasons for its shape; `docs/design/simulation.md` has what it is and is not a twin of.
+    ///
+    /// Nothing is connected until the first tick, and a simulator that goes away is retried on
+    /// every tick after — restarting MuJoCo must not mean restarting the duck.
+    #[arg(long, conflicts_with = "fake")]
+    sim: Option<String>,
 
     /// Do not load a policy: run the loop and hold the startup pose.
     ///
@@ -1048,6 +1060,7 @@ fn spawn_control_thread(
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
     let period = params.period();
     let fake = args.fake;
+    let sim = args.sim.clone();
     let port = params.bus.port.clone();
     let params = params.clone();
     // So a reload can re-read `[policy]` without a restart. The path rather than the loaded
@@ -1075,6 +1088,24 @@ fn spawn_control_thread(
                 tracing::warn!("--fake: no bus, no robot");
                 runtime.block_on(control_loop(
                     FakeIo::at(DEFAULT_POSITION),
+                    state,
+                    intents,
+                    params,
+                    params_path,
+                    period,
+                    poweroff,
+                ));
+                return;
+            }
+
+            // No `open_bus_waiting` equivalent, deliberately: `RemoteIo` connects lazily and
+            // reconnects on every tick, so a duck started before its simulator simply reports
+            // unhealthy until the simulator answers — which is what a robot with no power on the
+            // bus does too, by a different route.
+            if let Some(addr) = sim {
+                tracing::warn!(%addr, "--sim: the body is in MuJoCo");
+                runtime.block_on(control_loop(
+                    duck_control::sim::RemoteIo::at(addr),
                     state,
                     intents,
                     params,
@@ -1802,13 +1833,21 @@ async fn control_loop<T: RobotIo>(
         voice.play("greet", false);
     }
 
+    // When the joints in `sensors` were actually read, `CLOCK_MONOTONIC` ns — the clock
+    // `tof.frame` and a mapper share. Stamped at the read, not at publish, because
+    // `controller.step()` (an ONNX forward pass) sits between the two and would bias every
+    // `robot.state` timestamp by one inference otherwise. It rides the coast: a coasted tick
+    // republishes the last fresh sample, so it must republish that sample's read time too.
+    let mut sensors_read_ns = 0u64;
     while !state.shutdown.load(Ordering::Relaxed) {
         ticker.tick().await;
         let tick_start = Instant::now();
 
+        let read_at = proto::clock::monotonic_ns();
         let fresh = match safety.read() {
             Ok(sensors) => {
                 state.consecutive_errors.store(0, Ordering::Relaxed);
+                sensors_read_ns = read_at;
                 Some(sensors)
             }
             Err(e) => {
@@ -2919,6 +2958,15 @@ async fn control_loop<T: RobotIo>(
                 },
                 theremin: theremin_state.clone(),
                 chorale: chorale_state.clone(),
+                t_ns: sensors_read_ns,
+                imu: Some(proto::ImuState {
+                    gyro: sensors.imu.gyro,
+                    quat: sensors.imu.quat,
+                }),
+                frames: Some(mapping::frames_at(mapping::head_joints_of(
+                    &sensors.positions,
+                ))),
+                skeleton: mapping::skeleton_at(&sensors.positions),
             });
         }
 
@@ -4102,6 +4150,10 @@ fn dispatch(
         // What each slot is running, from where, and why it is not running what was asked. Served
         // from the snapshot the control loop publishes, so it answers during startup too rather
         // than racing the first load.
+        // The geometry the mapping fields of `robot.state` are stated in. Constant for the
+        // life of the process, read from the same asset the FK runs on.
+        proto::Call::RobotModel => proto::Response::ok(Some(id), &mapping::model()),
+
         proto::Call::RobotPolicies => proto::Response::ok(
             Some(id),
             &proto::PoliciesResult {
@@ -4377,6 +4429,167 @@ async fn shutdown() {
     tokio::select! {
         _ = term.recv() => {}
         _ = int.recv() => {}
+    }
+}
+
+/// What `robot.state` carries for a mapper, and what `robot.model` answers: sensor poses from
+/// the head FK, and the static geometry they are stated in. One place, the `kinematics` crate,
+/// so a laptop or a server that pairs a picture with a pose asks rather than transcribes.
+mod mapping {
+    use std::sync::LazyLock;
+
+    use duck_ipc_proto as proto;
+
+    static FK: LazyLock<kinematics::head::HeadFk> = LazyLock::new(kinematics::head::HeadFk::alpha);
+    static TOF: LazyLock<kinematics::tof::Reprojector> =
+        LazyLock::new(kinematics::tof::Reprojector::alpha);
+
+    /// The head joints, in [`kinematics::head::HeadFk`]'s order, out of a full joint vector.
+    const HEAD: [&str; 4] = ["neck_pitch", "head_pitch", "head_yaw", "head_roll"];
+
+    pub fn head_joints_of(positions: &[f64]) -> [f64; 4] {
+        let mut out = [0.0; 4];
+        for (slot, name) in out.iter_mut().zip(HEAD) {
+            if let Some(i) = proto::JOINT_NAMES.iter().position(|n| *n == name) {
+                *slot = positions.get(i).copied().unwrap_or(0.0);
+            }
+        }
+        out
+    }
+
+    fn pose(p: kinematics::Pose) -> proto::PoseState {
+        proto::PoseState {
+            pos: p.pos,
+            quat: p.quat.wxyz(),
+        }
+    }
+
+    /// Every body's pose in the trunk frame, in [`Model::body_names`] order, from the full measured
+    /// joint vector — the whole skeleton for a viewer. The model's joint order is the MJCF's, not
+    /// the wire's, so the angles are gathered by name from [`proto::JOINT_NAMES`]-ordered positions.
+    pub fn skeleton_at(positions: &[f64]) -> Vec<proto::PoseState> {
+        let model = kinematics::Model::alpha();
+        let angles: Vec<f64> = model
+            .joint_names()
+            .map(|n| {
+                proto::JOINT_NAMES
+                    .iter()
+                    .position(|w| *w == n)
+                    .and_then(|i| positions.get(i).copied())
+                    .unwrap_or(0.0)
+            })
+            .collect();
+        model.body_poses(&angles).into_iter().map(pose).collect()
+    }
+
+    fn skeleton_links() -> Vec<proto::SkeletonLink> {
+        let model = kinematics::Model::alpha();
+        let parents = model.body_parents();
+        model
+            .body_names()
+            .enumerate()
+            .map(|(i, name)| proto::SkeletonLink {
+                name: name.to_owned(),
+                parent: parents[i],
+            })
+            .collect()
+    }
+
+    pub fn frames_at(head: [f64; 4]) -> proto::FramesState {
+        proto::FramesState {
+            camera: pose(FK.camera_in_trunk_cv2(head)),
+            tof: pose(FK.tof_in_trunk(head)),
+            head_imu: FK.head_imu_in_trunk(head).map(pose),
+        }
+    }
+
+    pub fn model() -> proto::ModelResult {
+        let model = kinematics::Model::alpha();
+        proto::ModelResult {
+            asset: "alpha".to_owned(),
+            trunk_height_m: model.trunk_height_m(),
+            joint_names: proto::JOINT_NAMES.iter().map(|s| (*s).to_owned()).collect(),
+            head_joints: HEAD.iter().map(|s| (*s).to_owned()).collect(),
+            tof_beams: TOF.beams().to_vec(),
+            tof_fov_deg: kinematics::tof::FOV_DEG,
+            frames_at_zero: frames_at([0.0; 4]),
+            skeleton: skeleton_links(),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn head_joints_come_out_of_the_wire_order() {
+            let mut joints = [0.0; 15];
+            joints[5] = 0.1;
+            joints[6] = 0.2;
+            joints[7] = 0.3;
+            joints[8] = 0.4;
+            assert_eq!(head_joints_of(&joints), [0.1, 0.2, 0.3, 0.4]);
+        }
+
+        #[test]
+        fn the_model_says_what_the_frames_are_stated_in() {
+            let m = model();
+            assert_eq!(m.tof_beams.len(), 64);
+            assert_eq!(m.joint_names.len(), 15);
+            assert!(m.trunk_height_m > 0.05 && m.trunk_height_m < 0.3);
+            // Camera and ToF are parallel, a couple of centimetres apart.
+            let f = m.frames_at_zero;
+            let d: f64 = (0..3)
+                .map(|i| (f.camera.pos[i] - f.tof.pos[i]).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            assert!(d > 0.01 && d < 0.05, "camera-tof distance {d}");
+        }
+
+        #[test]
+        fn the_skeleton_topology_and_poses_line_up() {
+            let links = model().skeleton;
+            assert!(!links.is_empty(), "a skeleton is served");
+            assert_eq!(links[0].parent, None, "the root has no parent");
+            assert!(
+                links[1..].iter().all(|l| l.parent.is_some()),
+                "every other link has a parent"
+            );
+            // A pose per link, in the same order, and every parent precedes its child.
+            let poses = skeleton_at(&[0.0; 15]);
+            assert_eq!(poses.len(), links.len(), "one pose per link");
+            assert!(
+                links
+                    .iter()
+                    .enumerate()
+                    .all(|(i, l)| l.parent.is_none_or(|p| p < i))
+            );
+        }
+
+        #[test]
+        fn the_skeleton_moves_with_a_leg_joint() {
+            let mut bent = [0.0; 15];
+            let knee = proto::JOINT_NAMES
+                .iter()
+                .position(|n| n.contains("knee"))
+                .expect("a knee joint");
+            bent[knee] = 0.8;
+            // Bending a knee moves some body, but never the root (trunk_base sits at identity).
+            let rest = skeleton_at(&[0.0; 15]);
+            let moved = skeleton_at(&bent);
+            assert_eq!(rest[0].pos, moved[0].pos, "the root does not move");
+            assert!(
+                rest.iter().zip(&moved).any(|(a, b)| a.pos != b.pos),
+                "a leg body moved"
+            );
+        }
+
+        #[test]
+        fn frames_move_with_the_head() {
+            let a = frames_at([0.0; 4]).camera.pos;
+            let b = frames_at([0.0, 0.0, 1.0, 0.0]).camera.pos;
+            assert!(a != b);
+        }
     }
 }
 

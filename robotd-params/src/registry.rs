@@ -414,7 +414,7 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Record(
             "width = 1280\nheight = 720\nfx = 1809.5\nfy = 1809.5\ncx = 640.0\ncy = 360.0",
         ),
-        "Measured camera geometry — a calibration writes it; absent publishes the module's design figures",
+        "This robot's own camera calibration — a per-robot solve writes it; absent, mediad publishes the family's",
     ),
     entry(
         "media.congestion_control",

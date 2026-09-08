@@ -193,6 +193,14 @@ pub enum Source {
     Test,
     /// The head camera, through the rkisp capture path.
     Camera(Camera),
+    /// A simulated head camera, at `host:port`: what a duck in MuJoCo sees.
+    ///
+    /// Frames arrive length-prefixed and raw rather than as JSON, unlike the rest of the simulator
+    /// links — 640x360 UYVY is 460,800 bytes, and at 15 fps that is 6.9 MB/s. There is no handshake,
+    /// because there is nothing to negotiate that both ends do not already have to agree on to be
+    /// useful: the geometry is fixed on both sides — `[media] quality` here, the body's camera
+    /// there — or nothing works.
+    Sim(String),
 }
 
 /// The head camera, and the two things it will not work without.
@@ -405,6 +413,7 @@ pub fn start(
             src
         }
         Source::Camera(camera) => camera_source(camera, fps)?,
+        Source::Sim(addr) => sim_source(addr, width, height, fps)?,
     };
 
     // Pinned rather than negotiated, because both branches of the tee depend on the answer, and a
@@ -895,6 +904,102 @@ fn camera_source(camera: &Camera, fps: u32) -> Result<gst::Element> {
     Ok(src)
 }
 
+/// A simulated camera as an `appsrc`, fed by a thread reading frames off a socket.
+///
+/// **`is-live` and `do-timestamp`, both of them.** A camera is live by construction; an `appsrc` is
+/// not, and without saying so the pipeline races ahead of the clock and `webrtcsink` sees a source
+/// that can be pulled faster than real time. And without timestamps every downstream element has to
+/// invent them, which shows up as a stream that plays at the wrong speed rather than as an error.
+///
+/// The reader owns the reconnect: MuJoCo restarts whenever the number of ducks changes, and a
+/// camera that goes away must not take the pipeline with it — the encoder simply has no new frames
+/// until it comes back, which is what a real camera being unplugged looks like too.
+fn sim_source(addr: &str, width: u32, height: u32, fps: u32) -> Result<gst::Element> {
+    use gst_app::prelude::*;
+
+    let caps = gst::Caps::builder("video/x-raw")
+        .field("format", CAPTURE_FORMAT)
+        .field("width", width as i32)
+        .field("height", height as i32)
+        .field("framerate", gst::Fraction::new(fps as i32, 1))
+        .build();
+
+    let src = gst_app::AppSrc::builder()
+        .caps(&caps)
+        .is_live(true)
+        .do_timestamp(true)
+        .format(gst::Format::Time)
+        .build();
+
+    let expected = (width as usize) * (height as usize) * 2;
+    let announce = addr.to_owned();
+    let addr = addr.to_owned();
+    let pushable = src.clone();
+    std::thread::Builder::new()
+        .name("sim-camera".into())
+        .spawn(move || {
+            let mut complained = false;
+            loop {
+                match read_frames(&addr, expected, &pushable) {
+                    // A clean close means it had connected and streamed; clear the flag so the
+                    // *next* failure is logged, as `tofd`'s `sim_loop` and `RemoteIo` both do.
+                    Ok(()) => {
+                        complained = false;
+                        tracing::warn!(%addr, "the simulated camera closed");
+                    }
+                    Err(e) if !complained => {
+                        complained = true;
+                        tracing::warn!(%addr, error = %e, "no simulated camera; retrying");
+                    }
+                    Err(_) => {}
+                }
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        })
+        .map(|_| ())
+        .unwrap_or_else(
+            |e| tracing::error!(error = %e, "no reader thread for the simulated camera"),
+        );
+
+    tracing::info!(addr = %announce, width, height, fps, "simulated head camera");
+    Ok(src.upcast())
+}
+
+/// Length-prefixed frames from the simulator into an `appsrc`, until it stops or the frames stop.
+fn read_frames(addr: &str, expected: usize, src: &gst_app::AppSrc) -> std::io::Result<()> {
+    use std::io::Read;
+
+    let stream = std::net::TcpStream::connect(addr)?;
+    stream.set_nodelay(true)?;
+    let mut reader = std::io::BufReader::new(stream);
+    let mut header = [0u8; 4];
+    let mut frame = vec![0u8; expected];
+    tracing::info!(%addr, "the simulated camera is feeding the pipeline");
+
+    loop {
+        reader.read_exact(&mut header)?;
+        let len = u32::from_le_bytes(header) as usize;
+        // A frame of the wrong size means the two ends disagree about the geometry, and pushing it
+        // would be a picture nobody can read. Said once, loudly, rather than a stream of noise.
+        if len != expected {
+            return Err(std::io::Error::other(format!(
+                "the simulator sent a {len}-byte frame and this pipeline expects {expected} — the simulator's camera must match `[media] quality`"
+            )));
+        }
+        reader.read_exact(&mut frame)?;
+        let mut buffer = gst::Buffer::with_size(len).map_err(std::io::Error::other)?;
+        buffer
+            .get_mut()
+            .expect("a fresh buffer is writable")
+            .map_writable()
+            .map_err(std::io::Error::other)?
+            .copy_from_slice(&frame);
+        if src.push_buffer(buffer).is_err() {
+            return Ok(()); // the pipeline is gone
+        }
+    }
+}
+
 /// What the tee carries, and what both branches therefore see.
 ///
 /// Single-plane on purpose: `v4l2src` cannot drive rkisp's two-plane `NM12` at full rate, and
@@ -1062,7 +1167,8 @@ fn pin_sensor_mode(fps: u32) -> Result<()> {
             why = %String::from_utf8_lossy(&output.stderr).trim(),
             "media-ctl would not set the 1920x1080 sensor mode — capture stays in the boot \
              mode, which caps it at 21 fps, and `media.video` publishes no camera intrinsics \
-             because the field of view is then the full sensor's rather than this mode's crop"
+             because the exact framing is then the boot mode's (same ~62 deg field, different \
+             4:3->16:9 crop) rather than the pinned mode the calibration is for"
         );
         let _ = SENSOR_MODE.set(None);
     } else {
