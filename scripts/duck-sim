@@ -462,10 +462,19 @@ start_body() {
         */*)  scene_arg="--scene $SCENE" ;;
         *)    scene_arg="--scene $RL/src/mjlab_microduck/robot/microduck/scene_$SCENE.xml" ;;
     esac
+    # **The camera flags go with the cameras.** Rendering is newer than the body server, and a
+    # build without it has no `--cameras`/`--frame-port` — argparse then refuses the whole
+    # invocation over two arguments nobody asked to use, and the duck never starts. Passed only
+    # when a camera was actually requested, so asking for one against such a build still fails,
+    # loudly and about the thing that is missing.
+    cam_args=""
+    if [ -n "$CAMERAS" ]; then
+        cam_args="--cameras $CAMERAS --frame-port $FRAME_PORT"
+    fi
     # shellcheck disable=SC2086
     $SETSID nohup "$RL/.venv/bin/python" -m mjlab_microduck.sim.body_server \
         --port "$PORT" --ducks "$DUCKS" --keyframe "${DUCK_SIM_KEYFRAME:-SIT}" $HEADLESS $scene_arg \
-        --cameras "$CAMERAS" --frame-port "$FRAME_PORT" \
+        $cam_args \
         > "$STATE/body.log" 2>&1 &
     echo $! > "$STATE/body.pid"
     wait_for_port || die "the simulator did not come up. $STATE/body.log has why."
