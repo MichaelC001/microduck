@@ -45,6 +45,10 @@
 /// the family calibration confirms (it solves to 62.2°). See the module header.
 const FULL_FIELD_HFOV_DEG: f64 = 62.0;
 
+/// The MuJoCo twin head camera's vertical field of view. The MJCF sets no `fovy`, so MuJoCo's
+/// default 45° applies; see [`Intrinsics::sim`].
+const SIM_VFOV_DEG: f64 = 45.0;
+
 /// Horizontal focal length in pixels for a delivered frame `width` wide, from [`FULL_FIELD_HFOV_DEG`].
 /// The delivered field of view is the sensor's full width in every mode this driver offers, so this
 /// depends only on the output width, not on which sensor mode fed it.
@@ -103,6 +107,9 @@ pub enum Source {
     Family,
     /// The module's design figures — arithmetic from the datasheet, not a measurement.
     Nominal,
+    /// The MuJoCo twin's rendered camera — exact geometry from the simulator's field of view, not a
+    /// physical measurement (there is no physical sensor). Lets twin recordings self-describe.
+    Sim,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -228,6 +235,28 @@ impl Intrinsics {
         )
     }
 
+    /// The MuJoCo twin's head camera. The MJCF sets no `fovy` on the camera, so MuJoCo's default
+    /// **45° VERTICAL** field applies over the rendered height: `fx = fy = (height/2)/tan(45°/2)`,
+    /// principal point central, no distortion (a rendered pinhole has none). Exact for the simulator,
+    /// so twin recordings self-describe and need no `--calib`. Tagged [`Source::Sim`], `calibrated`
+    /// false (it is not a measurement of a physical sensor). If a scene ever sets a custom camera
+    /// `fovy`, update `SIM_VFOV_DEG`.
+    pub fn sim(width: u32, height: u32) -> Option<Self> {
+        if width == 0 || height == 0 {
+            return None;
+        }
+        let focal = f64::from(height) / 2.0 / (SIM_VFOV_DEG / 2.0).to_radians().tan();
+        Some(Self {
+            fx: focal,
+            fy: focal,
+            cx: f64::from(width) / 2.0,
+            cy: f64::from(height) / 2.0,
+            calibrated: false,
+            source: Source::Sim,
+            distortion: Vec::new(),
+        })
+    }
+
     /// What to publish, in order of preference: this robot's own `[media.intrinsics]` calibration;
     /// else the hardware family's, which every unit shares; else the module's design figures. Each
     /// carries its [`Source`], so "calibrated" never has to stand in for "measured on *this* robot".
@@ -296,6 +325,20 @@ mod tests {
         assert!((at_1080p.fx - nominal_focal_px(1920)).abs() < 0.01);
         let hfov = 2.0 * (960.0 / at_1080p.fx).atan().to_degrees();
         assert!((hfov - 62.0).abs() < 0.01, "{hfov}");
+    }
+
+    /// The twin's 45° vertical FOV over a 640x360 render — a wider (~72.7°) horizontal field than the
+    /// real camera's 62°, which is why the nominal K skews twin maps.
+    #[test]
+    fn sim_geometry_from_the_default_fovy() {
+        let k = Intrinsics::sim(640, 360).expect("nonzero");
+        assert!((k.fy - 434.57).abs() < 0.1, "{}", k.fy);
+        assert_eq!(k.fx, k.fy, "square pixels");
+        assert_eq!((k.cx, k.cy), (320.0, 180.0), "principal point central");
+        assert_eq!(k.source, Source::Sim);
+        assert!(!k.calibrated && k.distortion.is_empty());
+        let hfov = 2.0 * (320.0 / k.fx).atan().to_degrees();
+        assert!((hfov - 72.7).abs() < 0.5, "{hfov}");
     }
 
     /// The delivered field of view is the sensor's full ~62° at every resolution — the production
