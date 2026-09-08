@@ -127,8 +127,9 @@ struct Args {
 
     /// Take frames from a duck in MuJoCo at `host:port` instead of a camera.
     ///
-    /// The geometry has to match the simulator's camera — `--width 640 --height 360 --fps 15` for
-    /// its defaults — because the frames arrive raw and length-prefixed with no handshake, and a
+    /// The geometry has to match the simulator's camera — set `[media] quality` (the rung `mediad`
+    /// streams; `mediad` has no `--width`/`--height` of its own) to the resolution and rate the body
+    /// renders at — because the frames arrive raw and length-prefixed with no handshake, and a
     /// mismatch is a picture nobody can read rather than an error the pipeline can recover from.
     /// `mediad` says so and refuses the frame if the sizes disagree.
     /// Takes precedence over `[media] camera`, which is a fact about a robot and not about this.

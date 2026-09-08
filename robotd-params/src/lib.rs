@@ -329,22 +329,17 @@ pub struct MediaParams {
     /// Whether the send rate adapts to the link, and by what. [`CongestionControl`] has the
     /// trade — it is the largest single CPU consumer in this process.
     pub congestion_control: CongestionControl,
-    /// The camera's measured geometry: this robot's own calibration when somebody has written one
-    /// here, and the hardware family's otherwise.
+    /// This robot's own measured camera geometry, when somebody has written a `[media.intrinsics]`
+    /// table for it — and only then.
     ///
-    /// **The default is a real calibration, not the datasheet** — [`CameraIntrinsics::alpha`]. The
-    /// camera module and its M12 lens are one part on every alpha unit, so one unit's solve is a
-    /// far better description of another's than the module's design figures (the principal point
-    /// alone sits 60 px off the frame's centre, which no nominal record can know). Still a
-    /// family-wide figure rather than this unit's own: a per-robot `[media.intrinsics]` overrides it,
-    /// which is what a fresh solve on that robot should be written as. `mediad` scales whichever it
-    /// gets to the streamed size and publishes it with `calibrated: true`; the design figures,
-    /// marked as not calibrated, are only what a build for a camera nobody has solved would fall
-    /// back to. See [`CameraIntrinsics`].
-    ///
-    /// No field-level `default`: an absent key takes [`MediaParams::default`]'s value, the family
-    /// calibration, rather than `None`.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Absent is the common case and not a gap: `mediad` falls back to the hardware family's
+    /// calibration ([`CameraIntrinsics::alpha`] — the camera and lens are one part across a
+    /// revision, so it is a real solve of the same optics) and publishes it tagged `source:
+    /// "family"`, with the module's design figures (`source: "nominal"`) below that for a camera
+    /// nobody has solved at all. So this stays `Some` only for a per-robot solve, which is exactly
+    /// what lets `media.video` distinguish *this* robot's calibration from the family's. See
+    /// [`CameraIntrinsics`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intrinsics: Option<CameraIntrinsics>,
 }
 
@@ -406,8 +401,8 @@ impl Default for MediaParams {
             camera: true,
             quality: Quality::default(),
             bitrate: None,
-            // The family's calibration, until this robot has its own — see the field.
-            intrinsics: Some(CameraIntrinsics::alpha()),
+            // Only a per-robot solve goes here; the family calibration is `mediad`'s fallback.
+            intrinsics: None,
             // `webrtcsink`'s own default, named rather than inherited: what the element defaults
             // to is a fact about a plugin we ship from a pinned release, and the day it changes
             // should not be the day every robot's send rate changes with it.
@@ -2675,23 +2670,21 @@ mod tests {
     /// [`QUALITY_LABELS`] is what the registry offers and what the file may contain, and
     /// [`Quality::ALL`] is what the daemon can do — a rung in one and not the other is either a
     /// choice the editor writes and `mediad` cannot read, or a mode nobody can select.
-    /// **An absent `[media.intrinsics]` is the family's calibration, not `None`.** `MediaParams`
-    /// carries a struct-level `#[serde(default)]`, and a field-level `default` on `intrinsics`
-    /// would silently win over it with `None` — which is how this would regress to publishing the
-    /// datasheet on every robot while looking configured. A per-robot table still overrides.
+    /// **An absent `[media.intrinsics]` stays `None`.** Only a per-robot solve goes in the config;
+    /// the family calibration is `mediad`'s fallback, so that `Some` here means, unambiguously,
+    /// that this robot was measured — which is what lets `media.video` tag `source: "robot"` versus
+    /// `"family"`. `CameraIntrinsics::alpha` is still the family solve `mediad` reads.
     #[test]
-    fn an_absent_intrinsics_table_is_the_family_calibration() {
-        let alpha = CameraIntrinsics::alpha();
-        assert_eq!(MediaParams::default().intrinsics.as_ref(), Some(&alpha));
+    fn an_absent_intrinsics_table_is_none_not_the_family() {
+        assert_eq!(MediaParams::default().intrinsics, None);
 
         let parsed: Params = toml::from_str("[media]\nbitrate = 2000\n").expect("parses");
-        assert_eq!(parsed.media.intrinsics.as_ref(), Some(&alpha), "absent key");
+        assert_eq!(parsed.media.intrinsics, None, "absent key");
         let parsed: Params = toml::from_str("").expect("parses");
-        assert_eq!(
-            parsed.media.intrinsics.as_ref(),
-            Some(&alpha),
-            "absent table"
-        );
+        assert_eq!(parsed.media.intrinsics, None, "absent table");
+
+        // The family solve is a real calibration, just not stored here.
+        assert_eq!(CameraIntrinsics::alpha().width, 1280);
 
         let parsed: Params = toml::from_str(
             "[media.intrinsics]\nwidth = 640\nheight = 360\nfx = 500.0\nfy = 501.0\ncx = 320.0\ncy = 180.0\n",
@@ -2701,7 +2694,7 @@ mod tests {
         assert_eq!(
             (own.width, own.fx),
             (640, 500.0),
-            "a written table overrides the family's"
+            "a written table is this robot's own solve"
         );
         assert!(own.distortion.is_empty());
     }

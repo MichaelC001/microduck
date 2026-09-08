@@ -59,7 +59,7 @@ pub const FRAME_BUFFER: usize = 256;
 #[cfg(target_os = "linux")]
 const TEMP_EVERY: u64 = 100;
 
-/// What the `imu.stream` answer reports — whether a BMI088 was found and at what rate.
+/// What the `head_imu.stream` answer reports — whether a BMI088 was found and at what rate.
 #[derive(Clone)]
 pub struct ImuStatus {
     hz: u8,
@@ -147,10 +147,17 @@ pub fn imu_loop(
             last = tick;
             match ahrs.update(dt) {
                 Ok((gyro, quat)) => {
-                    let accel = ahrs
-                        .imu()
-                        .read_accelerometer_ms2()
-                        .unwrap_or((0.0, 0.0, 0.0));
+                    // A failed accelerometer read must not become `(0, 0, 0)`: zero acceleration
+                    // is indistinguishable from free-fall to a consumer, and nothing recovers from
+                    // it. Reopen the chip instead, exactly as a gyro failure does below.
+                    let accel = match ahrs.imu().read_accelerometer_ms2() {
+                        Ok(accel) => accel,
+                        Err(e) => {
+                            status.lost(format!("accelerometer read failed: {e:?}"));
+                            tracing::warn!("head IMU accelerometer read failed; reopening");
+                            break;
+                        }
+                    };
                     if seq.is_multiple_of(TEMP_EVERY)
                         && let Ok(t) = ahrs.imu().read_temperature()
                     {

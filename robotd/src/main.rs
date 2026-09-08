@@ -1833,13 +1833,21 @@ async fn control_loop<T: RobotIo>(
         voice.play("greet", false);
     }
 
+    // When the joints in `sensors` were actually read, `CLOCK_MONOTONIC` ns — the clock
+    // `tof.frame` and a mapper share. Stamped at the read, not at publish, because
+    // `controller.step()` (an ONNX forward pass) sits between the two and would bias every
+    // `robot.state` timestamp by one inference otherwise. It rides the coast: a coasted tick
+    // republishes the last fresh sample, so it must republish that sample's read time too.
+    let mut sensors_read_ns = 0u64;
     while !state.shutdown.load(Ordering::Relaxed) {
         ticker.tick().await;
         let tick_start = Instant::now();
 
+        let read_at = proto::clock::monotonic_ns();
         let fresh = match safety.read() {
             Ok(sensors) => {
                 state.consecutive_errors.store(0, Ordering::Relaxed);
+                sensors_read_ns = read_at;
                 Some(sensors)
             }
             Err(e) => {
@@ -2950,7 +2958,7 @@ async fn control_loop<T: RobotIo>(
                 },
                 theremin: theremin_state.clone(),
                 chorale: chorale_state.clone(),
-                t_ns: proto::clock::monotonic_ns(),
+                t_ns: sensors_read_ns,
                 imu: Some(proto::ImuState {
                     gyro: sensors.imu.gyro,
                     quat: sensors.imu.quat,

@@ -164,10 +164,12 @@ target/debug/tofd --sim 127.0.0.1:7801 --socket /tmp/d/duck-a-tof.sock
 DUCK_RUNTIME_DIR=/tmp/d ORT_DYLIB_PATH=<libonnxruntime.so> \
     target/debug/robotd --sim 127.0.0.1:7801 --params <params.toml> --socket /tmp/d/duck-a.sock
 # a camera, if duck-body was started with --cameras a
-target/debug/mediad --sim-camera 127.0.0.1:7901 --width 640 --height 360 --fps 15 \
+printf '[media]\nquality = "360p30"\n' > /tmp/d/mediad.toml
+target/debug/mediad --sim-camera 127.0.0.1:7901 --config /tmp/d/mediad.toml \
     --robot-socket /tmp/d/duck-a.sock --tof-socket /tmp/d/duck-a-tof.sock
 ```
 
-The camera's geometry has to match on both sides — frames arrive raw with no handshake, and `mediad`
-refuses a frame of the wrong size rather than showing a picture nobody can read. `scripts/duck-sim`
-is the record of the rest of the arguments; read it before improvising.
+The camera's geometry has to match on both sides — `mediad` streams the `[media] quality` rung
+(`360p30` is 640×360), and the body must render at the same size, because frames arrive raw with no
+handshake and `mediad` refuses one of the wrong size rather than showing a picture nobody can read.
+`scripts/duck-sim` is the record of the rest of the arguments; read it before improvising.

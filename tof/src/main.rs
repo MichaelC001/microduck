@@ -135,15 +135,6 @@ struct Args {
     #[arg(long)]
     fake: bool,
 
-    /// Read frames from a simulated body at `host:port` instead of a sensor.
-    ///
-    /// **The fake at the loop level, with a simulator behind it** — which is where a fake belongs
-    /// here: `sensor.rs` says in as many words that the off-board `Sensor` "is not a fake sensor and
-    /// must never become one", because the thing it stands for is a vendor C library talking to a
-    /// bus. A frame arriving from somewhere else is a different question from a sensor that lies.
-    ///
-    /// The simulator answers `{"op":"tof"}` with the same 8x8 of distances and per-zone statuses
-    /// this daemon publishes, so nothing downstream — `robotd`, `maploc`, the viewer — can tell.
     /// Head-IMU (BMI088) sample rate, Hz. The chip's default bandwidth is 100 Hz.
     #[arg(long, default_value_t = 100)]
     imu_hz: u8,
@@ -152,6 +143,15 @@ struct Args {
     #[arg(long)]
     no_imu: bool,
 
+    /// Read frames from a simulated body at `host:port` instead of a sensor.
+    ///
+    /// **The fake at the loop level, with a simulator behind it** — which is where a fake belongs
+    /// here: `sensor.rs` says in as many words that the off-board `Sensor` "is not a fake sensor and
+    /// must never become one", because the thing it stands for is a vendor C library talking to a
+    /// bus. A frame arriving from somewhere else is a different question from a sensor that lies.
+    ///
+    /// The simulator answers `{"op":"tof"}` with the same 8x8 of distances and per-zone statuses
+    /// this daemon publishes, so nothing downstream — `robotd`, the viewer — can tell.
     #[arg(long, conflicts_with = "fake")]
     sim: Option<String>,
 }
@@ -679,7 +679,7 @@ async fn subscriber(
                     id,
                     proto::Error::new(
                         proto::code::METHOD_NOT_FOUND,
-                        "tofd serves tof.stream and imu.stream and nothing else",
+                        "tofd serves tof.stream and head_imu.stream and nothing else",
                     ),
                 );
                 write_line(&mut write, &response).await?;

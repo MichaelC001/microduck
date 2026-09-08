@@ -115,16 +115,33 @@ impl SensorMode {
 /// and nothing on the robot turns the pixels back (`pipeline`'s header says why). A consumer that
 /// rotates the image has to rotate these too — `cx` and `cy` swap, and so do `fx` and `fy` — and
 /// the `rotate` field alongside these in `media.video` is what tells it by how much.
+/// Where a published calibration came from — so a consumer can tell *this* robot's own solve from
+/// the family's, which look identical in the numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Source {
+    /// A `[media.intrinsics]` calibration measured on this robot.
+    Robot,
+    /// The hardware family's shared calibration (`robotd-params` ships it): a real solve of the
+    /// same camera-and-lens part, not of this particular unit.
+    Family,
+    /// The module's design figures — arithmetic from the datasheet, not a measurement.
+    Nominal,
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Intrinsics {
     pub fx: f64,
     pub fy: f64,
     pub cx: f64,
     pub cy: f64,
-    /// **Whether these were measured on this robot.** `false` means they are the module's design
-    /// figures: good to a few percent, with no distortion model, and enough for a room-scale map
-    /// rather than for metrology.
+    /// **Whether these came from a real solve.** `false` is `Source::Nominal` — the module's design
+    /// figures, no distortion model, enough for a room-scale map rather than metrology. `true`
+    /// covers both a per-robot and the family calibration; [`Intrinsics::source`] says which, so a
+    /// consumer that needs *this* robot's own solve can tell it must still ask.
     pub calibrated: bool,
+    /// Whose solve this is: this robot's, the family's, or none (the datasheet). See [`Source`].
+    pub source: Source,
     /// Radial and tangential terms in OpenCV's order — `k1 k2 p1 p2 k3` — or empty for "no model
     /// of the distortion", which is what a nominal record has.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -163,6 +180,7 @@ impl Intrinsics {
             cx: f64::from(width) / 2.0,
             cy: f64::from(height) / 2.0,
             calibrated: false,
+            source: Source::Nominal,
             distortion: Vec::new(),
         })
     }
@@ -177,6 +195,17 @@ impl Intrinsics {
         measured: &robotd_params::CameraIntrinsics,
         width: u32,
         height: u32,
+    ) -> Option<Self> {
+        Self::scaled(measured, width, height, Source::Robot)
+    }
+
+    /// A calibration scaled to the delivered frame, tagged with whose solve it is. `Robot` for a
+    /// per-robot `[media.intrinsics]` table, `Family` for the shipped family default.
+    fn scaled(
+        measured: &robotd_params::CameraIntrinsics,
+        width: u32,
+        height: u32,
+        source: Source,
     ) -> Option<Self> {
         if measured.width == 0 || measured.height == 0 || width == 0 || height == 0 {
             return None;
@@ -198,13 +227,34 @@ impl Intrinsics {
             cx: measured.cx * scale_x,
             cy: measured.cy * scale_y,
             calibrated: true,
+            source,
             // Distortion coefficients are dimensionless in normalised image coordinates, so a
             // uniform resize leaves them alone.
             distortion: measured.distortion.clone(),
         })
     }
 
-    /// What to publish: a calibration if this robot has one, the design figures otherwise.
+    /// The hardware family's calibration, scaled to the delivered frame. The camera and lens are
+    /// one part across a revision, so this is a real solve of the same optics — just not of this
+    /// particular unit, which is why it is published as `Source::Family` rather than `Robot`.
+    ///
+    /// Gated on a known sensor mode for the same reason [`Intrinsics::nominal`] is: the solve was
+    /// taken in one mode, and in an unrecognised one (the sensor's boot mode, a wider field of
+    /// view) it would be as quietly wrong as the datasheet — so an unknown mode publishes nothing
+    /// rather than the family's numbers.
+    pub fn family(mode: Option<SensorMode>, width: u32, height: u32) -> Option<Self> {
+        mode?;
+        Self::scaled(
+            &robotd_params::CameraIntrinsics::alpha(),
+            width,
+            height,
+            Source::Family,
+        )
+    }
+
+    /// What to publish, in order of preference: this robot's own `[media.intrinsics]` calibration;
+    /// else the hardware family's, which every unit shares; else the module's design figures. Each
+    /// carries its [`Source`], so "calibrated" never has to stand in for "measured on *this* robot".
     pub fn published(
         configured: Option<&robotd_params::CameraIntrinsics>,
         mode: Option<SensorMode>,
@@ -213,6 +263,7 @@ impl Intrinsics {
     ) -> Option<Self> {
         configured
             .and_then(|measured| Self::scaled_from(measured, width, height))
+            .or_else(|| Self::family(mode, width, height))
             .or_else(|| Self::nominal(mode, width, height))
     }
 }
@@ -342,23 +393,40 @@ mod tests {
         );
     }
 
-    /// A calibration that cannot be scaled falls back to nominal rather than to nothing — and
-    /// says so, because a robot that was calibrated and is publishing design figures is a
-    /// mismatch somebody should fix.
+    /// A per-robot calibration that cannot be scaled falls back to the family's, not to nothing —
+    /// a real solve of the same optics, published as `family` so a consumer can see this robot's
+    /// own record was unusable and someone should fix it.
     #[test]
-    fn a_calibration_at_the_wrong_aspect_falls_back_to_nominal() {
+    fn an_unusable_robot_calibration_falls_back_to_the_family() {
         let published = Intrinsics::published(
             Some(&measured(640, 480)),
             Some(SensorMode::PINNED),
             1280,
             720,
         )
-        .expect("nominal");
+        .expect("the family calibration");
+        assert_eq!(published.source, Source::Family);
         assert!(
-            !published.calibrated,
-            "the fallback must not claim to be a measurement"
+            published.calibrated,
+            "the family solve is a real measurement"
         );
-        assert!((published.fx - 1809.52).abs() < 0.01);
+        // The alpha solve is 1280x720, delivered 1280x720, so it is carried across unscaled.
+        assert!((published.fx - 1055.08).abs() < 0.01, "{}", published.fx);
+    }
+
+    /// With no per-robot table, a robot in a known mode publishes the family's calibration, tagged
+    /// so a consumer can tell it is not this unit's own solve.
+    #[test]
+    fn the_family_fills_in_when_the_robot_has_no_table() {
+        let published = Intrinsics::published(None, Some(SensorMode::PINNED), 640, 360)
+            .expect("the family calibration");
+        assert_eq!(published.source, Source::Family);
+        assert!(published.calibrated);
+        // Half of the 1280x720 solve.
+        assert!((published.fx - 527.5).abs() < 0.5, "{}", published.fx);
+        let json = serde_json::to_value(&published).unwrap();
+        assert_eq!(json["source"], "family");
+        assert_eq!(json["calibrated"], true);
     }
 
     /// The shape a consumer reads. `calibrated` is not optional in the JSON: a consumer that has
@@ -369,6 +437,7 @@ mod tests {
             serde_json::to_value(Intrinsics::nominal(Some(SensorMode::PINNED), 1280, 720).unwrap())
                 .unwrap();
         assert_eq!(json["calibrated"], false);
+        assert_eq!(json["source"], "nominal");
         assert!((json["fx"].as_f64().unwrap() - 1809.52).abs() < 0.01);
         assert_eq!(json["cx"], 640.0);
         assert!(

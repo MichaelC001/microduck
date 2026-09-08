@@ -198,7 +198,8 @@ pub enum Source {
     /// Frames arrive length-prefixed and raw rather than as JSON, unlike the rest of the simulator
     /// links — 640x360 UYVY is 460,800 bytes, and at 15 fps that is 6.9 MB/s. There is no handshake,
     /// because there is nothing to negotiate that both ends do not already have to agree on to be
-    /// useful: the geometry is `--width`/`--height` on both sides or nothing works.
+    /// useful: the geometry is fixed on both sides — `[media] quality` here, the body's camera
+    /// there — or nothing works.
     Sim(String),
 }
 
@@ -940,7 +941,12 @@ fn sim_source(addr: &str, width: u32, height: u32, fps: u32) -> Result<gst::Elem
             let mut complained = false;
             loop {
                 match read_frames(&addr, expected, &pushable) {
-                    Ok(()) => tracing::warn!(%addr, "the simulated camera closed"),
+                    // A clean close means it had connected and streamed; clear the flag so the
+                    // *next* failure is logged, as `tofd`'s `sim_loop` and `RemoteIo` both do.
+                    Ok(()) => {
+                        complained = false;
+                        tracing::warn!(%addr, "the simulated camera closed");
+                    }
                     Err(e) if !complained => {
                         complained = true;
                         tracing::warn!(%addr, error = %e, "no simulated camera; retrying");
@@ -977,7 +983,7 @@ fn read_frames(addr: &str, expected: usize, src: &gst_app::AppSrc) -> std::io::R
         // would be a picture nobody can read. Said once, loudly, rather than a stream of noise.
         if len != expected {
             return Err(std::io::Error::other(format!(
-                "the simulator sent a {len}-byte frame and this pipeline is set up for {expected}                  — `--width`/`--height` must match the simulator's camera"
+                "the simulator sent a {len}-byte frame and this pipeline expects {expected} — the simulator's camera must match `[media] quality`"
             )));
         }
         reader.read_exact(&mut frame)?;
