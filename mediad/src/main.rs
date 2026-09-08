@@ -533,7 +533,9 @@ fn main() -> ExitCode {
                 }),
             },
             producer.clone(),
-            args.rotate,
+            // The resolved mount angle, not the flag: `--rotate` is an `Option` now and the
+            // default lives in one place at the top of `main`.
+            rotate,
             &args.token,
         ));
 
