@@ -33,6 +33,23 @@ encoder are absent, not modelled; a bug in one of those is only visible on a rob
 - For the container form only: `sudo`, `systemd-nspawn` (package `systemd-container`) and
   `mmdebstrap`. The script says which one is missing and prints the line to install it.
 
+## `up` or `boot`?
+
+Both drive the same MuJoCo body with the same `robotd`. They differ in what the daemons run *under*.
+
+| | `scripts/duck-sim` (`up`) | `scripts/duck-sim boot N` |
+|---|---|---|
+| The daemons run as | plain processes, your user, a pidfile each | systemd services inside a `systemd-nspawn` container per duck, from the real unit files |
+| Needs | nothing beyond the repo and `microduck_rl` | `sudo`, a one-time Debian rootfs build |
+| Starts in | seconds | a minute the first time, seconds after |
+| Identity | your laptop's; several ducks are one process tree | a machine-id, a voice and a socket per duck, and `duck-ether` between them |
+| Exercises | the control loop, policies, IPC, `robotctl`, the console | all of that, plus `User=`/groups/`RuntimeDirectory=`/hardening, the updater's apply, health gate, rollback and restart order, `journalctl` |
+
+Rule of thumb: **`up`** when you are working on the control loop, a policy, IPC or a client.
+**`boot`** when you are working on anything that touches systemd, the updater or provisioning, or on
+more than one duck talking to another. Two of the bugs this simulator has caught were a daemon whose
+user did not exist, so its unit never started — a class `up` cannot see at all.
+
 ## One duck, no container
 
 ```sh
