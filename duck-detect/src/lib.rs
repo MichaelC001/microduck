@@ -361,7 +361,7 @@ mod tests {
     fn the_rgb_scaler_turns_the_picture_and_keeps_its_shape() {
         // 8x4 UYVY, all grey except the top-left pixel, which is bright.
         let (width, height) = (8usize, 4usize);
-        let mut uyvy = vec![128u8, 16, 128, 16].repeat(width * height / 2);
+        let mut uyvy = [128u8, 16, 128, 16].repeat(width * height / 2);
         uyvy[1] = 235; // Y0 of the first pair: the top-left pixel, white.
 
         let mut out = Vec::new();
@@ -371,8 +371,9 @@ mod tests {
 
         let (w, h) = rgb_from_uyvy(&uyvy, width, height, 8, Turn::Right, &mut out);
         assert_eq!((w, h), (4, 8), "a quarter turn swaps the axes");
-        // Turned clockwise, the frame's top-left corner is the picture's top-right.
-        let top_right = ((0 * w) + (w - 1)) * 3;
+        // Turned clockwise, the frame's top-left corner is the picture's top-right — row zero,
+        // last column.
+        let top_right = (w - 1) * 3;
         assert!(
             out[top_right] > 200,
             "the bright pixel moved to the top-right: {:?}",
@@ -384,7 +385,7 @@ mod tests {
     /// Never upscales: a box larger than the sensor would interpolate detail nobody captured.
     #[test]
     fn the_rgb_scaler_only_ever_shrinks() {
-        let uyvy = vec![128u8, 16, 128, 16].repeat(8 * 4 / 2);
+        let uyvy = [128u8, 16, 128, 16].repeat(8 * 4 / 2);
         let mut out = Vec::new();
         assert_eq!(rgb_from_uyvy(&uyvy, 8, 4, 64, Turn::None, &mut out), (8, 4));
         assert_eq!(rgb_from_uyvy(&uyvy, 8, 4, 4, Turn::None, &mut out), (4, 2));

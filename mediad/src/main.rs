@@ -521,9 +521,7 @@ fn main() -> ExitCode {
                 ),
                 // The H.264 branch turns nothing: it is downstream of the same tee, so the flip —
                 // or its absence — is already in the pixels it encodes.
-                h264: stream_branch
-                    .clone()
-                    .map(mediad::stream::h264_encoder),
+                h264: stream_branch.clone().map(mediad::stream::h264_encoder),
                 gate: stream_branch.clone().map(|branch| {
                     std::sync::Arc::new(move |open: bool| {
                         if open {

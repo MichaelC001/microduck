@@ -199,8 +199,10 @@ async fn handle(line: &str, pool: &mut Pool, media: Option<&Media>) -> Option<St
         return Some(match stream_request(&request.params) {
             // No `url` key at all is a question rather than an instruction, which is what lets a
             // client show what is streaming without having to remember what it asked for.
-            Ask::Status => serde_json::to_string(&proto::Response::ok(id, &media.streamer.status()))
-                .expect("Response serialises"),
+            Ask::Status => {
+                serde_json::to_string(&proto::Response::ok(id, &media.streamer.status()))
+                    .expect("Response serialises")
+            }
             Ask::Stop => serde_json::to_string(&proto::Response::ok(id, &media.streamer.stop()))
                 .expect("Response serialises"),
             Ask::Start(config) => match media.streamer.start(config) {
@@ -640,7 +642,11 @@ mod tests {
             serde_json::from_str(&h.to_peer.recv().await.unwrap()).expect("valid json")
         }
 
-        let answer = ask(&mut h, r#"{"jsonrpc":"2.0","id":1,"method":"media.stream"}"#).await;
+        let answer = ask(
+            &mut h,
+            r#"{"jsonrpc":"2.0","id":1,"method":"media.stream"}"#,
+        )
+        .await;
         assert_eq!(answer["result"]["streaming"], false, "{answer}");
         assert_eq!(answer["result"]["sent"], 0);
 
@@ -649,9 +655,16 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":2,"method":"media.stream","params":{"url":"http://a.b"}}"#,
         )
         .await;
-        assert_eq!(answer["error"]["code"], proto::code::INVALID_PARAMS, "{answer}");
+        assert_eq!(
+            answer["error"]["code"],
+            proto::code::INVALID_PARAMS,
+            "{answer}"
+        );
         assert!(
-            answer["error"]["message"].as_str().unwrap().contains("ws://"),
+            answer["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("ws://"),
             "the refusal says what a url has to be: {answer}"
         );
 

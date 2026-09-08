@@ -1034,10 +1034,7 @@ impl Relay {
         // Read now rather than held as a receiver: a lane's answer to `media.video` should be
         // whatever was true when the consumer connected, and a picture that changed shape
         // mid-session is a `media.video` notification's job on the media path.
-        let video = self
-            .video
-            .as_ref()
-            .and_then(|watch| watch.borrow().clone());
+        let video = self.video.as_ref().and_then(|watch| watch.borrow().clone());
         let remote_id = session_id.to_owned();
         let session_id = session_id.to_owned();
 
@@ -2099,7 +2096,8 @@ mod tests {
             "the answer names the session the service routes on"
         );
         assert_eq!(
-            posted["rpc"], serde_json::from_str::<serde_json::Value>(&answer).unwrap(),
+            posted["rpc"],
+            serde_json::from_str::<serde_json::Value>(&answer).unwrap(),
             "and the payload is the daemon's own line, unparsed and unwrapped"
         );
         task.abort();
@@ -2149,7 +2147,10 @@ mod tests {
             .into_iter()
             .find(|posted| !posted["rpc"]["error"].is_null())
             .unwrap();
-        assert_eq!(posted["rpc"]["id"], 7, "a refusal answers the call that earned it");
+        assert_eq!(
+            posted["rpc"]["id"], 7,
+            "a refusal answers the call that earned it"
+        );
         task.abort();
     }
 

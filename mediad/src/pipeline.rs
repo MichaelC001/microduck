@@ -366,7 +366,12 @@ pub fn start(
     producer: &crate::producer::Producer,
     settings: &Settings,
     relays: Arc<crate::turn::Relays>,
-) -> Result<(gst::Pipeline, mpsc::Receiver<Channel>, Frames, Option<StreamBranch>)> {
+) -> Result<(
+    gst::Pipeline,
+    mpsc::Receiver<Channel>,
+    Frames,
+    Option<StreamBranch>,
+)> {
     let &Settings {
         port,
         bitrate,

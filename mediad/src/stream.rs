@@ -128,7 +128,11 @@ impl Config {
         if self.encoding == Encoding::H264 {
             return Duration::ZERO;
         }
-        let fps = if self.fps.is_finite() { self.fps } else { Self::DEFAULT_FPS };
+        let fps = if self.fps.is_finite() {
+            self.fps
+        } else {
+            Self::DEFAULT_FPS
+        };
         Duration::from_secs_f64(1.0 / fps.clamp(0.2, 15.0))
     }
 }
@@ -222,9 +226,8 @@ pub async fn pump(
     tracing::info!(%url, "the frame stream ended");
 }
 
-type Socket = tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
->;
+type Socket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// Why [`carry`] returned, which decides whether to redial.
 enum Carried {
@@ -682,10 +685,19 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
 
         assert_eq!(parsed["type"], "hello");
-        assert_eq!(parsed["robot"]["name"], "olducky", "where the receiver looks for the name");
+        assert_eq!(
+            parsed["robot"]["name"], "olducky",
+            "where the receiver looks for the name"
+        );
         assert_eq!(parsed["robot"]["kind"], "microduck");
-        assert_eq!(parsed["frames"]["encoding"], "h264", "the default, and what the VPU makes");
-        assert_eq!(parsed["frames"]["annexb"], true, "one message is one access unit");
+        assert_eq!(
+            parsed["frames"]["encoding"], "h264",
+            "the default, and what the VPU makes"
+        );
+        assert_eq!(
+            parsed["frames"]["annexb"], true,
+            "one message is one access unit"
+        );
         // Upright already, and the mount angle reported separately so a receiver cannot apply a
         // turn that has been applied.
         assert_eq!(parsed["frames"]["rotate"], 0);
@@ -820,7 +832,11 @@ mod tests {
             status["dropped"].as_u64().unwrap() >= 4,
             "the units after the gap were dropped: {status}"
         );
-        assert_eq!(status["sent"].as_u64().unwrap(), 0, "nothing ever connected: {status}");
+        assert_eq!(
+            status["sent"].as_u64().unwrap(),
+            0,
+            "nothing ever connected: {status}"
+        );
         streamer.stop();
     }
 
@@ -868,7 +884,7 @@ mod tests {
         .await;
         assert_eq!(seen.frames.lock().unwrap()[0], vec![0xff, 0xd8, 9]);
         assert!(
-            seen.hello.lock().unwrap().len() >= 1,
+            !seen.hello.lock().unwrap().is_empty(),
             "every connection opens with its own hello, since the receiver is new each time"
         );
         running.store(false, Ordering::Relaxed);
