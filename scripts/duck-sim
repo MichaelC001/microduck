@@ -32,6 +32,12 @@ set -eu
 STATE="${DUCK_SIM_STATE:-$HOME/.cache/duck-sim}"
 RL="${DUCK_SIM_RL:-$HOME/Pollen/microduck_rl}"
 PORT="${DUCK_SIM_PORT:-7801}"
+
+# `setsid` is util-linux: Linux has it, a Mac does not. What it buys is a daemon in its own session,
+# so closing this terminal does not take the duck with it — and on a machine without it `nohup`
+# alone covers the hangup, which is the part that matters. Nothing here kills by process group any
+# more (see `stop_one`), so a session was the only thing ever wanted from it.
+SETSID="$(command -v setsid 2>/dev/null || true)"
 DUCKS="${DUCK_SIM_DUCKS:-1}"
 
 # Which world. A bare name is one of the simulator's own scenes; anything with a slash is a path.
@@ -84,6 +90,20 @@ ctl() {
 #
 # No group kill at all any more. Every process this starts is a single process that exits on TERM,
 # and the group form bought nothing but the reach to do damage.
+# How a pid says what it is. /proc is Linux and a Mac has none, so `ps` answers there — and the
+# question is the same either way, which is the point: nothing above may signal a pid without it.
+#
+# A dead pid must not fall through to the other branch and get a second opinion. On Linux an
+# unreadable `cmdline` *is* the answer (the process is gone), so this returns empty rather than
+# asking `ps`; only a machine with no /proc at all reaches it.
+cmdline_of() {
+    if [ -d /proc ]; then
+        tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null
+    else
+        ps -p "$1" -o command= 2>/dev/null
+    fi
+}
+
 stop_one() {
     file="$STATE/$1.pid"
     expect="$2"
@@ -94,16 +114,21 @@ stop_one() {
 
     [ -n "$pid" ] || return 0
     [ "$pid" -gt 1 ] 2>/dev/null || return 0
-    [ -r "/proc/$pid/cmdline" ] || return 0
-    tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q -- "$expect" || {
+    cmdline_of "$pid" | grep -q -- "$expect" || {
         say "not stopping pid $pid: it is no longer $1"
         return 0
     }
 
     kill -TERM "$pid" 2>/dev/null || sudo -n kill -TERM "$pid" 2>/dev/null || true
-    i=0
-    while [ $i -lt 25 ] && [ -d "/proc/$pid" ]; do i=$((i + 1)); sleep 0.2; done
-    [ -d "/proc/$pid" ] || return 0
+    # `waited`, not `i`: there are no locals in POSIX sh, and `down` walks its ducks with `i`.
+    # This loop used to leave it wherever the wait ended, so stopping a `robotd` that took a moment
+    # to go moved the caller's counter forward and the `tofd` beside it was never signalled at all.
+    waited=0
+    while [ $waited -lt 25 ] && kill -0 "$pid" 2>/dev/null; do
+        waited=$((waited + 1))
+        sleep 0.2
+    done
+    kill -0 "$pid" 2>/dev/null || return 0
     kill -KILL "$pid" 2>/dev/null || sudo -n kill -KILL "$pid" 2>/dev/null || true
 }
 
@@ -143,29 +168,55 @@ build_daemons() {
     (cd "$REPO" && cargo build --quiet -p robotd -p robotctl -p tof -p sounds)
 }
 
+# **A checkout has no policies.** They live on the Hub and reach a robot through
+# `scripts/seed-policies.sh` at install time, deliberately outside the release — so a fresh clone
+# has nothing to name here, and a duck started against seven missing files comes up *degraded* and
+# never stands. Same script, same set, a root under the state directory.
+#
+# A `policies/` beside the repo wins if it has one: that is somebody's own set, and fetching over
+# it would silently swap the gait they are working on.
+policies() {
+    if [ -f "$REPO/policies/alpha_stand.onnx" ]; then
+        POLICIES="$REPO/policies"
+        return 0
+    fi
+    POLICIES="$STATE/policies/current"
+    [ -f "$POLICIES/alpha_stand.onnx" ] || {
+        say "no policy set here — fetching the official one"
+        sh "$REPO/scripts/seed-policies.sh" "$STATE/policies" || true
+    }
+    [ -f "$POLICIES/alpha_stand.onnx" ] ||
+        die "no policy set in $STATE/policies. It needs the network once, or your own .onnx files in $REPO/policies."
+}
+
 up() {
     [ -d "$RL" ] || die "no simulator at $RL. It is the microduck_rl repo — set DUCK_SIM_RL."
     [ -x "$RL/.venv/bin/python" ] || die "$RL has no .venv. Run \`uv sync\` there first."
-    ORT="$(ls "$RL"/.venv/lib/python*/site-packages/onnxruntime/capi/libonnxruntime.so.* 2>/dev/null | head -1)"
+    # `.so.<version>` on Linux, `.<version>.dylib` on macOS — the wheel names it after the platform
+    # and `ort` dlopens whatever this points at, so both spellings are looked for rather than one.
+    ORT="$(ls "$RL"/.venv/lib/python*/site-packages/onnxruntime/capi/libonnxruntime.so.* \
+            "$RL"/.venv/lib/python*/site-packages/onnxruntime/capi/libonnxruntime*.dylib \
+            2>/dev/null | head -1)"
     [ -n "$ORT" ] || die "no onnxruntime in $RL/.venv — the policies cannot load without it."
 
     down
     mkdir -p "$STATE"
 
     build_daemons
+    policies
 
     # Every policy named explicitly: `RELEASE_DIR` is /opt/robot/daemon/current, which exists on a
     # robot and not here, and `PolicyParams::resolved` uses a named path verbatim when it has one.
     cat > "$STATE/robotd.toml" <<TOML
 [policy]
 enabled = true
-walk = "$REPO/policies/alpha_walking.onnx"
-stand = "$REPO/policies/alpha_stand.onnx"
-sitstand = "$REPO/policies/alpha_sitstand.onnx"
-ground_pick = "$REPO/policies/alpha_ground_pick.onnx"
-kick_left = "$REPO/policies/ball_kick_left.onnx"
-kick_right = "$REPO/policies/ball_kick_right.onnx"
-roulade = "$REPO/policies/roulade.onnx"
+walk = "$POLICIES/alpha_walking.onnx"
+stand = "$POLICIES/alpha_stand.onnx"
+sitstand = "$POLICIES/alpha_sitstand.onnx"
+ground_pick = "$POLICIES/alpha_ground_pick.onnx"
+kick_left = "$POLICIES/ball_kick_left.onnx"
+kick_right = "$POLICIES/ball_kick_right.onnx"
+roulade = "$POLICIES/roulade.onnx"
 
 # Singing is opt-in, and a room full of ducks that will not sing together is a poor demonstration
 # of a room full of ducks. On a real robot this is a decision someone makes; here it is the point.
@@ -216,7 +267,7 @@ TOML
     i=0
     while [ "$i" -lt "$DUCKS" ]; do
         name="$(duck_name "$i")"
-        DUCK_RUNTIME_DIR="$STATE" setsid nohup "$REPO/target/debug/tofd" \
+        DUCK_RUNTIME_DIR="$STATE" $SETSID nohup "$REPO/target/debug/tofd" \
             --sim "127.0.0.1:$(duck_port "$i")" --socket "$STATE/$name-tof.sock" \
             > "$STATE/$name-tof.log" 2>&1 &
         echo $! > "$STATE/$name-tof.pid"
@@ -232,7 +283,7 @@ TOML
         # other's beacons and never hear anybody. A container gets this from its own machine-id.
         DUCK_IDENTITY="$name" \
         DUCK_RUNTIME_DIR="$STATE" ORT_DYLIB_PATH="$ORT" RUST_LOG="${RUST_LOG:-info}" \
-            setsid nohup "$REPO/target/debug/robotd" --sim "127.0.0.1:$(duck_port "$i")" \
+            $SETSID nohup "$REPO/target/debug/robotd" --sim "127.0.0.1:$(duck_port "$i")" \
             --params "$STATE/robotd-$name.toml" --socket "$STATE/$name.sock" \
             > "$STATE/$name.log" 2>&1 &
         echo $! > "$STATE/$name.pid"
@@ -254,7 +305,7 @@ TOML
             [ -x "$REPO/target/debug/mediad" ] || (cd "$REPO" && cargo build --quiet -p mediad)
             printf '[media]\nquality = "360p30"\n' > "$STATE/mediad-$name.toml"
             DUCK_RUNTIME_DIR="$STATE" RUST_LOG="${RUST_LOG:-info}" \
-                setsid nohup "$REPO/target/debug/mediad" \
+                $SETSID nohup "$REPO/target/debug/mediad" \
                 --sim-camera "127.0.0.1:$((FRAME_PORT + i))" \
                 --config "$STATE/mediad-$name.toml" \
                 --robot-socket "$STATE/$name.sock" --tof-socket "$STATE/$name-tof.sock" \
@@ -277,7 +328,7 @@ TOML
             i=$((i + 1))
         done
         # shellcheck disable=SC2086
-        setsid nohup "$REPO/target/debug/duck-ether" $args > "$STATE/ether.log" 2>&1 &
+        $SETSID nohup "$REPO/target/debug/duck-ether" $args > "$STATE/ether.log" 2>&1 &
         echo $! > "$STATE/ether.pid"
         say "the ether is open — $DUCKS ducks can hear each other"
     fi
@@ -402,6 +453,15 @@ start_body() {
     # `DUCK_SIM_VIEWER=0` for a window-less run: watching costs frames, and the daemon's loop is
     # wall-clock, so a simulator that cannot keep up is a robot that cannot balance.
     [ "${DUCK_SIM_VIEWER:-1}" = 0 ] && HEADLESS=--headless || HEADLESS=
+    # **The viewer needs `mjpython` on macOS.** MuJoCo's passive viewer has to own the main thread
+    # and the Cocoa event loop, so `launch_passive` refuses under a plain interpreter — the body
+    # server catches that and runs headless, which is a window that never opens and no error to
+    # explain it. `mjpython` is the launcher the wheel ships for exactly this. Linux has no such
+    # rule, and asking for headless has nothing to launch either way.
+    PY_BIN="$RL/.venv/bin/python"
+    if [ -z "$HEADLESS" ] && [ "$(uname -s)" = Darwin ] && [ -x "$RL/.venv/bin/mjpython" ]; then
+        PY_BIN="$RL/.venv/bin/mjpython"
+    fi
     # **Backgrounded directly, and in its own session.** `( cd X && nohup cmd & echo $! )` records
     # the *subshell's* pid, because `A && B & C` parses as `(A && B) & C` — so `down` killed a
     # wrapper and left MuJoCo running as an orphan. `setsid` puts the simulator in its own process
@@ -411,10 +471,19 @@ start_body() {
         */*)  scene_arg="--scene $SCENE" ;;
         *)    scene_arg="--scene $RL/src/mjlab_microduck/robot/microduck/scene_$SCENE.xml" ;;
     esac
+    # **The camera flags go with the cameras.** Rendering is newer than the body server, and a
+    # build without it has no `--cameras`/`--frame-port` — argparse then refuses the whole
+    # invocation over two arguments nobody asked to use, and the duck never starts. Passed only
+    # when a camera was actually requested, so asking for one against such a build still fails,
+    # loudly and about the thing that is missing.
+    cam_args=""
+    if [ -n "$CAMERAS" ]; then
+        cam_args="--cameras $CAMERAS --frame-port $FRAME_PORT"
+    fi
     # shellcheck disable=SC2086
-    setsid nohup "$RL/.venv/bin/python" -m mjlab_microduck.sim.body_server \
+    $SETSID nohup "$PY_BIN" -m mjlab_microduck.sim.body_server \
         --port "$PORT" --ducks "$DUCKS" --keyframe "${DUCK_SIM_KEYFRAME:-SIT}" $HEADLESS $scene_arg \
-        --cameras "$CAMERAS" --frame-port "$FRAME_PORT" \
+        $cam_args \
         > "$STATE/body.log" 2>&1 &
     echo $! > "$STATE/body.pid"
     wait_for_port || die "the simulator did not come up. $STATE/body.log has why."
@@ -491,6 +560,9 @@ Try DUCK_SIM_VIEWER=0, or fewer ducks." ;;
 # Every duck this script could have started, stopped and unmounted. By name from the same list that
 # starts them, so a duck left behind by an interrupted boot is still cleaned up.
 down_containers() {
+    # Called by every `down`, including the plain one. A machine with no systemd has no containers
+    # to stop, and sixteen `sudo systemctl` that cannot resolve would ask for a password first.
+    command -v systemctl >/dev/null 2>&1 || return 0
     i=0
     while [ "$i" -lt 16 ]; do
         name="$(duck_name "$i")"
@@ -521,6 +593,7 @@ duck_port() { echo $((PORT + $1)); }
 PACKAGES=systemd-sysv,dbus,libssl3,ca-certificates,alsa-utils,libasound2-plugins
 
 rootfs() {
+    containers_or_die
     # The list is recorded, so changing it rebuilds rather than silently not taking effect — which is
     # otherwise a round trip spent wondering why a pull changed nothing.
     if [ -d "$ROOTFS" ] && [ "$(cat "$STATE/rootfs.packages" 2>/dev/null)" = "$PACKAGES" ]; then
@@ -641,7 +714,16 @@ stage() {
     ' _ "$ROOTFS" "$REPO" "$ORT" "$PORT"
 }
 
+# `boot`, `shell` and `rootfs` are systemd, and a machine without it cannot run any of them. Said
+# here, before anything reaches for `sudo` — a password prompt followed by `machinectl: command not
+# found` is a worse way to learn it.
+containers_or_die() {
+    command -v systemd-nspawn >/dev/null 2>&1 && return 0
+    die "this needs systemd-nspawn, which is Linux only. \`scripts/duck-sim\` with no argument runs the same body and the same daemons as plain processes."
+}
+
 boot() {
+    containers_or_die
     # Always, not only when the directory is missing: deciding whether the rootfs is still the right
     # one is `rootfs`'s job, and guarding the call on the directory existing is what stopped a
     # changed package list from ever being noticed. It returns in a moment when nothing has changed.
@@ -789,6 +871,7 @@ NEXT
 }
 
 shell() {
+    containers_or_die
     sudo machinectl shell "${1:-$(duck_name 0)}"
 }
 

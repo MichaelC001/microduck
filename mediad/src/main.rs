@@ -162,6 +162,9 @@ struct Args {
     updater_socket: Option<std::path::PathBuf>,
 }
 
+// Gated with the `main` that calls it: off Linux there is no pipeline, so there is nothing to
+// point at a socket and `-D warnings` would call this dead.
+#[cfg(target_os = "linux")]
 impl Args {
     fn sockets(&self) -> mediad::upstream::Sockets {
         let mut s = mediad::upstream::Sockets::default();
