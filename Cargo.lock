@@ -1990,7 +1990,8 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 [[package]]
 name = "hf-robot-account"
 version = "0.1.0"
-source = "git+https://github.com/pollen-robotics/hf-robot-account?rev=48911821948ead9a08548aa65400510194685901#48911821948ead9a08548aa65400510194685901"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e8f937783a058985f73be1663ef122f19682723c7504ff32ea10879c1ce9bef4"
 dependencies = [
  "libc",
  "reqwest",
