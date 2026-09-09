@@ -679,7 +679,7 @@ pub fn start(
     link_tee_branch(&tee, &video_queue).context("could not attach the video branch to the tee")?;
     link_tee_branch(&tee, &raw_queue).context("could not attach the raw branch to the tee")?;
     if let Some(branch) = stream_branch.as_ref() {
-        link_tee_branch(&tee, &branch.valve)
+        link_tee_branch(&tee, branch.head())
             .context("could not attach the H.264 branch to the tee")?;
     }
 
@@ -859,7 +859,8 @@ fn build_stream_branch(
     );
     let _ = fps;
     Ok(StreamBranch {
-        valve: queue,
+        head: queue,
+        valve,
         encoder,
         encoded,
     })
@@ -956,12 +957,25 @@ impl Encoded {
 /// at all, and `pipeline.rs`'s own history with a `videoflip` is why it is not rebuilt.
 #[derive(Clone)]
 pub struct StreamBranch {
+    /// The branch's first element — its `queue`, which is what the tee's request pad links to.
+    ///
+    /// **Separate from the valve, and it cost a panic on the board to learn why.** Both were one
+    /// field called `valve`, holding the queue because that is what has to be linked; `open()`
+    /// then set `drop` on it and glib panicked with `property 'drop' of type 'GstQueue' not
+    /// found`. It killed the task handling the call rather than the daemon, so the symptom was a
+    /// `media.stream` that never answered — silence, from a robot that was otherwise fine.
+    head: gst::Element,
     valve: gst::Element,
     encoder: gst::Element,
     pub encoded: Encoded,
 }
 
 impl StreamBranch {
+    /// What the tee links to: the head of the branch, not the valve behind it.
+    pub fn head(&self) -> &gst::Element {
+        &self.head
+    }
+
     /// Open the valve, and ask for a keyframe so a receiver has something to start on.
     ///
     /// Without the request a receiver waits for the encoder's own keyframe interval before its
@@ -969,12 +983,33 @@ impl StreamBranch {
     /// working. `h264parse config-interval=-1` puts SPS and PPS in front of it, so that keyframe
     /// is enough on its own.
     pub fn open(&self) {
-        self.valve.set_property("drop", false);
+        self.gate(false);
         self.request_keyframe();
     }
 
     pub fn close(&self) {
-        self.valve.set_property("drop", true);
+        self.gate(true);
+    }
+
+    /// Set the valve's `drop`, and **do not panic if it is the wrong element**.
+    ///
+    /// `set_property` panics on a name the element does not have, and this one ran on a tokio
+    /// worker inside the task answering `media.stream` — so the first version of this file killed
+    /// that task and the call simply never came back. A robot that is otherwise healthy, silent
+    /// on one method, is a much worse failure than a refusal. The element is right now; the guard
+    /// is for the next time somebody moves a field.
+    fn gate(&self, drop: bool) {
+        if self
+            .valve
+            .has_property_with_type("drop", bool::static_type())
+        {
+            self.valve.set_property("drop", drop);
+        } else {
+            tracing::error!(
+                element = %self.valve.factory().map(|f| f.name().to_string()).unwrap_or_default(),
+                "the frame stream's valve has no `drop` property, so it cannot be gated"
+            );
+        }
     }
 
     /// Ask the encoder for a keyframe now.
