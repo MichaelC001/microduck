@@ -271,6 +271,17 @@ refused with that list.
 Lines go to stdout and everything else to stderr, so `logs robotd -n 200 | grep -i panic` works.
 A long tail is trimmed to what the radio can carry, oldest lines first, with a note saying so.
 
+A tail that spans a restart says where:
+
+```
+2026-09-09T12:27:20+00:00 systemd[1]: Starting robotd.service - Robot control daemon...
+-- new robotd process, pid 3227 --
+2026-09-09T12:27:21+00:00 robotd[3227]: control loop running joints=15 hz=50.0 driving=true
+```
+
+Which matters after an update, when forty lines carry two different builds' output. Anything in
+`-- … --` comes from the robot rather than the journal.
+
 There is no `-f`, no `--since` and no search. For those, ssh in:
 
 ```bash

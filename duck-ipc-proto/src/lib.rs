@@ -3849,6 +3849,12 @@ pub struct LogsResult {
     /// The unit as systemd names it, so a caller that typed `robotd` sees what it actually read.
     pub unit: String,
     /// Oldest first, the way a journal reads. No trailing newlines.
+    ///
+    /// **A line in `-- … --` is the robot's, not the journal's.** `journalctl` uses that shape
+    /// for what it inserts rather than recorded (`-- Reboot --`, `-- No entries --`) and this
+    /// borrows it for the one thing a tail cannot otherwise show: `-- new robotd process, pid
+    /// 3227 --`, where the daemon restarted. A tail spanning an update carries two different
+    /// builds' output, and nothing in the lines themselves says where one ends.
     pub lines: Vec<String>,
     /// Lines were dropped from the front to fit [`MAX_LOG_BYTES`]. Not an error — it is what
     /// asking for more than the radio can carry looks like, and a caller can say so.

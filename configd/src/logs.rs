@@ -145,6 +145,23 @@ pub async fn read(
     ))
 }
 
+/// The pid a line was written by, if the line is the daemon's own.
+///
+/// `short-iso` puts the writer in the second field, as `robotd[3227]:` — or as `systemd[1]:` for
+/// the lines systemd writes *about* the unit, which `journalctl -u` returns alongside it. Those
+/// are the reason this checks the identifier: `Stopping`, `Stopped` and `Started` all come from
+/// pid 1, so a bare "the pid changed" would announce a new process three times per restart and
+/// name the wrong one.
+#[cfg(any(target_os = "linux", test))]
+fn pid_of(line: &str, service: &str) -> Option<u32> {
+    let field = line.split_whitespace().nth(1)?.strip_suffix(':')?;
+    let (identifier, pid) = field.strip_suffix(']')?.split_once('[')?;
+    if identifier != service {
+        return None;
+    }
+    pid.parse().ok()
+}
+
 /// Turn `journalctl`'s output into a reply that fits the wire.
 ///
 /// Split out from [`read`] so the trimming is testable without a journal, which is the half with
@@ -153,12 +170,27 @@ pub async fn read(
 /// escaping is what makes an estimate wrong.
 #[cfg(any(target_os = "linux", test))]
 fn assemble(unit: &'static str, stdout: &str) -> proto::LogsResult {
-    let mut lines: Vec<String> = stdout
-        .lines()
-        .map(str::trim_end)
-        .filter(|line| !line.is_empty())
-        .map(truncate_line)
-        .collect();
+    let service = crate::units::service_of(unit);
+    let mut lines: Vec<String> = Vec::new();
+    let mut writer: Option<u32> = None;
+
+    for line in stdout.lines().map(str::trim_end).filter(|l| !l.is_empty()) {
+        if let Some(pid) = pid_of(line, service) {
+            // The tail a person reads spans restarts without saying so: a release is installed,
+            // every daemon restarts, and forty lines carry two different builds with nothing
+            // between them. systemd's own `Started …` line is in there, but it is one line among
+            // forty identical warnings and it reads as just another one.
+            //
+            // `-- … --` is `journalctl`'s own shape for a line it inserted rather than recorded
+            // (`-- Reboot --`, `-- No entries --`), so it is the form a reader already knows not
+            // to attribute to the daemon.
+            if writer.is_some_and(|previous| previous != pid) {
+                lines.push(format!("-- new {service} process, pid {pid} --"));
+            }
+            writer = Some(pid);
+        }
+        lines.push(truncate_line(line));
+    }
 
     let mut truncated = false;
     while serde_json::to_string(&lines).map_or(0, |json| json.len()) > proto::MAX_LOG_BYTES
@@ -243,6 +275,90 @@ mod tests {
         let result = assemble("robotd.service", "one\ntwo\n\nthree\n");
         assert_eq!(result.lines, ["one", "two", "three"]);
         assert!(!result.truncated);
+    }
+
+    /// A tail that spans a restart says so, once, naming the process that took over.
+    #[test]
+    fn a_restart_is_marked_where_it_happened() {
+        let stdout = "\
+2026-09-09T12:27:19+00:00 robotd[965]: old build, still running
+2026-09-09T12:27:20+00:00 systemd[1]: Stopping robotd.service - Robot control daemon...
+2026-09-09T12:27:20+00:00 systemd[1]: Stopped robotd.service - Robot control daemon.
+2026-09-09T12:27:20+00:00 systemd[1]: Starting robotd.service - Robot control daemon...
+2026-09-09T12:27:21+00:00 robotd[3227]: control loop running
+2026-09-09T12:27:24+00:00 robotd[3227]: bus read failed
+";
+        let lines = assemble("robotd.service", stdout).lines;
+
+        // systemd's three lines come from pid 1 and must not each announce a new process.
+        assert_eq!(
+            lines.iter().filter(|l| l.starts_with("-- ")).count(),
+            1,
+            "{lines:#?}"
+        );
+        // Immediately before the first line of the new process, not where systemd spoke.
+        let at = lines
+            .iter()
+            .position(|l| l.starts_with("-- "))
+            .expect("a marker");
+        assert_eq!(lines[at], "-- new robotd process, pid 3227 --");
+        assert!(lines[at + 1].contains("control loop running"), "{lines:#?}");
+        assert!(
+            lines[at - 1].contains("Starting robotd.service"),
+            "{lines:#?}"
+        );
+    }
+
+    /// One process for the whole tail is the ordinary case, and it gets no marker at all —
+    /// including for the very first line, whose pid this has nothing to compare against.
+    #[test]
+    fn one_process_is_not_marked() {
+        let stdout = "\
+2026-09-09T12:27:21+00:00 robotd[3227]: control loop running
+2026-09-09T12:27:24+00:00 robotd[3227]: bus read failed
+";
+        let lines = assemble("robotd.service", stdout).lines;
+        assert_eq!(lines.len(), 2, "{lines:#?}");
+        assert!(!lines.iter().any(|l| l.starts_with("-- ")), "{lines:#?}");
+    }
+
+    /// A daemon that has restarted twice in one tail is marked twice.
+    #[test]
+    fn every_restart_in_the_tail_is_marked() {
+        let stdout = "\
+2026-09-09T12:00:00+00:00 btd[1]: first
+2026-09-09T12:00:01+00:00 btd[2]: second
+2026-09-09T12:00:02+00:00 btd[3]: third
+";
+        let lines = assemble("btd.service", stdout).lines;
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|l| l.starts_with("-- new btd process"))
+                .count(),
+            2,
+            "{lines:#?}"
+        );
+    }
+
+    /// The unit's *own* lines are what carry the pid. A line from anything else — systemd, or a
+    /// child process logging under its own name — cannot start a marker or the tail would be full
+    /// of them.
+    #[test]
+    fn only_the_daemons_own_lines_carry_a_pid() {
+        assert_eq!(
+            pid_of("2026-09-09T12:27:21+00:00 robotd[3227]: hello", "robotd"),
+            Some(3227)
+        );
+        for line in [
+            "2026-09-09T12:27:20+00:00 systemd[1]: Started robotd.service.",
+            "2026-09-09T12:27:20+00:00 setsid[4010]: a child of the daemon",
+            "2026-09-09T12:27:20+00:00 robotd: an identifier with no pid",
+            "not a journal line at all",
+            "",
+        ] {
+            assert_eq!(pid_of(line, "robotd"), None, "{line}");
+        }
     }
 
     /// Over budget, the *newest* lines survive — the ones somebody asked for.
