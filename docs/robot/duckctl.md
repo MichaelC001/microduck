@@ -248,6 +248,50 @@ duckctl --name <robot-name> version
 The API version, the release, and the git revision it was built from. A `revision` of `null` means
 the release was built on somebody's laptop rather than by CI.
 
+## Logs
+
+```bash
+duckctl --name <robot-name> logs robotd
+```
+
+The last 40 lines of that daemon's journal, this boot. For more, and for the boot before this one:
+
+```bash
+duckctl --name <robot-name> logs robotd -n 200
+```
+
+```bash
+duckctl --name <robot-name> logs btd --boot -1
+```
+
+Readable units: `updaterd`, `robotd`, `configd`, `btd`, `padd`, `mediad`, `tofd`, plus
+`bluetooth` and `NetworkManager`. The `.service` suffix is optional, and anything else comes back
+refused with that list.
+
+Lines go to stdout and everything else to stderr, so `logs robotd -n 200 | grep -i panic` works.
+A long tail is trimmed to what the radio can carry, oldest lines first, with a note saying so.
+
+A tail that spans a restart says where:
+
+```
+2026-09-09T12:27:20+00:00 systemd[1]: Starting robotd.service - Robot control daemon...
+-- new robotd process, pid 3227 --
+2026-09-09T12:27:21+00:00 robotd[3227]: control loop running joints=15 hz=50.0 driving=true
+```
+
+Which matters after an update, when forty lines carry two different builds' output. Anything in
+`-- … --` comes from the robot rather than the journal.
+
+There is no `-f`, no `--since` and no search. For those, ssh in:
+
+```bash
+ssh radxa@$(duckctl --name <robot-name> ip)
+```
+
+```bash
+journalctl -u robotd -f
+```
+
 ## Updates
 
 Same words as `robotctl update`, so a command learned on the robot works here. Every one of them
@@ -549,7 +593,8 @@ minutes with nothing arriving at all — which is why they are the way to run an
 ## What it prints
 
 Replies go to stdout as pretty JSON, and everything else — progress, diagnosis, what the radio
-saw — to stderr. So `duckctl ... info > reply.json` keeps the two apart, and a JSON-RPC error
+saw — to stderr. `logs` is the exception and prints its lines as lines, since a journal tail in
+escaped JSON is unreadable; a refusal from it still prints as JSON. So `duckctl ... info > reply.json` keeps the two apart, and a JSON-RPC error
 from the robot still exits non-zero. Progress lines start with `·` and are one line each, so
 `update apply > outcome.json` leaves them on screen and keeps the outcome in the file.
 

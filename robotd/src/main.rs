@@ -67,6 +67,22 @@ const MAX_LINE: usize = 64 * 1024;
 /// journal size cap it is what *evicts* the logs support needs.
 const LOOP_SUMMARY_INTERVAL: Duration = Duration::from_secs(300);
 
+/// How often an *isolated* dropped bus transaction is worth a line.
+///
+/// One drop is ordinary on a serial bus and a run of them is a fault, so the loop logs the first
+/// of a run and every tenth after it. That rule reads `consecutive_errors`, which resets on the
+/// next good read — so it never fired on the case a board actually produces: one drop, one good
+/// read, one drop, at about a hertz, forever `consecutive=1`. Every one of them was logged.
+///
+/// Which is the failure [`LOOP_SUMMARY_INTERVAL`] exists to prevent, arriving by another door: a
+/// journal under a size cap, filled with the most ordinary event the robot has, evicting the
+/// history somebody will need — and, since `duckctl logs` reads that journal over a radio, forty
+/// lines of it saying nothing else.
+///
+/// So an isolated drop gets one line a minute, carrying how many it stands for. A *run* is not
+/// rate-limited: that is the spasm, and it stays as loud as it was.
+const BUS_DROP_QUIET: Duration = Duration::from_secs(60);
+
 /// How fast the beak follows the vowel being sung, as a time constant.
 ///
 /// A vowel is a step — `ah` opens the mouth to 0.90 and `mm` to 0.02 — and a servo asked to jump
@@ -1753,6 +1769,11 @@ async fn control_loop<T: RobotIo>(
     let mut window_start = Instant::now();
     let mut window_ticks = 0u64;
     let mut last_summary = Instant::now();
+    // Dropped bus reads: when one was last reported, how many have gone unreported since, and how
+    // many happened in this summary window. See [`BUS_DROP_QUIET`].
+    let mut last_bus_drop: Option<Instant> = None;
+    let mut bus_drops_quiet = 0u32;
+    let mut bus_drops_window = 0u32;
     let mut was_driving = false;
     let mut bringup = Bringup::Limp;
     // A mode switch in flight: the mode to end up in, once the robot is home. `None` the rest of
@@ -1911,11 +1932,28 @@ async fn control_loop<T: RobotIo>(
             }
             Err(e) => {
                 let n = state.consecutive_errors.fetch_add(1, Ordering::Relaxed) + 1;
-                // One dropped transaction is ordinary on a serial bus; a run of them is not.
-                // Log the first and then every tenth, so a persistent fault is visible
-                // without a wall of identical lines.
-                if n == 1 || n.is_multiple_of(10) {
-                    tracing::warn!(error = %e, consecutive = n, "bus read failed");
+                bus_drops_window += 1;
+
+                // A run of them is a fault, and stays as loud as it was: every tenth, at once.
+                // An isolated drop is ordinary, and `consecutive` resets on the next good read —
+                // so `n == 1` was true of every drop on a bus that recovers each time, and
+                // logging on it filled the journal. One line per [`BUS_DROP_QUIET`], saying how
+                // many it stands for.
+                let a_run = n.is_multiple_of(10);
+                let due = last_bus_drop.is_none_or(|at| at.elapsed() >= BUS_DROP_QUIET);
+                if a_run || due {
+                    tracing::warn!(
+                        error = %e,
+                        consecutive = n,
+                        // Zero on a run, and on the first drop after a quiet spell. Non-zero is
+                        // the rate: that many more happened and were not worth their own lines.
+                        also = bus_drops_quiet,
+                        "bus read failed"
+                    );
+                    last_bus_drop = Some(Instant::now());
+                    bus_drops_quiet = 0;
+                } else {
+                    bus_drops_quiet += 1;
                 }
                 None
             }
@@ -3053,6 +3091,9 @@ async fn control_loop<T: RobotIo>(
                     total = ticks,
                     hz = format!("{hz:.1}"),
                     missed = state.missed.load(Ordering::Relaxed),
+                    // Every dropped bus read in this window, reported or suppressed. The warnings
+                    // above are rate-limited, so this is where the true rate lives.
+                    bus_drops = bus_drops_window,
                     driving,
                     fallen = safety.fallen(),
                     battery_v = format!(
@@ -3070,6 +3111,7 @@ async fn control_loop<T: RobotIo>(
                     "control loop"
                 );
                 last_summary = Instant::now();
+                bus_drops_window = 0;
             }
         }
     }
