@@ -314,7 +314,7 @@ impl Imu {
         let rotation = matrix(self.q);
 
         // World → screen: yaw the camera for a three-quarter view, then look down at it. The
-        // result is in body millimetres until it is fitted below.
+        // result is in body millimetres until it is scaled below.
         let (az_sin, az_cos) = CAMERA_AZIMUTH.sin_cos();
         let (el_sin, el_cos) = CAMERA_ELEVATION.sin_cos();
         let project = |p: [f32; 3]| -> (f32, f32) {
@@ -325,32 +325,27 @@ impl Imu {
             (x, -up)
         };
 
-        // Fit the whole pad, whatever its attitude, into the canvas with a pixel of margin. Fitted
-        // per frame rather than to a fixed extent: a pad on its edge is tall and thin, a pad flat
-        // is wide and short, and a fixed scale that framed both would draw each at half size.
-        // The pad's own centre stays put, so tilting reads as tilting and not as sliding.
-        let ends: Vec<((f32, f32), (f32, f32))> = PAD_WIREFRAME
+        // One zoom for every attitude: the pad's bounding sphere is what has to fit, so a pad on
+        // its edge and a pad lying flat are drawn at the same scale and tilting reads as tilting,
+        // not as the picture breathing. The body origin sits at the canvas centre. Framed at 80% of
+        // the sphere rather than all of it: only a grip tip pointing straight at the camera's edge
+        // ever reaches the last 20%, and framing for that moment shrinks every other one.
+        let radius = PAD_WIREFRAME
             .iter()
-            .map(|s| (project(s.from), project(s.to)))
-            .collect();
-        let (mut min_x, mut max_x, mut min_y, mut max_y) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
-        for (a, b) in &ends {
-            for p in [a, b] {
-                min_x = min_x.min(p.0);
-                max_x = max_x.max(p.0);
-                min_y = min_y.min(p.1);
-                max_y = max_y.max(p.1);
-            }
-        }
-        let extent_x = (max_x - min_x).max(1.0);
-        let extent_y = (max_y - min_y).max(1.0);
-        let scale = ((w as f32 - 2.0) / extent_x).min((h as f32 - 2.0) / extent_y);
+            .flat_map(|s| [s.from, s.to])
+            .map(norm)
+            .fold(1.0f32, f32::max)
+            * 0.8;
+        let scale = ((w as f32 - 2.0) / (2.0 * radius)).min((h as f32 - 2.0) / (2.0 * radius));
         let (cx, cy) = (w as f32 / 2.0, h as f32 / 2.0);
-        let (mid_x, mid_y) = ((min_x + max_x) / 2.0, (min_y + max_y) / 2.0);
-        let place = |p: (f32, f32)| ((p.0 - mid_x) * scale + cx, (p.1 - mid_y) * scale + cy);
+        let place = |p: (f32, f32)| (p.0 * scale + cx, p.1 * scale + cy);
 
-        for (segment, (a, b)) in PAD_WIREFRAME.iter().zip(ends) {
-            canvas.line(place(a), place(b), segment.colour());
+        for segment in PAD_WIREFRAME {
+            canvas.line(
+                place(project(segment.from)),
+                place(project(segment.to)),
+                segment.colour(),
+            );
         }
         canvas.blit(area, buf);
     }
@@ -761,7 +756,7 @@ mod tests {
         steady(&mut level, 0.1, [0.0, 0.0, 1.0], [0.0; 3]);
         let flat = picture(&level);
         let inked = flat.iter().flat_map(|r| r.chars()).filter(|c| *c != ' ').count();
-        assert!(inked > 60, "a wireframe is more than a few pixels: {inked}");
+        assert!(inked > 30, "a wireframe is more than a few pixels: {inked}");
 
         let mut rolled = Imu::new(a_device());
         steady(&mut rolled, 0.1, [0.0, 0.7, 0.7], [0.0; 3]);
