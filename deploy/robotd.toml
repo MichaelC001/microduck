@@ -292,8 +292,16 @@ mode = "walk"
 # The ToF theremin: a hand's distance in front of the beak becomes a note, and the mouth
 # opens with the pitch. Picked up with `robotctl theremin` (or `robot.theremin`) — this
 # switch is only whether it *can* be, so a duck with a known-bad ToF can refuse outright.
+#
+# **Off by default.** It is a party trick, and a duck nobody asked to play one has no
+# business holding a subscription to the depth stream; `robotctl theremin` on a duck that has
+# not opted in says so and names this key. Turning it on does not start anything by itself.
+#
+# Nothing else changes with it: `tofd` runs and polls the sensor either way, so
+# `robotctl monitor`'s ToF grid works the same whichever way this is set.
+#
 # Needs [audio] on: a theremin with no voice is a mouth opening for no reason.
-# enabled = true
+# enabled = false
 
 # tofd's depth stream.
 # socket = "/run/tofd/tof.sock"
