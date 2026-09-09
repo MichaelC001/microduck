@@ -90,7 +90,11 @@ this is relative motion and it drifts; it answers "did it walk in a circle" and 
 angles between degrees and radians; `t` opens the [ToF matrix](#the-tof-sensor-tofd); `d` toggles
 the robot view and `[` / `]` orbit it; `p` opens the pad's raw input stream — every evdev report
 from the gamepad, with the gaps between them, which is the only place a stalled radio is visible
-([pair a gamepad](pair-a-gamepad.md#when-it-drops-while-you-are-driving)). Angles are degrees on screen — joints, head and the yaw rate.
+([pair a gamepad](pair-a-gamepad.md#when-it-drops-while-you-are-driving)). A pad with an inertial
+unit — the Pro Controller clones have one, the Xbox does not — grows that block by a panel: a
+wireframe pad that tilts and turns with the one in your hands, its pitch, roll and drifting yaw,
+the raw acceleration and rates, and whether the gyro's rest bias has been learned yet (hold it
+still half a second). The yellow bar is the pad's front edge. Angles are degrees on screen — joints, head and the yaw rate.
 Redirected or piped it prints one line per tick instead, so `> run.log` and `| grep FALLEN`
 behave, and those numbers stay radians whatever the screen is set to. The joint vectors are in
 `--json`, which carries the whole state, one object per line:

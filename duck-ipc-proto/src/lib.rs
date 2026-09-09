@@ -315,7 +315,18 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// An older `configd` answers [`code::METHOD_NOT_FOUND`] naming the method, which is the designed
 /// skew and not a handshake refusal: a new `duckctl` against a robot on an older release reports
 /// that the robot is too old rather than failing obscurely.
-pub const API_VERSION: u32 = 26;
+///
+/// # v27 — the pad's IMU, on the pad tap
+///
+/// Three more [`PadReport`] variants: a pad's inertial unit as a second evdev node beside the one
+/// that drives, its samples, and its going away. The "Pro Controller" Switch clones ship a
+/// six-axis IMU and the kernel's `hid-nintendo` exposes it as a separate accelerometer device
+/// under the same HID parent; an Xbox pad has none and a subscriber never sees the variants.
+///
+/// A new variant on a tagged enum is what a robotctl built before it cannot decode, which is the
+/// one reason this is a bump rather than a note: the tap is still `padd`'s own socket, and every
+/// other client is untouched.
+pub const API_VERSION: u32 = 27;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -4134,6 +4145,66 @@ pub enum PadReport {
         /// usually an errno the operator wants verbatim.
         why: String,
     },
+    /// The pad has an inertial unit and its node is open. Sent on subscribing if one is already
+    /// being read, and again each time one appears — the same one code path as `Attached`.
+    ///
+    /// Independent of `Attached`: the IMU is a second evdev device with a life of its own, and a
+    /// pad without one simply never sends this. Everything in a [`PadImuSample`] is read against
+    /// the device here.
+    ImuAttached { device: Box<PadImuDevice> },
+    /// One inertial sample, as the kernel framed it.
+    Imu(PadImuSample),
+    /// The IMU node closed.
+    ImuDetached { why: String },
+}
+
+/// A pad's inertial unit, as the kernel describes it.
+///
+/// One device rather than six axes in [`PadInputDevice::axes`], because the kernel keeps them
+/// apart: an accelerometer node carries `INPUT_PROP_ACCELEROMETER` and its `ABS_X..Z` are metres
+/// per second squared, not a stick. Reading them as a stick is what gilrs would do, which is why
+/// `padd` drives from the other node and this one is only ever tapped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PadImuDevice {
+    /// As the kernel names it: "Nintendo Switch Pro Controller IMU".
+    pub name: String,
+    /// The event node being read.
+    pub node: String,
+    /// Raw units per **g** on the accelerometer axes, from the driver's `resolution`. 4096 on
+    /// `hid-nintendo`. Zero when the driver did not say, in which case the raw numbers are all a
+    /// reader has.
+    pub accel_per_g: i32,
+    /// Raw units per **degree per second** on the gyro axes. 14247 on `hid-nintendo`.
+    pub gyro_per_dps: i32,
+    /// The accelerometer's full scale, raw units, so a reader can tell a clipped sample.
+    pub accel_max: i32,
+    /// The gyro's full scale, raw units.
+    pub gyro_max: i32,
+}
+
+/// One inertial sample: everything the IMU node delivered between two `SYN_REPORT`s.
+///
+/// Raw kernel units, deliberately — the tap hands out what the device said and the resolution to
+/// read it with, and the conversion happens once, in the viewer. Six integers rather than a
+/// `PadFrame`'s event list because this arrives at several hundred a second and every byte is
+/// paid for on the board's CPU.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PadImuSample {
+    /// Samples since this IMU attached, counted by `padd`. A hole is [`Self::socket_dropped`].
+    pub seq: u64,
+    /// The kernel's timestamp, microseconds since the epoch — the same clock and the same
+    /// caveats as [`PadFrame::at_us`].
+    pub at_us: u64,
+    /// `ABS_X`, `ABS_Y`, `ABS_Z`: acceleration, including gravity. At rest on a table the axis
+    /// pointing up reads about `+accel_per_g`.
+    pub accel: [i32; 3],
+    /// `ABS_RX`, `ABS_RY`, `ABS_RZ`: angular rate about the same three axes.
+    pub gyro: [i32; 3],
+    /// Samples this subscriber missed because its own socket was behind, since the last one it
+    /// did receive. Counted apart from [`PadFrame::socket_dropped`]: a dropped IMU sample says
+    /// nothing about the stick reports.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub socket_dropped: u64,
 }
 
 /// One report from the pad: everything the kernel delivered between two `SYN_REPORT`s.
