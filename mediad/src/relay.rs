@@ -92,8 +92,9 @@ pub const DEFAULT_RENDEZVOUS: &str = "https://pollen-robotics-reachy-mini-centra
 
 /// Where `updaterd` keeps the account credential.
 ///
-/// **A cross-daemon file format, and `updaterd` owns it.** `updater::account::Store` writes it and
-/// a test there pins the one key this reads, because the writer is what can break the contract.
+/// **A cross-daemon file format, and `hf_robot_account` owns it.** `updaterd` performs the login
+/// and that crate writes the file; a test there pins the one key `read_access_token` takes out of
+/// it, because the writer is what can break the contract.
 /// Read on every connect attempt rather than cached: a login that happens while this task is
 /// waiting has to take effect without a restart, and re-reading a small file on a path that
 /// already sleeps for thirty seconds costs nothing.
@@ -531,10 +532,12 @@ impl Relay {
         }
     }
 
-    /// The access token, or `None` when this robot belongs to nobody. [`crate::hf`] owns the
-    /// reading of it, because the TURN credentials need the same token.
+    /// The access token, or `None` when this robot belongs to nobody.
+    ///
+    /// `hf_robot_account` owns the reading of it: it is the crate that writes the file, and the
+    /// TURN credentials need the same token out of the same place.
     fn token(&self) -> Option<String> {
-        crate::hf::access_token(&self.token_path)
+        hf_robot_account::read_access_token(&self.token_path)
     }
 
     /// One connection: open the stream, register, then hold the lease until something breaks.

@@ -474,12 +474,18 @@ fn main() -> ExitCode {
         // *after* the pipeline is up, because which sensor mode is in force is only known once
         // something tried to set it — and a mode nobody knows the field of view of publishes
         // nothing rather than a plausible wrong number. `mediad::camera` has the arithmetic.
-        let intrinsics = mediad::camera::Intrinsics::published(
-            media.intrinsics.as_ref(),
-            mediad::pipeline::sensor_mode(),
-            media.quality.width(),
-            media.quality.height(),
-        );
+        let intrinsics = if args.sim_camera.is_some() {
+            // The MuJoCo twin renders a known field of view, so publish its exact geometry — twin
+            // recordings then self-describe (no `--calib` needed on the duckslam side).
+            mediad::camera::Intrinsics::sim(media.quality.width(), media.quality.height())
+        } else {
+            mediad::camera::Intrinsics::published(
+                media.intrinsics.as_ref(),
+                mediad::pipeline::sensor_mode(),
+                media.quality.width(),
+                media.quality.height(),
+            )
+        };
         match &intrinsics {
             Some(geometry) => tracing::info!(
                 fx = geometry.fx,

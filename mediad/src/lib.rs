@@ -22,7 +22,6 @@
 pub mod camera;
 pub mod config;
 /// The account credential `updaterd` writes, read by the two things here that need it.
-pub mod hf;
 pub mod producer;
 /// The outward connection to the rendezvous service — what makes a duck reachable from off its
 /// own LAN. `docs/design/remote-access-design.md` §3.

@@ -20,6 +20,11 @@
 //! module the robot uses, so if the framing were asymmetric this would not work — which makes
 //! it a real test of the protocol rather than a reimplementation that could agree with itself.
 //!
+//! The one thing that *is* asymmetric is how long a line may be, and it has to be: the robot's cap
+//! bounds what an unpaired peer in radio range can make it buffer, and this end has no such peer.
+//! Sharing the tight one made every reply over 8 KiB unreadable here while `btd` served it
+//! correctly — see `framing::MAX_REPLY_LINE`.
+//!
 //! ```text
 //! cargo run -p duckctl -- scan          # robots in range, and their addresses
 //! cargo run -p duckctl -- status
@@ -27,6 +32,7 @@
 //! cargo run -p duckctl -- wifi connect "Pollen" --psk secret
 //! cargo run -p duckctl -- name "Ducky"
 //! cargo run -p duckctl -- call robot.health
+//! cargo run -p duckctl -- logs robotd -n 100
 //! ```
 //!
 //! `DUCK_ROBOT` and `DUCK_PIN` in the environment are the defaults for `--name` and `--pin`, for
@@ -811,6 +817,38 @@ enum Command {
         #[arg(long, default_value_t = 8080)]
         port: u16,
     },
+    /// The tail of one daemon's journal.
+    ///
+    /// `duckctl logs robotd` after a robot has misbehaved, which is the question `journalctl`
+    /// answers on the robot and nothing answered from here. Reachable with no network at all, so
+    /// it works on the robot whose wifi never came up — the one whose logs are hardest to get.
+    ///
+    /// `duckctl call system.services` names the units, and an unknown name is refused with the
+    /// real list. `bluetooth` and `NetworkManager` are readable too: they are what is broken when
+    /// the robot cannot be reached at all.
+    ///
+    /// Not a `journalctl` command line, and it never will be: this is served over a radio anyone
+    /// in range can talk to, so the robot picks the unit from a fixed list. For searching, take
+    /// the `ip` and use ssh.
+    Logs {
+        /// `robotd`, `btd`, `configd`, `updaterd`, `padd`, `mediad`, `tofd`, `bluetooth` or
+        /// `NetworkManager`. The `.service` suffix is optional.
+        #[arg(value_name = "SERVICE")]
+        service: String,
+        /// How many lines from the end.
+        ///
+        /// The default is what a BLE link carries in a couple of seconds. More is allowed and
+        /// costs proportionally — the robot trims the oldest lines to fit what the radio can
+        /// carry, and says so when it did.
+        #[arg(long, short = 'n', default_value_t = 40)]
+        lines: usize,
+        /// Which boot: `0` is this one, `-1` the one before it.
+        ///
+        /// `--boot -1` is "what did it say before it restarted", which is the reason the journal
+        /// is configured to survive a reboot at all (`deploy/journald.conf.d`).
+        #[arg(long, short = 'b', default_value_t = 0, allow_hyphen_values = true)]
+        boot: i32,
+    },
     /// Version handshake plus update status.
     Status,
     /// What the robot is running: the API version, the release, and the revision it was built from.
@@ -1471,7 +1509,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
     }
 
-    let mut reassembler = Reassembler::new();
+    // `for_replies`, not `new`: this is the client end, and the robot's answers are bounded by
+    // `MAX_REPLY_LINE` rather than by the tighter cap that limits what a radio peer may send. A
+    // `logs` tail is the reply that outgrew the other one.
+    let mut reassembler = Reassembler::for_replies();
     // The deadline is **idle**, not total: it is pushed back by every notification that arrives,
     // because a robot sending progress is a robot that is working. See `REPLY_TIMEOUT`.
     let mut deadline = tokio::time::Instant::now() + timeout;
@@ -1522,6 +1563,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 };
             }
 
+            // `logs` asked for text, so it prints text. A journal tail rendered as a JSON array
+            // of escaped strings is the one reply nobody can read, and reading it is the whole
+            // point of the command. A refusal still prints as JSON below, because the refusal
+            // names the units it would have accepted and that is worth seeing whole.
+            if let Command::Logs { service, boot, .. } = &cli.command
+                && value.get("error").is_none()
+            {
+                let _ = peripheral.disconnect().await;
+                return print_journal(&value["result"], service, *boot);
+            }
+
             println!("{}", serde_json::to_string_pretty(&value)?);
             let _ = peripheral.disconnect().await;
             // A JSON-RPC error is the robot answering, not this tool failing — so it is
@@ -1544,6 +1596,49 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             };
         }
     }
+}
+
+/// Print a journal tail: the lines on stdout, everything about them on stderr.
+///
+/// The split is what makes `duckctl logs robotd | grep panic` work — a truncation note or an
+/// empty-tail explanation in that pipe would be a line the robot never logged.
+fn print_journal(
+    result: &serde_json::Value,
+    service: &str,
+    boot: i32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let unit = result["unit"].as_str().unwrap_or(service);
+    let Some(lines) = result["lines"].as_array() else {
+        // A well-formed answer in a shape this build does not know. Printed rather than
+        // paraphrased, because the reply itself is the only evidence of what happened.
+        return Err(format!(
+            "the robot answered system.logs with no `lines`, which this version of duckctl              cannot read:\n{}",
+            serde_json::to_string_pretty(result)?
+        )
+        .into());
+    };
+
+    for line in lines {
+        match line.as_str() {
+            Some(text) => println!("{text}"),
+            None => println!("{line}"),
+        }
+    }
+
+    if lines.is_empty() {
+        // Not an error: a daemon that has not run this boot is a real answer, and it is a
+        // different one from a daemon that is running and silent. `system.services` tells them
+        // apart, so that is where this points.
+        eprintln!(
+            "no lines for {unit} in boot {boot} — it may not have run then. `duckctl call              system.services` says whether it is running now."
+        );
+    }
+    if result["truncated"] == serde_json::Value::Bool(true) {
+        eprintln!(
+            "note: older lines were dropped to fit what BLE can carry. Ask for fewer with              `-n`, or read the whole journal over ssh — `duckctl ip` has the address."
+        );
+    }
+    Ok(())
 }
 
 /// How a wait for the next notification ended.
@@ -1665,7 +1760,7 @@ async fn read_line(
     notifications: &mut (impl futures::Stream<Item = btleplug::api::ValueNotification> + Unpin),
     timeout: Duration,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let mut reassembler = Reassembler::new();
+    let mut reassembler = Reassembler::for_replies();
     let deadline = tokio::time::Instant::now() + timeout;
 
     loop {
@@ -1782,6 +1877,18 @@ fn request_line(command: &Command) -> Result<(String, Duration), Box<dyn std::er
         ),
         Command::Update(update) => return update_request_line(update),
         Command::Info => ("system.info", serde_json::json!({}), REPLY_TIMEOUT),
+        // A journal read is a `journalctl` spawn on the robot plus a reply several times larger
+        // than any other, chunked at 20 bytes a notification — seconds rather than milliseconds,
+        // so it gets the slow budget for the same reason `wifi scan` does.
+        Command::Logs {
+            service,
+            lines,
+            boot,
+        } => (
+            proto::method::SYSTEM_LOGS,
+            serde_json::json!({ "unit": service, "lines": lines, "boot": boot }),
+            SLOW_REPLY_TIMEOUT,
+        ),
         Command::Health => ("robot.health", serde_json::json!({}), REPLY_TIMEOUT),
         Command::Name { name } => (
             "system.setName",
@@ -2722,6 +2829,48 @@ mod tests {
         assert!(answers_to("duck [1]", "duck [1]"));
         assert!(!answers_to("[duck-c51b]", "duck-c51b"));
         assert!(!answers_to("duck-c51b [", "duck-c51b"));
+    }
+
+    /// A negative boot offset is an argument, not a mistyped flag.
+    ///
+    /// `--boot -1` is the whole reason this command is worth having — "what did it say before it
+    /// restarted" — and clap rejects a value starting with `-` unless the argument says
+    /// otherwise. Pinned because the failure is at parse time, on the one invocation nobody
+    /// reaches for until something is already wrong.
+    #[test]
+    fn the_boot_before_this_one_can_be_asked_for() {
+        let wire = |args: &[&str]| {
+            let cli = Cli::try_parse_from([&["duckctl"], args].concat()).expect("parses");
+            request_line(&cli.command).expect("a request").0
+        };
+
+        let previous = wire(&["logs", "btd", "--boot", "-1"]);
+        assert!(
+            previous.contains(duck_ipc_proto::method::SYSTEM_LOGS),
+            "{previous}"
+        );
+        assert!(previous.contains(r#""boot":-1"#), "{previous}");
+
+        let default = wire(&["logs", "btd"]);
+        assert!(default.contains(r#""boot":0"#), "{default}");
+        assert!(default.contains(r#""lines":40"#), "{default}");
+        // The unit goes over verbatim, suffix and all: the robot resolves it against its own
+        // list, so this tool has no list to keep in step.
+        assert!(
+            wire(&["logs", "NetworkManager.service"])
+                .contains(r#""unit":"NetworkManager.service""#)
+        );
+    }
+
+    /// A journal read spawns `journalctl` and carries a reply several times larger than any
+    /// other, chunked at 20 bytes a notification. The reply budget has to match.
+    #[test]
+    fn reading_a_journal_gets_the_slow_budget() {
+        let cli = Cli::try_parse_from(["duckctl", "logs", "robotd", "-n", "500"]).expect("parses");
+        assert_eq!(
+            request_line(&cli.command).expect("a request").1,
+            SLOW_REPLY_TIMEOUT
+        );
     }
 
     /// **The Hub commands take the budget their work needs**, because the failure otherwise

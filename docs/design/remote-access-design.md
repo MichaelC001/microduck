@@ -51,6 +51,13 @@ service too was made the other way for this reason, and §3.1 is where it costs 
 
 ## 2. The account is an OAuth device flow against Hugging Face
 
+**The flow lives in [`hf-robot-account`](https://github.com/pollen-robotics/hf-robot-account)**,
+its own repository, because nothing in it is about a duck: any robot with no browser signs in the
+same way. What stays in `updater/src/account.rs` is what is a fact about *this* robot — the token
+path, the `robot` group, the mapping onto `proto`, and which JSON-RPC code each refusal deserves.
+Everything below about the flow itself describes that crate; everything about where the credential
+lands and who may read it describes this repository.
+
 ### 2.1 Why the device grant, which is also where `reachy_mini` ended up
 
 `reachy_mini` has **both**. It started with authorization code + PKCE, pointing the redirect URI
@@ -190,8 +197,8 @@ drops its answer. That is also what makes `logout` able to promise what it says.
 `huggingface_hub` ships a **first-party public device-code client**, `DEVICE_CODE_OAUTH_CLIENT_ID`
 = `26be6b09-91c5-47da-9861-d2d2bb7a7e36`, which is what `hf auth login` uses. It is public — no
 secret, so nothing needs baking into a release beyond a public identifier — and it needs no OAuth
-app registered anywhere. `updater::account::CLIENT_ID` is that constant, and it is the whole of
-what this decision came to.
+app registered anywhere. `hf_robot_account::HUGGINGFACE_CLIENT_ID` is that constant, and it is the
+whole of what this decision came to.
 
 Two alternatives, recorded because the first one looks obvious and is blocked:
 
@@ -223,7 +230,7 @@ What the account actually needs is `openid profile`, plus `read-repos` for one r
 mechanism (`policy-channel-design.md` §7).
 
 **So the narrow version is a Pollen-owned public device-code client with
-`openid profile read-repos`** — one constant in `account.rs` and one click by somebody with HF org
+`openid profile read-repos`** — one `Config::client_id` and one click by somebody with HF org
 admin. It is not blocking: the flow works today and a scope change is a re-login. It is worth
 doing before a duck goes home with anybody, because the failure mode is asymmetric — a robot that
 has been able to write all along cannot be un-done, while a robot that needs a wider scope later
@@ -342,7 +349,7 @@ A device-code token comes back as `expires_in: 2591999` — thirty days — with
 and refreshing **rotates** it: the answer carries a *new* refresh token and the old one is spent.
 So the store is two strings plus a clock, and there are three consequences worth naming.
 
-**A robot that is simply left on must renew itself.** `updater::account::maintain` wakes every six
+**A robot that is simply left on must renew itself.** `hf_robot_account::maintain` wakes every six
 hours and refreshes anything with under a week left — three-quarters of the way through the
 token's life, leaving a week of retries for a board whose network is marginal. It is spawned
 unconditionally, unlike the update scheduler, because a robot with update checks switched off

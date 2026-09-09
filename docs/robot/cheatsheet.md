@@ -430,6 +430,13 @@ corrupt each other's replies:
 sudo systemctl stop robotd && sudo /opt/robot/daemon/current/bin/robotd init && sudo systemctl start robotd
 ```
 
+**Replacing a motor** needs no configuration tool. Fit the new servo straight from the box (ID 1,
+57 600 baud), power the servos, and `robotd` — or `robotd init` — finds the one joint that no longer
+answers, flashes the new servo as that joint, sets its registers and reboots it. The journal says
+`factory-fresh servo on the bus; flashing it as the missing joint` and then `replacement servo
+adopted`. One at a time: with two joints missing it cannot tell which the new servo is for, waits,
+and says so.
+
 `init` works whether or not the robot has fallen — by default a fall is a *report* (visible in
 `robotctl monitor`), not a gate, matching the prototype. A board that sets `[safety] fall_limp`
 or `fall_recover` in `robotd.toml` arms the gate: there a fallen robot goes limp and refuses

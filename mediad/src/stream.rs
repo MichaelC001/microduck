@@ -483,7 +483,7 @@ impl Streamer {
 
         tokio::spawn(pump(
             config.url.clone(),
-            crate::hf::access_token(&self.token_path),
+            hf_robot_account::read_access_token(&self.token_path),
             hello(&config, &self.producer, self.rotate),
             from_encoder,
             Arc::clone(&counters),
