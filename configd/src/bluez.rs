@@ -168,10 +168,10 @@
 //! that re-initiates: the adapter scans as a central for a bonded peripheral while `btd` advertises
 //! as a peripheral itself. Both roles at once hold on this board's radio.
 //!
-//! The BR/EDR path was written from the Pro Controller clone's journal and from the `bluetoothctl`
-//! sequence that works on it by hand; `bond` follows that sequence call for call. The classic pad
-//! that the clone is bonded through today was bonded by hand, so the pair-first path in this file
-//! still owes its first `robotctl pad pair` on hardware.
+//! **And against the Pro Controller clone**, 2026-09-09, on the board above: `pad pair` with the pad
+//! in pairing mode found the classic face, bonded it and connected it in eight seconds — `bonded
+//! (classic)`, `connected`, `gamepad paired and trusted` — and `padd` drove from it. An Xbox pad
+//! paired a minute later through the unchanged LE path.
 //!
 //! What has **not** been exercised on hardware: a DualSense, two pads in pairing mode at once, and
 //! pairing by explicit address.
