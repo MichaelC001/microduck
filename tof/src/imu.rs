@@ -90,6 +90,18 @@ impl ImuStatus {
         inner.unavailable = None;
     }
 
+    /// Switched off in the config, rather than absent or broken.
+    ///
+    /// A separate sentence from [`Self::lost`] on purpose: every other reason this stream has
+    /// nothing is a board to go and look at, and this one is a line in `robotd.toml`. A
+    /// subscriber that cannot tell them apart sends somebody to check a cable.
+    pub fn off(&self) {
+        self.lost(
+            "the head IMU is off — `[head_imu] enabled = true` in robotd.toml, then restart tofd"
+                .to_owned(),
+        );
+    }
+
     fn lost(&self, why: String) {
         let mut inner = self.inner.lock().unwrap();
         inner.sensor = None;
@@ -244,5 +256,38 @@ fn sleep_unless_shutdown(dur: Duration, shutdown: &Arc<AtomicBool>) {
         let step = left.min(slice);
         std::thread::sleep(step);
         left = left.saturating_sub(step);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The three answers a subscriber can get, and the one this switch adds.
+    ///
+    /// "Off" has to be distinguishable from "not fitted" in the sentence itself, because they
+    /// are the same silence: one is a line in a file and the other is a board to go and look
+    /// at. So the reason names the key.
+    #[test]
+    fn switched_off_reads_differently_from_absent() {
+        let status = ImuStatus::new(100);
+
+        let fresh = status.result();
+        assert!(fresh.sensor.is_none());
+        assert_eq!(fresh.hz, 100);
+
+        status.off();
+        let off = status.result();
+        let why = off.unavailable.expect("a reason");
+        assert!(why.contains("[head_imu] enabled"), "{why}");
+        assert!(off.sensor.is_none());
+        // Still `accepted`: the subscription is fine, there is simply nothing coming. A refusal
+        // would send a client into a reconnect loop over a setting.
+        assert!(off.accepted);
+
+        status.lost("nothing answered on any bus".to_owned());
+        let absent = status.result();
+        let why = absent.unavailable.expect("a reason");
+        assert!(!why.contains("[head_imu]"), "{why}");
     }
 }
