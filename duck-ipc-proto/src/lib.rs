@@ -301,7 +301,21 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// [`RobotState::frames`] (camera, ToF, head IMU) is a few leaves — without carrying a copy of the
 /// kinematics, the same reason `frames` and `tof_beams` come from the robot. Both from the same FK
 /// `robot.look` uses. Additive: the `Vec`s are empty from a daemon predating it.
-pub const API_VERSION: u32 = 25;
+///
+/// # v26 — `system.logs`
+///
+/// The tail of one daemon's journal, over the wire. Until now the answer to "what did it say
+/// before it stopped" was `journalctl` over ssh, which needs a network the robot may not have and
+/// an address a phone has no way to reach — so the one question support asks first was the one
+/// question the wire could not answer.
+///
+/// Additive as a method, and narrow on purpose: a unit from a fixed list, a line count, and which
+/// boot. Not a `journalctl` command line — see [`LogsParams`] for why that boundary is where it is.
+///
+/// An older `configd` answers [`code::METHOD_NOT_FOUND`] naming the method, which is the designed
+/// skew and not a handshake refusal: a new `duckctl` against a robot on an older release reports
+/// that the robot is too old rather than failing obscurely.
+pub const API_VERSION: u32 = 26;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -668,6 +682,8 @@ pub mod method {
     pub const SYSTEM_INFO: &str = "system.info";
     /// What systemd says about each daemon, and which release each is running from.
     pub const SYSTEM_SERVICES: &str = "system.services";
+    /// The tail of one unit's journal, for a client with no shell on the robot.
+    pub const SYSTEM_LOGS: &str = "system.logs";
     /// Rename the robot. This is the name a phone sees.
     pub const SYSTEM_SET_NAME: &str = "system.setName";
     /// Reboot, cleanly, through systemd.
@@ -918,6 +934,8 @@ pub enum Call {
     // ── system.* ─────────────────────────────────────────────────────────────
     SystemInfo,
     SystemServices,
+    /// The tail of one unit's journal; see [`method::SYSTEM_LOGS`].
+    SystemLogs(LogsParams),
     SystemSetName(SetNameParams),
     SystemReboot,
     /// Read the pairing PIN.
@@ -1060,6 +1078,7 @@ impl Call {
             Call::NetForget(_) => method::NET_FORGET,
             Call::SystemInfo => method::SYSTEM_INFO,
             Call::SystemServices => method::SYSTEM_SERVICES,
+            Call::SystemLogs(_) => method::SYSTEM_LOGS,
             Call::SystemSetName(_) => method::SYSTEM_SET_NAME,
             Call::SystemReboot => method::SYSTEM_REBOOT,
             Call::SystemPairingPin => method::SYSTEM_PAIRING_PIN,
@@ -1224,6 +1243,7 @@ impl Call {
             | Call::NetForget(_)
             | Call::SystemInfo
             | Call::SystemServices
+            | Call::SystemLogs(_)
             | Call::SystemSetName(_)
             | Call::SystemReboot
             | Call::SystemPairingPin
@@ -1329,6 +1349,7 @@ impl Call {
             Call::RobotSubscribe(p) => encode(p),
             Call::NetConnect(p) => encode(p),
             Call::NetForget(p) => encode(p),
+            Call::SystemLogs(p) => encode(p),
             Call::SystemSetName(p) => encode(p),
             Call::SystemSetPairingPin(p) => encode(p),
             Call::SystemAuthenticate(p) => encode(p),
@@ -1436,6 +1457,7 @@ impl Call {
             method::NET_FORGET => Call::NetForget(decode(params)?),
             method::SYSTEM_INFO => Call::SystemInfo,
             method::SYSTEM_SERVICES => Call::SystemServices,
+            method::SYSTEM_LOGS => Call::SystemLogs(decode(params)?),
             method::SYSTEM_SET_NAME => Call::SystemSetName(decode(params)?),
             method::SYSTEM_REBOOT => Call::SystemReboot,
             method::SYSTEM_PAIRING_PIN => Call::SystemPairingPin,
@@ -1606,6 +1628,11 @@ pub mod test_support {
             }),
             Call::SystemInfo,
             Call::SystemServices,
+            Call::SystemLogs(LogsParams {
+                unit: "robotd".into(),
+                lines: 40,
+                boot: -1,
+            }),
             Call::SystemSetName(SetNameParams {
                 name: "duck-01".into(),
             }),
@@ -3777,6 +3804,57 @@ pub struct ServiceUnit {
     pub identity: Option<Identity>,
 }
 
+/// Which unit's journal to read, and how much of it. Parameters of [`Call::SystemLogs`].
+///
+/// **A unit name, not a filter expression.** The service picks from a fixed list and refuses
+/// anything else, because this call is reachable from a phone in radio range and `journalctl`
+/// arguments are not a language to hand such a peer. What that costs is `-g`, `--since` and
+/// several other things a person with a shell would reach for; what it buys is that the worst a
+/// client can ask for is the tail of a daemon this project ships.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LogsParams {
+    /// `robotd` or `robotd.service` — the service resolves either. See `configd::logs` for the
+    /// units it will read.
+    pub unit: String,
+    /// How many lines from the end. Clamped to [`MAX_LOG_LINES`], and the byte budget below
+    /// usually binds first.
+    pub lines: usize,
+    /// Which boot: `0` is the current one, `-1` the one before it, and so on backwards.
+    ///
+    /// Negative rather than an index because that is the question — "what did it say before it
+    /// restarted" — and because it is `journalctl -b`'s own convention, so the answer to "which
+    /// boot did I just read" is the same number in both places.
+    pub boot: i32,
+}
+
+/// Ceiling on [`LogsParams::lines`], applied by the service rather than trusted from the caller.
+pub const MAX_LOG_LINES: usize = 500;
+
+/// Ceiling on the serialised `lines` array, in bytes.
+///
+/// **This exists because of the transport, and it is the binding limit in practice.** BLE
+/// reassembles a reply into one line, and the client's buffer for that is bounded — a peer that
+/// never sends a newline must not be able to grow it without limit. 48 KiB leaves the rest of a
+/// JSON-RPC envelope room inside a 64 KiB client buffer, and at a typical ATT MTU it is already
+/// several seconds on the air, which is the other reason not to raise it.
+///
+/// The service drops the *oldest* lines to fit and says it did, because the newest are the ones
+/// somebody asked for.
+pub const MAX_LOG_BYTES: usize = 48 * 1024;
+
+/// Answer to [`Call::SystemLogs`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogsResult {
+    /// The unit as systemd names it, so a caller that typed `robotd` sees what it actually read.
+    pub unit: String,
+    /// Oldest first, the way a journal reads. No trailing newlines.
+    pub lines: Vec<String>,
+    /// Lines were dropped from the front to fit [`MAX_LOG_BYTES`]. Not an error — it is what
+    /// asking for more than the radio can carry looks like, and a caller can say so.
+    pub truncated: bool,
+}
+
 /// Answer to [`Call::PadStatus`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PadStatusResult {
@@ -4914,7 +4992,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            64,
+            65,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }
