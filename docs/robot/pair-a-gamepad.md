@@ -135,6 +135,21 @@ to check and how to drop it.
 Both are workarounds for the aic8800 radio, not properties of the design. They go when the radio
 does.
 
+### A classic pad and bluetoothd's CPU
+
+A Pro Controller streams IMU samples in every packet, about 200 packets a second, whether or not
+anyone touches it. With BlueZ's default `UserspaceHID=true` each one is relayed by bluetoothd through
+uhid, and that cost 16% of a core on graphite with the pad idle. `scripts/setup-board.sh` sets
+`UserspaceHID=false` in `/etc/bluetooth/input.conf` on every board, which hands the channel to the
+kernel's `hidp` and takes bluetoothd out of the data path — measured 0.0% afterwards, same driver,
+same input nodes, same bond. It applies at the next boot. An LE pad such as the Xbox is untouched by
+the setting: HID over GATT never went through `input.conf`. A board provisioned before this exists
+gets it by re-running the script:
+
+```bash
+sudo sh scripts/setup-board.sh && sudo reboot
+```
+
 ## Pairing a Pro Controller by hand
 
 Only if `pad pair` is not available. The order matters and is the **reverse** of the Xbox one:

@@ -156,6 +156,12 @@
 //! Discovery stays on `auto`, so BlueZ sweeps both transports and a Pro Controller and an Xbox pad
 //! are both found by the same search.
 //!
+//! Once bonded, a classic pad's reports are the kernel's business and not bluetoothd's:
+//! `scripts/setup-board.sh` sets `UserspaceHID=false` in `input.conf`, because the default relays
+//! this pad's ~200 packets/s of IMU through bluetoothd and uhid at 16% of a core. Nothing in this
+//! file depends on which path is in use; it is noted here because it is the other half of what
+//! "supporting a classic pad" turned out to mean.
+//!
 //! ## Where this has and has not run
 //!
 //! **Run against a real BlueZ on a Radxa Zero 3W with an Xbox Wireless Controller**, which is where
