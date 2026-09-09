@@ -43,6 +43,7 @@ use robotd_params::Slot;
 mod configure;
 mod duck;
 mod monitor;
+mod pad_imu;
 mod path_map;
 mod show;
 

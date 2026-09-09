@@ -63,6 +63,14 @@ padd    active — driving whatever pad connects
 Two lines, because they fail separately: a connected pad with a dead driver looks exactly like a
 working robot ignoring you.
 
+A Pro Controller also carries a six-axis IMU, which the kernel exposes as a second input device
+beside the one that drives. `robotctl monitor`, with `p` for the pad block, shows it as a panel
+that appears only when the pad has one: a wireframe pad posed like the real one, pitch and roll
+from gravity, yaw from the gyro alone (it drifts — nothing on a pad observes heading), and the
+gyro's rest bias, which the clone needs learned before the picture stops turning on its own. Set
+the pad down for half a second and the panel says `settled`. The stream costs nothing while the
+monitor is not open: `padd` reads the IMU node only while somebody is subscribed to the tap.
+
 `paired but NOT trusted` is the state worth knowing. It works now and does not reconnect after a
 reboot, because approving a reconnection needs an agent and at boot there is none. Re-run `pad pair`
 to fix it.
