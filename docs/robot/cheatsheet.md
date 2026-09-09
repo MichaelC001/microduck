@@ -666,6 +666,11 @@ closer is higher — and the mouth opens with the note, wide at the top of the r
 until Ctrl-C and puts the instrument down on the way out. `--off` puts down one a client left
 up.
 
+**Off by default** — `[theremin] enabled` in `robotd.toml`, per duck, like the chorale above.
+`robotctl configure` is the way to set it, and it offers the `robotd` restart that picks it up;
+until then `robotctl theremin` refuses and names the key. Nothing else turns off with it: `tofd`
+runs regardless, so the depth grid below works on a duck that has never played a note.
+
 An explicit mode with nothing clever inside it: while it is up, the nearest return inside the
 playable band is the hand. Point the duck at open space and it is silent; point it at a wall
 40 cm away and it plays a steady note. It plays sitting, standing or walking — the mouth is

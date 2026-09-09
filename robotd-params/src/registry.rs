@@ -332,7 +332,7 @@ pub const REGISTRY: &[Entry] = &[
     feature(
         "theremin.enabled",
         Kind::Bool,
-        "The ToF theremin may be picked up at all (robot.theremin still starts it)",
+        "The ToF theremin may be picked up at all — off by default (robot.theremin starts it)",
     ),
     entry("theremin.socket", Kind::Text, "tofd's depth stream"),
     entry(

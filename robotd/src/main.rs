@@ -627,6 +627,12 @@ struct RobotState {
     /// drops off the I²C bus — and an accepted theremin on a duck with no depth is a
     /// feature that silently does nothing.
     theremin_ready: AtomicBool,
+    /// Whether `[theremin] enabled` allows an instrument at all, and there is a voice to play
+    /// it in. Read once at startup, like the policies — and kept separate from
+    /// [`State::theremin_ready`] so that the refusal can name the switch. Off is the default,
+    /// so "the feature is not turned on" is the answer most of these refusals want, and
+    /// sending that person to look at `tofd` wastes their evening.
+    theremin_allowed: bool,
     /// Whether this robot's config allows it to sing with others. Read once at startup, like the
     /// policies: `[chorale] accept`, false by default.
     chorale_accepted: bool,
@@ -693,6 +699,7 @@ impl RobotState {
             config_path: config_path.to_owned(),
             has_voice: params.audio.enabled && has_any_wav(&params.audio.bank),
             theremin_ready: AtomicBool::new(false),
+            theremin_allowed: params.theremin.enabled && params.audio.enabled,
             chorale_accepted: params.chorale.accept,
             mode: AtomicU8::new(mode_code(params.policy.mode)),
             fallen: AtomicBool::new(false),
@@ -1877,12 +1884,16 @@ async fn control_loop<T: RobotIo>(
         None
     };
 
-    // The theremin. Its depth reader starts now and parks on `tofd`'s socket whether or not
-    // anyone ever asks for an instrument: one blocked read costs nothing, and connecting
-    // lazily would make the first arming window wait for a connection as well as for
-    // frames — a second of silence that reads as a broken feature. Off entirely when the
-    // params say so, or when audio is off, since a theremin with no voice is a mouth
-    // opening for no reason.
+    // The theremin. `[theremin] enabled` is off by default, so on most ducks this is `None`
+    // and nothing here subscribes to depth at all — `tofd` keeps its own counsel, and
+    // `robotctl monitor` is unaffected either way, since it subscribes to `tofd` itself.
+    //
+    // On a duck that has turned it on, the depth reader starts *now* and parks on `tofd`'s
+    // socket whether or not anyone ever asks for an instrument: one blocked read costs
+    // nothing, and connecting lazily would make the first arming window wait for a
+    // connection as well as for frames — a second of silence that reads as a broken feature.
+    // Also off when audio is off, since a theremin with no voice is a mouth opening for no
+    // reason.
     let mut theremin = (params.theremin.enabled && params.audio.enabled)
         .then(|| theremin::Theremin::spawn(params.theremin.socket.clone(), params.theremin.hand()));
     // How far the beak is open for the chorale, slewed across ticks — see where it is written.
@@ -4189,6 +4200,15 @@ fn dispatch(
                     accepted: false,
                     reason: Some("this robot has no voice to play a theremin in".to_owned()),
                 }
+            } else if p.active && !state.theremin_allowed {
+                proto::ThereminResult {
+                    accepted: false,
+                    reason: Some(
+                        "the theremin is off by default — turn `[theremin] enabled` on with \
+                         `robotctl configure`, which offers the robotd restart it needs"
+                            .to_owned(),
+                    ),
+                }
             } else if p.active && !state.theremin_ready.load(Ordering::Relaxed) {
                 proto::ThereminResult {
                     accepted: false,
@@ -5155,6 +5175,51 @@ mod tests {
             .result_as()
             .unwrap();
         assert!(init.accepted, "nor may init refuse for gravity");
+    }
+
+    /// The theremin ships **off**, and the refusal has to name the switch.
+    ///
+    /// The switch and a silent depth stream are different problems with the same symptom, and
+    /// they used to share one message. Now that off is the default, that message would send
+    /// every first-time player to inspect a `tofd` that is running perfectly.
+    #[test]
+    fn a_switched_off_theremin_names_the_switch_and_not_tofd() {
+        let ask = |params: &Params| -> proto::ThereminResult {
+            let mut s = RobotState::new(
+                params,
+                std::path::Path::new("/test/robotd.toml"),
+                false,
+                false,
+            );
+            // A voice, which `RobotState::new` decides by looking for wavs on disk: a test
+            // machine has no bank, and without this every answer here is "no voice to play in".
+            s.has_voice = true;
+            dispatch(
+                &s,
+                &Arc::new(Intents::new()),
+                proto::Id::Number(1),
+                &proto::Call::RobotTheremin(proto::ThereminParams { active: true }),
+            )
+            .result_as()
+            .expect("a theremin answer")
+        };
+
+        let params = Params::default();
+        assert!(!params.theremin.enabled, "the theremin ships off");
+        let refused = ask(&params);
+        assert!(!refused.accepted);
+        let reason = refused.reason.expect("a refusal says why");
+        assert!(reason.contains("[theremin] enabled"), "{reason}");
+        assert!(!reason.contains("tofd"), "not tofd's fault: {reason}");
+
+        // Switched on, and the honest complaint becomes the one about depth — `theremin_ready`
+        // is published by the loop, which is not running under a dispatch test.
+        let mut on = Params::default();
+        on.theremin.enabled = true;
+        let refused = ask(&on);
+        assert!(!refused.accepted);
+        let reason = refused.reason.expect("a refusal says why");
+        assert!(reason.contains("tofd"), "{reason}");
     }
 
     fn state() -> RobotState {

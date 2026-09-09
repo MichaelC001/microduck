@@ -524,9 +524,10 @@ pub struct ChoraleParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ThereminParams {
-    /// Master switch. On by default: the instrument still has to be picked up with
-    /// `robot.theremin`, so what this turns off is the *ability* to, on a duck where the
-    /// feature is unwanted or the sensor is known bad.
+    /// Master switch. **Off by default**: the theremin is a party trick, and a duck that
+    /// nobody asked to play one should not be reaching for the depth stream at all. Turning
+    /// it on grants the *ability* to pick the instrument up — that still takes
+    /// `robot.theremin` — on a duck where somebody wants it and the ToF is known good.
     pub enabled: bool,
     /// `tofd`'s depth stream.
     pub socket: PathBuf,
@@ -548,7 +549,7 @@ impl Default for ThereminParams {
     fn default() -> Self {
         let hand = kinematics::hand::Config::default();
         Self {
-            enabled: true,
+            enabled: false,
             socket: PathBuf::from(duck_ipc_proto::socket::TOF),
             near_m: hand.near_m,
             far_m: hand.far_m,
