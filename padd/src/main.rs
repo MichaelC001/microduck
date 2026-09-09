@@ -32,7 +32,8 @@
 //! LB / RB      left / right kick
 //! DPad-Down    sit ↔ stand
 //! RT / LT      mouth (either trigger; the max wins) · RT quacks · LT rides the wheee
-//! Select, 2 s  sit down, then power off
+//! Select       torque off, on release — the emergency stop
+//! Select, 2 s  sit down, torque off, then power off — the release does nothing more
 //! ```
 //!
 //! Head and body-pose mode both zero the velocity while active, as the prototype does — a
@@ -190,6 +191,58 @@ const IDLE_POLL: Duration = Duration::from_millis(500);
 
 /// Select held this long sits the robot down and powers it off.
 const SHUTDOWN_HOLD: Duration = Duration::from_secs(2);
+
+/// The Select button, which does one of two things depending on how long it was held — and so
+/// has to wait for the release to know which.
+///
+/// A short press is the emergency stop: `robot.relax`, torque off, the robot drops. Held for
+/// [`SHUTDOWN_HOLD`] it is the shutdown sequence instead: sit down, torque off, power off. The two
+/// cannot both fire — a robot that has already gone limp cannot sit — so the stop is sent **on
+/// release**, and only if the hold never reached the shutdown. The cost is that the stop lands
+/// when the thumb comes off rather than when it goes down, which for a button somebody presses
+/// and lets go of is the same instant.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct SelectButton {
+    /// When the current hold began. `None` between presses.
+    held_since: Option<Instant>,
+    /// The shutdown was sent for this hold, so its release is not a stop.
+    shutdown_sent: bool,
+}
+
+/// What Select asks for this tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectAction {
+    Nothing,
+    /// Held long enough: sit, torque off, power off. Once per hold.
+    Shutdown,
+    /// Let go before that: torque off now.
+    Relax,
+}
+
+impl SelectButton {
+    /// One tick: is the button down now, and did it come up since the last tick.
+    ///
+    /// `released` is the edge from the event queue, because a press and release inside one tick
+    /// leaves `pressed` false on both sides and would otherwise be a stop nobody saw.
+    fn tick(&mut self, pressed: bool, released: bool, now: Instant) -> SelectAction {
+        if pressed {
+            let since = *self.held_since.get_or_insert(now);
+            if now.duration_since(since) >= SHUTDOWN_HOLD && !self.shutdown_sent {
+                self.shutdown_sent = true;
+                return SelectAction::Shutdown;
+            }
+            return SelectAction::Nothing;
+        }
+        let was_shutdown = self.shutdown_sent;
+        self.held_since = None;
+        self.shutdown_sent = false;
+        if released && !was_shutdown {
+            return SelectAction::Relax;
+        }
+        // A release after the shutdown, or a tick with nothing to say.
+        SelectAction::Nothing
+    }
+}
 
 /// D-pad up held this long switches drive mode, walk ⇄ roller.
 ///
@@ -372,7 +425,7 @@ fn main() -> std::process::ExitCode {
         roller,
         "driving — Start once stands up, Start again toggles the policy, Y head mode, B body pose, \
          A ground pick, LB/RB kicks, DPad-Down sit, triggers mouth, DPad-Right reboot servos, \
-         DPad-Up (3s) walk/roller, Select torque off, Select (2s) shutdown"
+         DPad-Up (3s) walk/roller, Select (release) torque off, Select (2s) sit and shutdown"
     );
 
     let period = Duration::from_secs_f64(1.0 / args.hz as f64);
@@ -392,10 +445,9 @@ fn main() -> std::process::ExitCode {
     let mut imu_head = ImuHead::Off;
     // Whether a pad was there last tick, so appearing and disappearing are each logged once.
     let mut driving = false;
-    let mut select_held_since: Option<Instant> = None;
+    let mut select = SelectButton::default();
     let mut dpad_up_held_since: Option<Instant> = None;
     let mut mode_switch_sent = false;
-    let mut shutdown_sent = false;
     // Trigger levels last tick, for the sound edges: RT quacks on its rising edge, LT
     // starts the wheee ride. The prototype's threshold.
     let mut prev_rt = 0.0f64;
@@ -434,8 +486,14 @@ fn main() -> std::process::ExitCode {
         // a flag apiece, because what each one runs is config now and this loop no longer knows.
         let mut pressed: Vec<&'static str> = Vec::new();
         let mut relax = false;
+        let mut select_released = false;
         let mut reboot_motors = false;
         while let Some(event) = gilrs.next_event() {
+            // Select is the one button read on its release: a short press stops, a long hold shuts
+            // down, and which it was is only known when the thumb comes off.
+            if let gilrs::EventType::ButtonReleased(Button::Select, _) = event.event {
+                select_released = true;
+            }
             if let gilrs::EventType::ButtonPressed(button, _) = event.event {
                 match button {
                     Button::Start => toggle_enable = true,
@@ -452,8 +510,8 @@ fn main() -> std::process::ExitCode {
                     Button::LeftTrigger => pressed.push("lb"),
                     Button::RightTrigger => pressed.push("rb"),
                     Button::DPadDown => pressed.push("dpad_down"),
-                    // Emergency release: torque off. Held on, it is still the shutdown below.
-                    Button::Select => relax = true,
+                    // Select is handled on release — see `SelectButton`.
+                    Button::Select => {}
                     // Reboot the servos: the way back from a tripped overload without pulling
                     // the battery.
                     Button::DPadRight => reboot_motors = true,
@@ -650,8 +708,24 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
 
+        // Select: a short press is the emergency stop, on release; held two seconds it is the
+        // shutdown sequence — sit down, torque off, power off — sent once per hold, and the
+        // release after it does nothing. The robot owns the sequence from there.
+        match select.tick(pad.is_pressed(Button::Select), select_released, tick) {
+            SelectAction::Nothing => {}
+            SelectAction::Relax => relax = true,
+            SelectAction::Shutdown => {
+                up = false;
+                tracing::warn!("Select held — asking the robot to sit, torque off and power off");
+                if let Err(e) = request(&mut stream, &mut next_id, &proto::Call::RobotShutdown) {
+                    tracing::error!(error = %e, "shutdown request failed");
+                    return std::process::ExitCode::FAILURE;
+                }
+            }
+        }
+
         if relax {
-            tracing::warn!("Select — robot.relax: torque off");
+            tracing::warn!("Select released — robot.relax: torque off");
             // Torque off leaves the robot limp, so the next Start stands it up again rather
             // than toggling the policy on a robot that is lying on the floor.
             up = false;
@@ -673,24 +747,6 @@ fn main() -> std::process::ExitCode {
                 tracing::error!(error = %e, "reboot request failed");
                 return std::process::ExitCode::FAILURE;
             }
-        }
-
-        // Select held two seconds: sit down, then power off. Sent once per hold — the
-        // robot owns the sequence from there, and a second request would be a no-op anyway.
-        if pad.is_pressed(Button::Select) {
-            let held = select_held_since.get_or_insert(tick);
-            if tick.duration_since(*held) >= SHUTDOWN_HOLD && !shutdown_sent {
-                shutdown_sent = true;
-                up = false;
-                tracing::warn!("Select held — asking the robot to sit and power off");
-                if let Err(e) = request(&mut stream, &mut next_id, &proto::Call::RobotShutdown) {
-                    tracing::error!(error = %e, "shutdown request failed");
-                    return std::process::ExitCode::FAILURE;
-                }
-            }
-        } else {
-            select_held_since = None;
-            shutdown_sent = false;
         }
 
         // D-pad up held three seconds: switch drive mode, which is what somebody who has just
@@ -1258,6 +1314,37 @@ mod tests {
         assert!((head.head_yaw - 60.0f64.to_radians()).abs() < 0.01, "{head:?}");
         let head = head_from_pad(left, 2.0, 0.5);
         assert!((head.head_yaw - 0.5).abs() < 1e-6, "{head:?}");
+    }
+
+
+    /// Select is read on release. A short press is the stop, on the release; a hold reaching two
+    /// seconds is the shutdown, once, and the release after it is not a stop as well — the robot
+    /// is sitting down and must not be dropped mid-way.
+    #[test]
+    fn select_stops_on_a_short_release_and_shuts_down_on_a_long_hold() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut select = SelectButton::default();
+
+        // Short press: down for 300 ms, then up.
+        assert_eq!(select.tick(true, false, at(0)), SelectAction::Nothing);
+        assert_eq!(select.tick(true, false, at(300)), SelectAction::Nothing);
+        assert_eq!(select.tick(false, true, at(320)), SelectAction::Relax);
+        assert_eq!(select.tick(false, false, at(340)), SelectAction::Nothing);
+
+        // Press and release inside one tick: the state never read as down, the edge did.
+        assert_eq!(select.tick(false, true, at(1_000)), SelectAction::Relax);
+
+        // Long hold: the shutdown fires at two seconds, once, and the release is silent.
+        assert_eq!(select.tick(true, false, at(2_000)), SelectAction::Nothing);
+        assert_eq!(select.tick(true, false, at(3_990)), SelectAction::Nothing);
+        assert_eq!(select.tick(true, false, at(4_000)), SelectAction::Shutdown);
+        assert_eq!(select.tick(true, false, at(4_020)), SelectAction::Nothing);
+        assert_eq!(select.tick(false, true, at(5_000)), SelectAction::Nothing);
+
+        // And the next short press is a stop again.
+        assert_eq!(select.tick(true, false, at(6_000)), SelectAction::Nothing);
+        assert_eq!(select.tick(false, true, at(6_100)), SelectAction::Relax);
     }
 
 }
