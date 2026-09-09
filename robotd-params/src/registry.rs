@@ -360,6 +360,12 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Integer,
         "How long a note rides over a sensor dropout, milliseconds",
     ),
+    // ── [head_imu] ───────────────────────────────────────────────────────────
+    feature(
+        "head_imu.enabled",
+        Kind::Bool,
+        "Read the head IMU (BMI088) at all — off by default; ~4% of a core when on",
+    ),
     // ── [audio] ──────────────────────────────────────────────────────────────
     feature(
         "audio.enabled",
@@ -618,6 +624,7 @@ mod tests {
                 "detect.enabled",
                 "chorale.accept",
                 "theremin.enabled",
+                "head_imu.enabled",
                 "audio.enabled",
                 "audio.greet",
                 "audio.pet_detect",

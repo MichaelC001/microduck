@@ -60,6 +60,7 @@ pub struct Params {
     pub safety: SafetyParams,
     pub audio: AudioParams,
     pub theremin: ThereminParams,
+    pub head_imu: HeadImuParams,
     pub chorale: ChoraleParams,
     pub media: MediaParams,
     pub detect: DetectParams,
@@ -570,6 +571,27 @@ impl ThereminParams {
             hold: std::time::Duration::from_millis(self.hold_ms),
         }
     }
+}
+
+/// `[head_imu]` — the BMI088 on the head module, read by `tofd` and served as
+/// `head_imu.stream`.
+///
+/// **One switch, and it is off.** Reading this chip at 100 Hz costs ~3.5–4.5% of a core on an
+/// RK3566, and a bench that isolates the parts says none of it is fixable in the loop: being
+/// woken a hundred times a second is 0.7 points of it, the Madgwick fusion 0.3, and the rest is
+/// the two I²C transactions a sample takes. Fewer bytes is not on offer — a gyro and an
+/// accelerometer sample *is* twelve bytes — so what is left is not reading it, which is this
+/// key, or reading it less often, which is `tofd --imu-hz`.
+///
+/// It stays off until something subscribes to the stream, because for now nothing does: it was
+/// added for the mapping work, and a duck that is not mapping was paying for it from boot.
+/// `docs/project/tof-on-demand.md` is the measurement and the reasoning.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct HeadImuParams {
+    /// Read the head IMU at all. `false` — and derived rather than written out, so the default
+    /// cannot be changed by editing one word. `tofd --imu` overrides it for a session.
+    pub enabled: bool,
 }
 
 /// `[audio]` — the voice and the microphone. All optional equipment: a robot without a
