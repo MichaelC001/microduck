@@ -4186,9 +4186,10 @@ pub struct PadImuDevice {
 ///
 /// A batch rather than one sample per report, because of what a sample costs to send: at six
 /// hundred a second, one JSON line and one socket write each was measured at 6.6% of a core on the
-/// board (2026-09-09, `padd` with a subscriber). The kernel already groups them — the clone packs
-/// three samples into every HID packet — so the tap sends what one `read` returned, and the
-/// viewer takes them in order. Nothing is summarised: every sample is here.
+/// board (2026-09-09, `padd` with a subscriber, above its 1.6% idle). The kernel already groups
+/// them — the clone packs three samples into every HID packet — so the tap sends what one `read`
+/// returned, and the viewer takes them in order: measured at exactly three per batch, two hundred
+/// batches a second, and 4.4% of a core. Nothing is summarised: every sample is here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PadImuBatch {
     /// In the order the kernel delivered them, oldest first. Never empty on the wire.
