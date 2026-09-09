@@ -74,6 +74,21 @@ ssh radxa@$(duckctl ip)
 connects to nothing, needs no PIN, and takes about a second — and the answer is not stale: `btd`
 re-reads the address every five seconds and re-advertises when it moves.
 
+Or skip the substitution:
+
+```bash
+duckctl ssh
+```
+
+```bash
+duckctl ssh -- sudo robotctl pad pair
+```
+
+`ssh` finds the address the way `ip` does and then becomes `ssh`, so the prompts, the terminal and
+the exit status are ssh's own. The account is `--user`, else `DUCK_BOARD_USER` from the environment
+— the variable [`dev-push.sh`](dev-push.md) reads, so a laptop set up for pushing is set up for this
+— else `radxa`. Words after `--` run on the robot instead of opening a shell.
+
 A robot bonded to this machine often stops advertising the service to it, and then `ip` connects and
 asks `net.status` instead. That is slower and needs the PIN, and it always answers. `--verbose` says
 which of the two happened.

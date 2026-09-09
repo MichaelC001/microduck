@@ -428,6 +428,28 @@ fn deliver(command: &Command, address: &str) -> Result<(), Box<dyn std::error::E
             println!("{address}");
             Ok(())
         }
+        Command::Ssh { user, command } => {
+            let user = ssh_user(user.as_deref(), std::env::var("DUCK_BOARD_USER").ok());
+            let argv = ssh_argv(&user, address, command);
+            eprintln!("ssh {}", argv.join(" "));
+            let mut ssh = std::process::Command::new("ssh");
+            ssh.args(&argv);
+            // Become ssh rather than run it: the terminal is then ssh's from here on — its
+            // prompts, its exit status, its handling of a dropped link — and nothing of this
+            // process is left behind to be `Ctrl-C`d separately. The radio was released above,
+            // before this was called, so there is nothing to clean up.
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                let e = ssh.exec();
+                Err(format!("could not run ssh: {e}").into())
+            }
+            #[cfg(not(unix))]
+            {
+                let status = ssh.status().map_err(|e| format!("could not run ssh: {e}"))?;
+                std::process::exit(status.code().unwrap_or(1));
+            }
+        }
         Command::Open { print, port } => {
             let url = console_url(address, *port);
             if *print {
@@ -446,6 +468,28 @@ fn deliver(command: &Command, address: &str) -> Result<(), Box<dyn std::error::E
         // `run` only calls this for the two above; every other command's answer is its JSON.
         _ => Err("this command does not resolve an address".into()),
     }
+}
+
+/// Which account `ssh` logs into: the flag, else a non-empty `DUCK_BOARD_USER`, else `radxa`.
+///
+/// Empty is unset — `DUCK_BOARD_USER= duckctl ssh` reads as "not set", the same rule `DUCK_ROBOT`
+/// follows, because a variable emptied to switch it off must not become an ssh login of `@host`.
+/// `radxa` is the image's account and `dev-push.sh`'s default for the same variable.
+fn ssh_user(flag: Option<&str>, env: Option<String>) -> String {
+    flag.map(str::to_owned)
+        .or_else(|| env.filter(|user| !user.trim().is_empty()))
+        .unwrap_or_else(|| "radxa".to_owned())
+}
+
+/// `ssh`'s arguments: `user@address`, then whatever is to run there.
+///
+/// The command's words are passed through as separate arguments and ssh joins them with spaces
+/// on the far side, which is what `ssh host sudo robotctl pad pair` does at a prompt. Quoting for
+/// the remote shell is the caller's, exactly as it would be there.
+fn ssh_argv(user: &str, address: &str, command: &[String]) -> Vec<String> {
+    let mut argv = vec![format!("{user}@{address}")];
+    argv.extend(command.iter().cloned());
+    argv
 }
 
 /// Where the console is, given where the robot is.
@@ -801,6 +845,24 @@ enum Command {
     /// stopped advertising the service to it is asked over BLE instead, which is slower and always
     /// answers.
     Ip,
+    /// ssh into the robot.
+    ///
+    /// `duckctl ssh` is `ssh <user>@$(duckctl ip)` as one step: the address comes from the
+    /// advertisement the way `ip` finds it, and then this process *becomes* `ssh`, so the terminal,
+    /// the exit status and the key prompts are ssh's own. Anything after `--` is run on the robot
+    /// instead of opening a shell: `duckctl ssh -- sudo robotctl pad pair`.
+    ///
+    /// The user is `--user`, else `DUCK_BOARD_USER` from the environment — the same variable
+    /// `scripts/dev-push.sh` reads, so a laptop set up for pushing is set up for this — else
+    /// `radxa`, the image's default account.
+    Ssh {
+        /// The account on the robot. Without it, `DUCK_BOARD_USER`; without that, `radxa`.
+        #[arg(long, value_name = "USER")]
+        user: Option<String>,
+        /// A command to run on the robot instead of opening a shell. Put it after `--`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, value_name = "COMMAND")]
+        command: Vec<String>,
+    },
     /// Open the robot's console in a browser.
     ///
     /// The page `mediad` serves: the camera, and the controls a WebRTC peer is allowed to drive.
@@ -1198,11 +1260,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // what makes it the safe command to reach for when a robot cannot be reached, and it is also why
     // it can only report what an advertisement carries.
     let list_only = matches!(cli.command, Command::Scan);
-    // `ip` and `open` want one field out of an advertisement, so they read it the way `scan` does —
+    // `ip`, `open` and `ssh` want one field out of an advertisement, so they read it the way `scan` does —
     // and unlike `scan` they connect after all when no advertisement carried one. Cheap read first,
     // call second: without the fallback these two commands would fail on exactly the laptops that
     // use them most, because a robot bonded to this Mac often stops advertising the service to it.
-    let resolving = matches!(cli.command, Command::Ip | Command::Open { .. });
+    let resolving = matches!(
+        cli.command,
+        Command::Ip | Command::Open { .. } | Command::Ssh { .. }
+    );
 
     let manager = Manager::new().await?;
     let adapter = manager
@@ -1869,7 +1934,9 @@ fn request_line(command: &Command) -> Result<(String, Duration), Box<dyn std::er
         // The fallback, reached only when no advertisement carried an address. `net.status` is what
         // the advertisement is made of — `btd` re-reads it every five seconds — so this asks the
         // same question over a connection that costs a bond and a PIN.
-        Command::Ip | Command::Open { .. } => ("net.status", serde_json::json!({}), REPLY_TIMEOUT),
+        Command::Ip | Command::Open { .. } | Command::Ssh { .. } => {
+            ("net.status", serde_json::json!({}), REPLY_TIMEOUT)
+        }
         Command::Version => (
             "hello",
             serde_json::json!({ "api_version": duck_ipc_proto::API_VERSION }),
@@ -2754,6 +2821,35 @@ mod tests {
                 port: 8080
             }
         ));
+    }
+
+    /// `ssh` takes a user and a trailing command, and the user falls back the documented way: the
+    /// flag, a non-empty `DUCK_BOARD_USER`, then the image's account. An emptied variable is unset,
+    /// not a login of `@host`.
+    #[test]
+    fn ssh_resolves_its_user_and_passes_the_command_through() {
+        let cli = Cli::try_parse_from(["duckctl", "ssh", "--user", "pierre"]).expect("parses");
+        let Command::Ssh { user, command } = &cli.command else {
+            panic!("not an ssh command");
+        };
+        assert_eq!(user.as_deref(), Some("pierre"));
+        assert!(command.is_empty());
+
+        let cli = Cli::try_parse_from(["duckctl", "ssh", "--", "sudo", "robotctl", "pad", "pair"])
+            .expect("a trailing command parses");
+        let Command::Ssh { user, command } = &cli.command else {
+            panic!("not an ssh command");
+        };
+        assert_eq!(user, &None);
+        assert_eq!(
+            ssh_argv(&ssh_user(user.as_deref(), None), "192.168.10.136", command),
+            ["radxa@192.168.10.136", "sudo", "robotctl", "pad", "pair"]
+        );
+
+        assert_eq!(ssh_user(Some("pierre"), Some("antoine".into())), "pierre");
+        assert_eq!(ssh_user(None, Some("antoine".into())), "antoine");
+        assert_eq!(ssh_user(None, Some("".into())), "radxa");
+        assert_eq!(ssh_user(None, None), "radxa");
     }
 
     #[test]
