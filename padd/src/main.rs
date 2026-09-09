@@ -285,19 +285,21 @@ impl ImuHead {
 /// The head pose for a pad attitude relative to its reference.
 ///
 /// `relative` is body → world of the pad now, in the frame of the reference — [`pad_imu::relative`].
-/// Its pitch, roll and yaw become the head's, scaled by `gain` and clamped to `max_head`, with the
-/// same signs the stick mapping uses: nose-up on the pad is a negative `head_pitch` (the joint axis
-/// is inverted relative to "look up", verified on hardware for the sticks), pad yaw to the left is
-/// positive `head_yaw`, and the pad rolling right (left side up) is positive `head_roll`. The neck
-/// stays at zero: one pitch joint is enough to follow a wrist.
+/// Its pitch, roll and yaw become the head's, scaled by `gain` and clamped to `max_head`. The signs
+/// are the ones that made the head copy the pad on the robot (2026-09-09): pad nose-up is a
+/// positive `head_pitch`, pad yaw to the left a positive `head_yaw`, and the pad rolling right
+/// (left side up) a negative `head_roll`. Pitch and roll came out opposite to the stick mapping's
+/// guess, which is worth knowing: the sticks' signs describe "stick up looks up", not the joint
+/// axes, and the pad frame is the joints'. The neck stays at zero: one pitch joint is enough to
+/// follow a wrist.
 fn head_from_pad(relative: [f32; 4], gain: f64, max_head: f64) -> proto::HeadParams {
     let [pitch, roll, yaw] = pad_imu::euler_deg(relative);
     let angle = |degrees: f32| (f64::from(degrees).to_radians() * gain).clamp(-max_head, max_head);
     proto::HeadParams {
         neck_pitch: 0.0,
-        head_pitch: -angle(pitch),
+        head_pitch: angle(pitch),
         head_yaw: angle(yaw),
-        head_roll: angle(roll),
+        head_roll: -angle(roll),
     }
 }
 
@@ -1228,18 +1230,23 @@ mod tests {
         assert!(head.head_yaw.abs() < 1e-4 && head.head_pitch.abs() < 1e-4, "{head:?}");
     }
 
-    /// The pad's tilt becomes the head's pose with the stick mapping's signs: nose up looks up
-    /// (negative head_pitch), yaw left looks left (positive head_yaw). Gain scales, the travel
-    /// limit clamps, the neck stays put.
+    /// The pad's tilt becomes the head's pose with the signs verified on the robot: nose up is a
+    /// positive head_pitch, yaw left a positive head_yaw, rolled right a negative head_roll. Gain
+    /// scales, the travel limit clamps, the neck stays put.
     #[test]
     fn the_head_follows_the_pad_with_the_sticks_signs_gain_and_limit() {
         let half = 15.0f32.to_radians();
         // 30° nose up: a rotation about +Y.
         let nose_up = [half.cos(), 0.0, half.sin(), 0.0];
         let head = head_from_pad(nose_up, 1.0, 2.5);
-        assert!((head.head_pitch - (-30.0f64.to_radians())).abs() < 0.01, "{head:?}");
+        assert!((head.head_pitch - 30.0f64.to_radians()).abs() < 0.01, "{head:?}");
         assert!(head.head_yaw.abs() < 0.01 && head.head_roll.abs() < 0.01, "{head:?}");
         assert_eq!(head.neck_pitch, 0.0);
+
+        // 30° rolled right (left side up): about +X. The head rolls the other sign.
+        let rolled = [half.cos(), half.sin(), 0.0, 0.0];
+        let head = head_from_pad(rolled, 1.0, 2.5);
+        assert!((head.head_roll - (-30.0f64.to_radians())).abs() < 0.01, "{head:?}");
 
         // 30° yaw left: about +Z.
         let left = [half.cos(), 0.0, 0.0, half.sin()];
