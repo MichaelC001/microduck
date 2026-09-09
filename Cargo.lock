@@ -482,7 +482,7 @@ dependencies = [
 [[package]]
 name = "bmi088"
 version = "0.1.0"
-source = "git+https://github.com/pollen-robotics/bmi088-rs?tag=v0.1.1#efddf2029f276495a99dd51435c61b643fa009b5"
+source = "git+https://github.com/pollen-robotics/bmi088-rs?rev=6db3c2cd7428b0da43385cb68e8f90a17cb1cb1c#6db3c2cd7428b0da43385cb68e8f90a17cb1cb1c"
 dependencies = [
  "ahrs",
  "embedded-hal",
