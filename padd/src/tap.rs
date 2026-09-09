@@ -48,7 +48,18 @@
 //!
 //! Unlike a stick it is never silent: the clone streams several hundred samples a second whether
 //! or not anyone touches it. That is why a sample is six integers rather than an event list, why it
-//! has its own drop counter, and why the IMU is not opened at all unless someone is watching.
+//! has its own drop counter, and why the IMU is not opened at all unless someone is watching —
+//! or unless `padd` itself is, which is the second reader below.
+//!
+//! ## The IMU as a control, not only a stream
+//!
+//! With `[imu_head] enabled`, `padd` poses the robot's head from the pad's tilt. The attitude that
+//! needs comes from the same node the tap streams, so rather than a second reader on the same
+//! device this reader runs a `pad_imu::Imu` filter over every batch it reads and the main loop asks
+//! for the attitude ([`Tap::attitude`]). [`Tap::imu_control`] is the main loop saying "keep the
+//! IMU open for me": the node then stays open with or without a subscriber, and closes again when
+//! the feature goes off. One reader, one filter, and `robotctl monitor` draws the same attitude
+//! `padd` steers by.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -108,6 +119,10 @@ struct Shared {
     state: Mutex<State>,
     /// Signalled whenever the reader might have work: a pad appeared, or someone subscribed.
     wake: Condvar,
+    /// The IMU's attitude, kept by the IMU reader for the main loop. `None` while no IMU is
+    /// open. Its own lock, not `state`'s: the main loop reads it fifty times a second and must not
+    /// queue behind a subscriber's send.
+    attitude: Mutex<Option<pad_imu::Imu>>,
 }
 
 struct State {
@@ -116,6 +131,9 @@ struct State {
     /// The pad's IMU node, when the pad has one — see [`imu_sibling`]. Resolved once per pad node
     /// rather than per tick, because it is a walk through sysfs.
     wanted_imu: Option<PathBuf>,
+    /// Does `padd` itself want the IMU read, for head control? A second reason to hold the node
+    /// open, beside a subscriber.
+    control: bool,
     subscribers: Vec<Subscriber>,
     /// The `Attached` report for the device currently open.
     ///
@@ -170,11 +188,13 @@ impl Tap {
             state: Mutex::new(State {
                 wanted: None,
                 wanted_imu: None,
+                control: false,
                 subscribers: Vec::new(),
                 attached: None,
                 imu_attached: None,
             }),
             wake: Condvar::new(),
+            attitude: Mutex::new(None),
         });
 
         let accepting = Arc::clone(&shared);
@@ -219,6 +239,34 @@ impl Tap {
     /// No pad. The readers close their devices and say so to whoever is watching.
     pub fn idle(&self) {
         self.want(None, None);
+    }
+
+    /// Keep the pad's IMU open for `padd`'s own use, or stop. Safe to call every tick.
+    pub fn imu_control(&self, on: bool) {
+        let mut state = self.shared.lock();
+        if state.control == on {
+            return;
+        }
+        state.control = on;
+        drop(state);
+        self.shared.wake.notify_all();
+    }
+
+    /// Does the connected pad have an IMU at all? True as soon as the node is known, before it is
+    /// open — the question "can Y mean IMU head control on this pad" needs answering on the press.
+    pub fn has_imu(&self) -> bool {
+        self.shared.lock().wanted_imu.is_some()
+    }
+
+    /// The pad's attitude, body → world, `w` first. `None` while no IMU is open or before its
+    /// first believable sample.
+    pub fn attitude(&self) -> Option<[f32; 4]> {
+        self.shared
+            .attitude
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .and_then(pad_imu::Imu::quaternion)
     }
 
     fn want(&self, node: Option<PathBuf>, imu: Option<PathBuf>) {
@@ -330,12 +378,13 @@ impl Shared {
         None
     }
 
-    /// The IMU reader's [`Self::wait_for_work`]: a pad with an IMU, and somebody to read it for.
+    /// The IMU reader's [`Self::wait_for_work`]: a pad with an IMU, and somebody to read it for —
+    /// a subscriber, or `padd` itself.
     fn wait_for_imu_work(&self) -> PathBuf {
         let mut state = self.lock();
         loop {
             if let Some(node) = state.wanted_imu.clone()
-                && !state.subscribers.is_empty()
+                && (!state.subscribers.is_empty() || state.control)
             {
                 return node;
             }
@@ -349,7 +398,7 @@ impl Shared {
     /// The IMU reader's [`Self::done_with`].
     fn done_with_imu(&self, node: &Path) -> Option<&'static str> {
         let state = self.lock();
-        if state.subscribers.is_empty() {
+        if state.subscribers.is_empty() && !state.control {
             return Some("nobody is watching any more");
         }
         if state.wanted_imu.as_deref() != Some(node) {
@@ -359,6 +408,7 @@ impl Shared {
     }
 
     fn attach_imu(&self, device: proto::PadImuDevice) {
+        *self.attitude_slot() = Some(pad_imu::Imu::new(device.clone()));
         let report = Arc::new(proto::PadReport::ImuAttached {
             device: Box::new(device),
         });
@@ -368,17 +418,26 @@ impl Shared {
     }
 
     fn detach_imu(&self, why: String) {
+        *self.attitude_slot() = None;
         let mut state = self.lock();
         state.imu_attached = None;
         state.send(&Arc::new(proto::PadReport::ImuDetached { why }));
     }
 
+    /// One batch: into the filter first, then out to whoever is watching.
     fn samples(&self, samples: Vec<proto::PadImuSample>) {
-        self.lock()
-            .send(&Arc::new(proto::PadReport::Imu(proto::PadImuBatch {
-                samples,
-                socket_dropped: 0,
-            })));
+        let batch = proto::PadImuBatch {
+            samples,
+            socket_dropped: 0,
+        };
+        if let Some(imu) = self.attitude_slot().as_mut() {
+            imu.absorb(&batch);
+        }
+        self.lock().send(&Arc::new(proto::PadReport::Imu(batch)));
+    }
+
+    fn attitude_slot(&self) -> MutexGuard<'_, Option<pad_imu::Imu>> {
+        self.attitude.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn attach(&self, device: proto::PadInputDevice) {
@@ -936,11 +995,13 @@ mod tests {
             state: Mutex::new(State {
                 wanted: None,
                 wanted_imu: None,
+                control: false,
                 subscribers: Vec::new(),
                 attached: None,
                 imu_attached: None,
             }),
             wake: Condvar::new(),
+            attitude: Mutex::new(None),
         })
     }
 
@@ -1077,6 +1138,52 @@ mod tests {
         assert_eq!(dropped.samples.load(Ordering::Relaxed), 25);
         assert_eq!(dropped.frames.load(Ordering::Relaxed), 0);
         drop(reports);
+    }
+
+    /// `padd` wanting the attitude is reason enough to hold the IMU open, with nobody subscribed —
+    /// and the attitude it reads is the filter's, fed from the same batches the subscribers get.
+    #[test]
+    fn head_control_holds_the_imu_open_and_reads_the_filter() {
+        let shared = a_shared();
+        let node = Path::new("/dev/input/event5");
+        shared.lock().wanted_imu = Some(node.to_path_buf());
+        assert_eq!(
+            shared.done_with_imu(node),
+            Some("nobody is watching any more"),
+            "no subscriber, no control: let go"
+        );
+
+        shared.lock().control = true;
+        assert_eq!(shared.done_with_imu(node), None, "control alone holds it");
+
+        shared.attach_imu(proto::PadImuDevice {
+            name: "Nintendo Switch Pro Controller IMU".to_owned(),
+            node: node.display().to_string(),
+            accel_per_g: 4096,
+            gyro_per_dps: 14247,
+            accel_max: 32767,
+            gyro_max: 32_767_000,
+        });
+        let read = |shared: &Shared| {
+            shared
+                .attitude_slot()
+                .as_ref()
+                .and_then(pad_imu::Imu::quaternion)
+        };
+        assert!(read(&shared).is_none(), "no sample yet, no attitude");
+        // Flat on the table, one sample: seeded level.
+        shared.samples(vec![proto::PadImuSample {
+            seq: 1,
+            at_us: 1_000_000,
+            accel: [0, 0, 4096],
+            gyro: [0, 0, 0],
+        }]);
+        let q = read(&shared).expect("an attitude after a believable sample");
+        let euler = pad_imu::euler_deg(q);
+        assert!(euler.iter().all(|a| a.abs() < 0.5), "{euler:?}");
+
+        shared.detach_imu("the pad changed".to_owned());
+        assert!(read(&shared).is_none(), "gone with the node");
     }
 
     /// A subscriber arriving while an IMU is open is told about it, as it is told about the pad.

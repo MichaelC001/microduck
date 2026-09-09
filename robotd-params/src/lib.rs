@@ -65,6 +65,38 @@ pub struct Params {
     pub detect: DetectParams,
     /// Which pad button runs which skill. `padd` reads this, not `robotd`.
     pub pad: PadParams,
+    /// Posing the head from the pad's own IMU. `padd` reads this too.
+    pub imu_head: ImuHeadParams,
+}
+
+/// Controller-IMU head control: pose the head by tilting the pad.
+///
+/// Some pads carry an inertial unit — the "Pro Controller" Switch clones do; an Xbox pad does not.
+/// With this on and such a pad connected, **Y** stops meaning "the sticks pose the head" and
+/// means "the pad's tilt poses the head": the sticks keep driving, and turning the pad in your
+/// hands turns the robot's head. Press Y again and the head holds where it is, still driving.
+/// Press it a third time and the pad drives the head again **from where the pad is now** — the
+/// pad's yaw comes from a gyro and drifts, and re-centring on every re-entry is how a person
+/// beats the drift without a magnetometer.
+///
+/// Off, or on a pad with no IMU, Y is what it always was. Nothing else about the pad changes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ImuHeadParams {
+    /// Whether Y engages IMU head control on a pad that has an IMU.
+    pub enabled: bool,
+    /// Head radians per pad radian. One is "the head turns as far as the pad did"; more makes a
+    /// small wrist movement a large head movement. The head's own travel limit still applies.
+    pub gain: f64,
+}
+
+impl Default for ImuHeadParams {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            gain: 1.0,
+        }
+    }
 }
 
 /// Which pad button runs which skill.

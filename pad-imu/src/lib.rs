@@ -1,47 +1,45 @@
-//! The pad's inertial unit, as the monitor reads it and draws it.
+//! A gamepad's inertial unit, read into an attitude.
 //!
 //! Some pads carry a six-axis IMU. The "Pro Controller" Switch clones do, and `padd`'s tap hands
 //! its samples out as [`proto::PadReport::Imu`] — raw kernel units at several hundred a second.
-//! This module turns that stream into something a person can read at a glance: the pad's attitude,
-//! drawn as a wireframe that tilts and turns with the pad in your hands, next to the numbers.
+//! This crate turns that stream into an orientation two programs need the same way: `padd`, to
+//! pose the robot's head from the pad in your hands, and `robotctl monitor`, to draw the pad
+//! tilting on screen. One filter, so the head and the picture cannot disagree.
 //!
 //! ## What it computes
 //!
 //! **Orientation**, as a quaternion from the pad's body frame to the world, by integrating the
 //! gyro and pulling the result back toward the accelerometer's gravity — the smallest useful
 //! complementary filter. Gravity fixes pitch and roll; yaw comes from the gyro alone and drifts,
-//! which is honest: nothing on a pad can observe heading.
+//! which is honest: nothing on a pad can observe heading. Whoever uses yaw has to re-zero it now
+//! and then, and [`relative`] is how.
 //!
 //! **Gyro bias**, because the clone's gyro is not calibrated. At rest on a table its Z rate reads
-//! about 12 °/s, and integrated as-is the drawn pad would spin a full turn every thirty seconds
-//! while lying still. So the rate is watched for stillness — a short window in which the three
-//! rates barely move and the accelerometer reads one g — and the mean over such a window is taken
-//! as the bias. Until the first still window the raw rate is used and the view says the bias is
-//! still being learned.
+//! about 12 °/s, and integrated as-is the attitude would turn a full circle every thirty seconds
+//! while the pad lay still. So the rate is watched for stillness — a short window in which the
+//! three rates barely move and the accelerometer reads one g — and the mean over such a window is
+//! taken as the bias. Until the first still window the raw rate is used and [`Imu::bias_dps`] says
+//! so.
 //!
 //! ## Axes
 //!
 //! `hid-nintendo` reports the accelerometer on `ABS_X/Y/Z` and the gyro on `ABS_RX/RY/RZ`, with
-//! `+Z` up when the pad lies flat: the clone reads about `+1 g` there at rest. The body frame drawn
-//! here takes **+X as the pad's front** — the edge with the triggers, away from the player — and
-//! **+Y as the pad's left**, which follows from a right-handed frame with Z up. The wireframe puts
-//! a marker on the front edge so a wrong guess about X is visible the first time the pad tilts.
+//! `+Z` up when the pad lies flat: the clone reads about `+1 g` there at rest. The body frame is
+//! **+X the pad's front** — the edge with the triggers, away from the player — and **+Y the pad's
+//! left**, which follows from a right-handed frame with Z up. Confirmed against the drawn pad on
+//! the robot, 2026-09-09.
 //!
 //! ## What it costs
 //!
-//! The filter is a few dozen multiplications per sample. The drawing is a dozen line segments
-//! rasterised into half-block pixels, redrawn at the monitor's own pace rather than the IMU's —
-//! six hundred samples a second is a rate for a filter, not for a terminal.
+//! A few dozen multiplications per sample. Six hundred a second are a rounding error next to
+//! reading them off the kernel.
 
 use duck_ipc_proto as proto;
-use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
-use ratatui::style::Color;
 
 /// How hard the accelerometer pulls the orientation back toward gravity, per second.
 ///
 /// Two: a tilt error decays with a half-second time constant, which is slow enough that shaking
-/// the pad does not make the picture flinch and fast enough that it is level a second after being
+/// the pad does not make the attitude flinch and fast enough that it is level a second after being
 /// set down.
 const GRAVITY_GAIN: f32 = 2.0;
 
@@ -62,8 +60,8 @@ const STILL_SPREAD_DPS: f32 = 3.0;
 
 /// Longest gap between two samples the integrator will bridge, seconds.
 ///
-/// Beyond it the pad was silent — a dropped batch, a paused terminal — and integrating one stale
-/// rate over the whole gap would throw the picture. The sample is taken; the interval is not.
+/// Beyond it the pad was silent — a dropped batch, a paused reader — and integrating one stale
+/// rate over the whole gap would throw the attitude. The sample is taken; the interval is not.
 const MAX_DT_S: f32 = 0.05;
 
 /// One pad IMU, as accumulated from the tap.
@@ -139,7 +137,7 @@ impl Bias {
                 (self.sum[2] / f64::from(self.count)) as f32,
             ];
             // Blend with what is already known rather than jumping: two still windows a minute
-            // apart disagreeing by a tenth of a degree per second should not make the picture
+            // apart disagreeing by a tenth of a degree per second should not make the attitude
             // twitch each time.
             self.value = Some(match self.value {
                 Some(old) => [
@@ -291,223 +289,68 @@ impl Imu {
         self.q = normalized4(self.q);
     }
 
-    /// Pitch, roll and yaw of the body in the world, degrees.
-    ///
-    /// Aerospace order — yaw about Z, then pitch about the pad's Y (nose up positive), then roll
-    /// about its X (left side up positive) — read off the rotation matrix. Yaw is the gyro's word
-    /// alone and drifts; the other two are held by gravity.
+    /// Pitch, roll and yaw of the body in the world, degrees — [`euler_deg`] of the attitude.
+    /// Yaw is the gyro's word alone and drifts; the other two are held by gravity.
     pub fn euler_deg(&self) -> [f32; 3] {
-        let m = matrix(self.q);
-        // m carries body axes as columns in world coordinates: m[i][j] = row i, column j.
-        let pitch = (-m[2][0]).clamp(-1.0, 1.0).asin();
-        let roll = m[2][1].atan2(m[2][2]);
-        let yaw = m[1][0].atan2(m[0][0]);
-        let deg = 180.0 / std::f32::consts::PI;
-        [pitch * deg, roll * deg, yaw * deg]
+        euler_deg(self.q)
     }
 
-    /// Draw the pad's attitude into `area`, two pixels per cell.
-    ///
-    /// A wireframe of a pad — a flat slab, two grips toward the player, the two sticks, a marker on
-    /// the front edge — posed by the orientation and seen from a fixed three-quarter camera. Cheap
-    /// on purpose: a dozen segments, no depth sorting. The eye resolves a wireframe pad without it.
-    pub fn draw(&self, area: Rect, buf: &mut Buffer) {
-        let (w, h) = (usize::from(area.width), usize::from(area.height) * 2);
-        if w < 6 || h < 6 {
-            return;
-        }
-        let mut canvas = Canvas::new(w, h);
-        let rotation = matrix(self.q);
-
-        // World → screen: yaw the camera for a three-quarter view, then look down at it. The
-        // result is in body millimetres until it is scaled below.
-        let (az_sin, az_cos) = CAMERA_AZIMUTH.sin_cos();
-        let (el_sin, el_cos) = CAMERA_ELEVATION.sin_cos();
-        let project = |p: [f32; 3]| -> (f32, f32) {
-            let world = rotate_matrix(rotation, p);
-            let x = world[0] * az_cos - world[1] * az_sin;
-            let y = world[0] * az_sin + world[1] * az_cos;
-            let up = world[2] * el_cos + y * el_sin;
-            (x, -up)
-        };
-
-        // One zoom for every attitude: the pad's bounding sphere is what has to fit, so a pad on
-        // its edge and a pad lying flat are drawn at the same scale and tilting reads as tilting,
-        // not as the picture breathing. The body origin sits at the canvas centre. Framed at 80% of
-        // the sphere rather than all of it: only a grip tip pointing straight at the camera's edge
-        // ever reaches the last 20%, and framing for that moment shrinks every other one.
-        let radius = PAD_WIREFRAME
-            .iter()
-            .flat_map(|s| [s.from, s.to])
-            .map(norm)
-            .fold(1.0f32, f32::max)
-            * 0.8;
-        let scale = ((w as f32 - 2.0) / (2.0 * radius)).min((h as f32 - 2.0) / (2.0 * radius));
-        let (cx, cy) = (w as f32 / 2.0, h as f32 / 2.0);
-        let place = |p: (f32, f32)| (p.0 * scale + cx, p.1 * scale + cy);
-
-        for segment in PAD_WIREFRAME {
-            canvas.line(
-                place(project(segment.from)),
-                place(project(segment.to)),
-                segment.colour(),
-            );
-        }
-        canvas.blit(area, buf);
-    }
-}
-
-/// Camera yaw, radians: a three-quarter view, so both the front edge and a grip are visible.
-const CAMERA_AZIMUTH: f32 = -0.55;
-/// Camera elevation above the pad's plane, radians.
-const CAMERA_ELEVATION: f32 = 0.55;
-
-/// One segment of the drawn pad, in the body frame: millimetres, +X front, +Y left, +Z up.
-struct Segment {
-    from: [f32; 3],
-    to: [f32; 3],
-    part: Part,
-}
-
-#[derive(Clone, Copy)]
-enum Part {
-    Body,
-    Grip,
-    Stick,
-    Front,
-}
-
-impl Segment {
-    const fn new(from: [f32; 3], to: [f32; 3], part: Part) -> Self {
-        Self { from, to, part }
-    }
-
-    fn colour(&self) -> Color {
-        match self.part {
-            Part::Body => Color::Cyan,
-            Part::Grip => Color::Rgb(0, 140, 160),
-            Part::Stick => Color::White,
-            Part::Front => Color::Yellow,
-        }
-    }
-}
-
-/// The pad, in as few lines as still read as a pad: the top face of a slab 50 mm deep by 150
-/// wide, its front edge given thickness, two grips reaching back toward the player, the two
-/// sticks standing proud, and a bar along the front edge so that "which way is it facing" never
-/// has to be inferred from the grips alone. Every line dropped from a fuller model — the bottom
-/// face, the grips' far edges — was one that turned the picture into hatching at terminal
-/// resolution without adding a degree of freedom the eye could read.
-const PAD_WIREFRAME: &[Segment] = &{
-    const B: Part = Part::Body;
-    const G: Part = Part::Grip;
-    const S: Part = Part::Stick;
-    const F: Part = Part::Front;
-    [
-        // Top face.
-        Segment::new([25.0, 75.0, 10.0], [25.0, -75.0, 10.0], B),
-        Segment::new([25.0, -75.0, 10.0], [-25.0, -75.0, 10.0], B),
-        Segment::new([-25.0, -75.0, 10.0], [-25.0, 75.0, 10.0], B),
-        Segment::new([-25.0, 75.0, 10.0], [25.0, 75.0, 10.0], B),
-        // Thickness, on the front edge only.
-        Segment::new([25.0, 75.0, 10.0], [25.0, 75.0, -10.0], B),
-        Segment::new([25.0, -75.0, 10.0], [25.0, -75.0, -10.0], B),
-        Segment::new([25.0, 75.0, -10.0], [25.0, -75.0, -10.0], B),
-        // Grips: the outer edge of each, back and down from the rear corners, closed at the end.
-        Segment::new([-25.0, 70.0, 10.0], [-70.0, 55.0, -20.0], G),
-        Segment::new([-25.0, 40.0, 10.0], [-70.0, 35.0, -20.0], G),
-        Segment::new([-70.0, 55.0, -20.0], [-70.0, 35.0, -20.0], G),
-        Segment::new([-25.0, -70.0, 10.0], [-70.0, -55.0, -20.0], G),
-        Segment::new([-25.0, -40.0, 10.0], [-70.0, -35.0, -20.0], G),
-        Segment::new([-70.0, -55.0, -20.0], [-70.0, -35.0, -20.0], G),
-        // Sticks: the Pro Controller's left stick sits forward-left, the right one back-right.
-        Segment::new([8.0, 45.0, 10.0], [8.0, 45.0, 26.0], S),
-        Segment::new([-10.0, -30.0, 10.0], [-10.0, -30.0, 26.0], S),
-        // Front bar, along the top of the front edge, with a nose at its middle.
-        Segment::new([25.0, 60.0, 14.0], [25.0, -60.0, 14.0], F),
-        Segment::new([25.0, 0.0, 14.0], [45.0, 0.0, 14.0], F),
-    ]
-};
-
-/// A half-block pixel canvas: one colour per pixel, two pixels per terminal row.
-struct Canvas {
-    w: usize,
-    h: usize,
-    pixels: Vec<Option<Color>>,
-}
-
-impl Canvas {
-    fn new(w: usize, h: usize) -> Self {
-        Self {
-            w,
-            h,
-            pixels: vec![None; w * h],
-        }
-    }
-
-    fn set(&mut self, x: i32, y: i32, colour: Color) {
-        if x < 0 || y < 0 {
-            return;
-        }
-        let (x, y) = (x as usize, y as usize);
-        if x < self.w && y < self.h {
-            self.pixels[y * self.w + x] = Some(colour);
-        }
-    }
-
-    /// Bresenham, on rounded endpoints. Clipped per pixel: a segment that leaves the canvas is
-    /// drawn as far as it goes rather than dropped.
-    fn line(&mut self, a: (f32, f32), b: (f32, f32), colour: Color) {
-        let (mut x0, mut y0) = (a.0.round() as i32, a.1.round() as i32);
-        let (x1, y1) = (b.0.round() as i32, b.1.round() as i32);
-        let dx = (x1 - x0).abs();
-        let dy = -(y1 - y0).abs();
-        let sx = if x0 < x1 { 1 } else { -1 };
-        let sy = if y0 < y1 { 1 } else { -1 };
-        let mut err = dx + dy;
-        loop {
-            self.set(x0, y0, colour);
-            if x0 == x1 && y0 == y1 {
-                break;
-            }
-            let e2 = 2 * err;
-            if e2 >= dy {
-                err += dy;
-                x0 += sx;
-            }
-            if e2 <= dx {
-                err += dx;
-                y0 += sy;
-            }
-        }
-    }
-
-    fn blit(&self, area: Rect, buf: &mut Buffer) {
-        for row in 0..usize::from(area.height) {
-            for col in 0..self.w {
-                let top = self.pixels[(row * 2) * self.w + col];
-                let bottom = self.pixels.get((row * 2 + 1) * self.w + col).copied().flatten();
-                let Some(cell) = buf.cell_mut((area.x + col as u16, area.y + row as u16)) else {
-                    continue;
-                };
-                match (top, bottom) {
-                    (Some(t), Some(b)) => {
-                        cell.set_symbol("▀").set_fg(t).set_bg(b);
-                    }
-                    (Some(t), None) => {
-                        cell.set_symbol("▀").set_fg(t);
-                    }
-                    (None, Some(b)) => {
-                        cell.set_symbol("▄").set_fg(b);
-                    }
-                    (None, None) => {}
-                }
-            }
-        }
+    /// The attitude itself, body → world, `w` first. `None` until the first sample with a
+    /// believable gravity has seeded it — before that there is no attitude, only a default.
+    pub fn quaternion(&self) -> Option<[f32; 4]> {
+        self.seeded.then_some(self.q)
     }
 }
 
 // ── quaternion arithmetic, w first ───────────────────────────────────────────────────────
+
+/// The rotation from `reference` to `now`, in the body frame of `reference`: what a pad has done
+/// since the moment `reference` was taken. This is how a consumer of yaw beats the drift — take a
+/// fresh reference when the person says "this is centre", and read everything after it relative.
+pub fn relative(reference: [f32; 4], now: [f32; 4]) -> [f32; 4] {
+    normalized4(mul(conj(reference), now))
+}
+
+/// Pitch, roll and yaw of a body → world rotation, degrees.
+///
+/// Aerospace order — yaw about Z, then pitch about the body's Y (nose up positive), then roll
+/// about its X (left side up positive) — read off the rotation matrix.
+pub fn euler_deg(q: [f32; 4]) -> [f32; 3] {
+    let m = matrix(q);
+    // m carries body axes as columns in world coordinates: m[i][j] = row i, column j.
+    let pitch = (-m[2][0]).clamp(-1.0, 1.0).asin();
+    let roll = m[2][1].atan2(m[2][2]);
+    let yaw = m[1][0].atan2(m[0][0]);
+    let deg = 180.0 / std::f32::consts::PI;
+    [pitch * deg, roll * deg, yaw * deg]
+}
+
+/// The rotation matrix of a unit quaternion, body axes as columns.
+pub fn matrix(q: [f32; 4]) -> [[f32; 3]; 3] {
+    let [w, x, y, z] = q;
+    [
+        [
+            1.0 - 2.0 * (y * y + z * z),
+            2.0 * (x * y - z * w),
+            2.0 * (x * z + y * w),
+        ],
+        [
+            2.0 * (x * y + z * w),
+            1.0 - 2.0 * (x * x + z * z),
+            2.0 * (y * z - x * w),
+        ],
+        [
+            2.0 * (x * z - y * w),
+            2.0 * (y * z + x * w),
+            1.0 - 2.0 * (x * x + y * y),
+        ],
+    ]
+}
+
+/// Euclidean length of a vector.
+pub fn norm(v: [f32; 3]) -> f32 {
+    (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()
+}
 
 /// Units per physical unit → physical units per raw unit. A driver that declared no resolution
 /// leaves the numbers raw, which is at least not wrong.
@@ -517,10 +360,6 @@ fn scale(per_unit: i32) -> f32 {
     } else {
         1.0
     }
-}
-
-fn norm(v: [f32; 3]) -> f32 {
-    (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()
 }
 
 fn normalized(v: [f32; 3]) -> [f32; 3] {
@@ -574,36 +413,6 @@ fn from_rotvec(r: [f32; 3]) -> [f32; 4] {
 fn rotate(q: [f32; 4], v: [f32; 3]) -> [f32; 3] {
     let p = mul(mul(q, [0.0, v[0], v[1], v[2]]), conj(q));
     [p[1], p[2], p[3]]
-}
-
-fn rotate_matrix(m: [[f32; 3]; 3], v: [f32; 3]) -> [f32; 3] {
-    [
-        m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2],
-        m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
-        m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2],
-    ]
-}
-
-/// The rotation matrix of a unit quaternion, body axes as columns.
-fn matrix(q: [f32; 4]) -> [[f32; 3]; 3] {
-    let [w, x, y, z] = q;
-    [
-        [
-            1.0 - 2.0 * (y * y + z * z),
-            2.0 * (x * y - z * w),
-            2.0 * (x * z + y * w),
-        ],
-        [
-            2.0 * (x * y + z * w),
-            1.0 - 2.0 * (x * x + z * z),
-            2.0 * (y * z - x * w),
-        ],
-        [
-            2.0 * (x * z - y * w),
-            2.0 * (y * z + x * w),
-            1.0 - 2.0 * (x * x + y * y),
-        ],
-    ]
 }
 
 /// The body → world rotation that carries the measured up (the accelerometer at rest) onto the
@@ -680,10 +489,11 @@ mod tests {
     }
 
     /// Flat on the table: level, and the clone's 12 °/s of Z bias is learned rather than
-    /// integrated — the drawn pad must not spin while the real one lies still.
+    /// integrated — the attitude must not spin while the real pad lies still.
     #[test]
     fn a_pad_at_rest_reads_level_and_learns_its_bias() {
         let mut imu = Imu::new(a_device());
+        assert!(imu.quaternion().is_none(), "no attitude before a sample");
         steady(&mut imu, 3.0, [0.0, 0.0, 1.0], [1.8, -0.6, 12.0]);
 
         let bias = imu.bias_dps().expect("three seconds still is a bias");
@@ -694,6 +504,7 @@ mod tests {
         assert!(yaw.abs() < 12.0 * 0.6, "yaw stopped drifting: {yaw}");
         let rate = imu.rate_hz().expect("a rate");
         assert!((rate - 200.0).abs() < 2.0, "{rate}");
+        assert!(imu.quaternion().is_some());
     }
 
     /// Nose up: gravity moves toward −X on the body, and the filter reads that as positive pitch.
@@ -756,76 +567,26 @@ mod tests {
         assert!((after[1] - before[1]).abs() < 0.5, "{before:?} → {after:?}");
     }
 
-    /// The wireframe lands on the canvas: something is drawn, in the pad's colours, and a level
-    /// pad and a rolled pad are different pictures.
+    /// Re-zeroing: the attitude relative to a reference taken a moment ago is what the pad did
+    /// since — a yaw the gyro has drifted by is gone the moment a new reference is taken, and a
+    /// turn made after it reads in full.
     #[test]
-    fn the_pad_is_drawn_and_moves_with_the_attitude() {
-        fn picture(imu: &Imu) -> Vec<String> {
-            let area = Rect::new(0, 0, 40, 10);
-            let mut buf = Buffer::empty(area);
-            imu.draw(area, &mut buf);
-            (0..10)
-                .map(|y| (0..40).map(|x| buf[(x, y)].symbol()).collect())
-                .collect()
-        }
+    fn a_relative_attitude_starts_from_zero_and_reads_the_turn_since() {
+        let mut imu = Imu::new(a_device());
+        steady(&mut imu, 2.0, [0.0, 0.0, 1.0], [0.0; 3]);
+        // Drift: 40 °/s of yaw for a second, unlearned because the pad is "moving".
+        steady(&mut imu, 1.0, [0.0, 0.0, 1.4], [0.0, 0.0, 40.0]);
+        let drifted = imu.quaternion().unwrap();
+        assert!(euler_deg(drifted)[2].abs() > 30.0, "{:?}", euler_deg(drifted));
 
-        let mut level = Imu::new(a_device());
-        steady(&mut level, 0.1, [0.0, 0.0, 1.0], [0.0; 3]);
-        let flat = picture(&level);
-        let inked = flat.iter().flat_map(|r| r.chars()).filter(|c| *c != ' ').count();
-        assert!(inked > 30, "a wireframe is more than a few pixels: {inked}");
+        let reference = drifted;
+        let zeroed = euler_deg(relative(reference, imu.quaternion().unwrap()));
+        assert!(zeroed.iter().all(|a| a.abs() < 0.01), "{zeroed:?}");
 
-        let mut rolled = Imu::new(a_device());
-        steady(&mut rolled, 0.1, [0.0, 0.7, 0.7], [0.0; 3]);
-        assert_ne!(flat, picture(&rolled), "a rolled pad is a different picture");
-    }
-}
-
-#[cfg(test)]
-mod probe {
-    use super::*;
-
-    /// Print the wireframe for a few attitudes. Not an assertion — a way to look at the picture
-    /// without a pad in hand: `cargo test -p robotctl pad_imu::probe -- --ignored --nocapture`.
-    #[test]
-    #[ignore = "visual probe, run manually with --ignored --nocapture"]
-    fn show_me_the_pad() {
-        for (name, accel) in [
-            ("flat", [0.0, 0.0, 1.0]),
-            ("nose up 30°", [-0.5, 0.0, 0.866]),
-            ("rolled left 45°", [0.0, -0.707, 0.707]),
-            ("on its front edge", [1.0, 0.0, 0.0]),
-        ] {
-            let device = proto::PadImuDevice {
-                name: String::new(),
-                node: String::new(),
-                accel_per_g: 4096,
-                gyro_per_dps: 14247,
-                accel_max: 32767,
-                gyro_max: 32_767_000,
-            };
-            let mut imu = Imu::new(device);
-            imu.absorb(&proto::PadImuBatch {
-                samples: vec![proto::PadImuSample {
-                    seq: 1,
-                    at_us: 1_000_000,
-                    accel: [
-                        (accel[0] * 4096.0) as i32,
-                        (accel[1] * 4096.0) as i32,
-                        (accel[2] * 4096.0) as i32,
-                    ],
-                    gyro: [0; 3],
-                }],
-                socket_dropped: 0,
-            });
-            let area = Rect::new(0, 0, 44, 10);
-            let mut buf = Buffer::empty(area);
-            imu.draw(area, &mut buf);
-            println!("── {name} · euler {:?}", imu.euler_deg());
-            for y in 0..10 {
-                let row: String = (0..44).map(|x| buf[(x, y)].symbol()).collect();
-                println!("│{row}│");
-            }
-        }
+        // Turn left 20° (about +Z) after the reference, and that is all that shows.
+        steady(&mut imu, 0.5, [0.0, 0.0, 1.4], [0.0, 0.0, 40.0]);
+        let since = euler_deg(relative(reference, imu.quaternion().unwrap()));
+        assert!((since[2] - 20.0).abs() < 1.0, "{since:?}");
+        assert!(since[0].abs() < 1.0 && since[1].abs() < 1.0, "{since:?}");
     }
 }

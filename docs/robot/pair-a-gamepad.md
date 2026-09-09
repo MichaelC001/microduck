@@ -69,7 +69,14 @@ that appears only when the pad has one: a wireframe pad posed like the real one,
 from gravity, yaw from the gyro alone (it drifts — nothing on a pad observes heading), and the
 gyro's rest bias, which the clone needs learned before the picture stops turning on its own. Set
 the pad down for half a second and the panel says `settled`. The stream costs nothing while the
-monitor is not open: `padd` reads the IMU node only while somebody is subscribed to the tap.
+monitor is not open: `padd` reads the IMU node only while somebody is subscribed to the tap — or
+while it is steering the head from it, below.
+
+The same attitude can drive the robot's head. `sudo robotctl configure`, section *Controller-IMU
+head control*, `enabled`: Y then hands the head to the pad's tilt while the sticks keep driving,
+Y again holds the head, and a third Y re-centres on the pad's current attitude and follows again —
+the [cheat sheet](cheatsheet.md#gamepad-configd) has the full cycle. The picture in the monitor and
+the head use one filter, so where the drawn pad points is where the head goes.
 
 `paired but NOT trusted` is the state worth knowing. It works now and does not reconnect after a
 reboot, because approving a reconnection needs an agent and at boot there is none. Re-run `pad pair`

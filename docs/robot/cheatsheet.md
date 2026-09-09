@@ -480,7 +480,7 @@ mapping is the prototype's, so muscle memory carries over:
 | left stick | drive: forward/back and strafe · head: head yaw and pitch · body pose: up and crouch |
 | right stick | drive: turn · head: neck pitch and head roll · body pose: pitch and roll |
 | **Start** | first press: torque on and a 2 s ramp to the home pose, then hold. Second press: the policy drives. After that it toggles the policy |
-| **Y** / triangle | head mode: sticks pose the head (body holds still) |
+| **Y** / triangle | head mode: sticks pose the head (body holds still). With `[imu_head] enabled` and a pad that has an IMU: the pad's tilt poses the head and the sticks keep driving — see below |
 | **B** / circle | body-pose mode: sticks lean and crouch the standing robot |
 | **A** / cross | ground pick |
 | **X** / square | roulade — one forward roll; hold to chain rolls |
@@ -491,6 +491,20 @@ mapping is the prototype's, so muscle memory carries over:
 | **DPad-Right** | reboot every servo: the way back from a tripped overload without pulling the battery. Torque off, then Start |
 | **Select** | torque off (`robot.relax`): the emergency release. The robot drops, so hold it. Then Start stands it up again |
 | **Select**, held 2 s | power off (the press has already cut torque) |
+
+**Drive the head with the pad itself.** A Pro Controller carries an IMU, and with
+
+```bash
+sudo robotctl configure      # Controller-IMU head control → enabled
+```
+
+Y changes meaning on such a pad: the first press hands the head to the pad — tilt it and the head
+tilts, turn it and the head turns — while the sticks go on driving the body. Press Y again and the
+head holds where it is, sticks still driving. Press it a third time and the pad drives the head again
+**from wherever the pad is now**: its yaw is a gyro's word alone and drifts, and re-centring on every
+re-entry is how you beat the drift without a magnetometer. `gain` in the same section is head
+radians per pad radian, 1 by default. On an Xbox pad, or with the switch off, Y is the stick head
+mode above. `padd` picks the change up within a second; no restart.
 
 There is no stop button: release the sticks and the robot stands, and `robotd`'s deadman stops it
 if `padd` dies. On a roller robot (`mode = "roller"` in `robotd.toml`) the sticks take the roller
