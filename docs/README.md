@@ -61,7 +61,7 @@ Dated records rather than reference. They describe a moment, and go stale on pur
 | [`media-bringup.md`](project/media-bringup.md) | What a Radxa Zero 3W does about video: the VPU, what MPP needs, and the two plugins that have to be built. |
 | [`pad-minimal-pairing.md`](project/pad-minimal-pairing.md) | The smallest board configuration a gamepad will bond under, found by taking one away at a time. |
 | [`idle-cpu.md`](project/idle-cpu.md) | What the daemons do when nobody is asking them to: four things that stopped, two that were measured and left alone, and what still wants a board. |
-| [`tof-on-demand.md`](project/tof-on-demand.md) | The head ToF and IMU range and read for nobody. What it would take to gate them on a subscriber, and why starting and stopping the unit is not it. Decision wanted. |
+| [`tof-on-demand.md`](project/tof-on-demand.md) | `tofd`'s idle 5% is nine parts head IMU to one part depth, and the IMU has no consumer. Why the laser and the unit are left alone. Decision wanted. |
 
 ## `ideas/` — not designed yet
 

@@ -119,7 +119,7 @@ is:
 
 ## What came after
 
-The head sensors are the loose end here: the poll got cheaper, and it still runs for nobody. See
-[`tof-on-demand.md`](tof-on-demand.md) for what gating it on a subscriber would take, why the unit
-is the wrong thing to start and stop, and the head IMU's 100 Hz — which is larger than anything on
-this page and has no consumer at all.
+The head sensors were the loose end here, and a `ps -L` on a board settled them: `tofd`'s idle ~5%
+is 4.5% head IMU and 0.5% depth, and the IMU has no consumer in the tree at all. So the poll this
+page made cheaper was never the cost, and the thing worth turning off is the sensor nobody asked
+for. See [`tof-on-demand.md`](tof-on-demand.md).
