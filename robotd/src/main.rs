@@ -1003,17 +1003,12 @@ async fn main() -> ExitCode {
 /// Enable torque and ramp to the home pose.
 #[cfg(target_os = "linux")]
 fn run_init(params: &Params, duration: Duration) -> ExitCode {
-    let mut io = match duck_control::bus::DynamixelIo::open(&params.bus.port) {
-        Ok(io) => io,
-        Err(e) => {
-            tracing::error!(error = %e, port = %params.bus.port, "cannot open the bus");
-            return ExitCode::FAILURE;
-        }
-    };
-    if let Err(e) = io.check_registers() {
-        tracing::error!(error = %e, "motor register check failed");
+    // The same open as the daemon's, replacement adoption included: `init` is what someone
+    // reaches for right after a motor swap, and it must not be the one path that refuses the
+    // new servo.
+    let Some(mut io) = open_bus(&params.bus.port, 0) else {
         return ExitCode::FAILURE;
-    }
+    };
     if let Err(e) = io.set_torque(true) {
         tracing::error!(error = %e, "cannot enable torque");
         return ExitCode::FAILURE;
@@ -1182,6 +1177,9 @@ fn open_bus(port: &str, attempt: u32) -> Option<BusIo> {
             return None;
         }
     };
+    if !adopt_missing_servo(&mut io, loud) {
+        return None;
+    }
     match io.check_registers() {
         Ok(0) => tracing::info!("motor registers already correct"),
         Ok(n) => tracing::warn!(corrected = n, "motor registers corrected"),
@@ -1197,6 +1195,67 @@ fn open_bus(port: &str, attempt: u32) -> Option<BusIo> {
         }
     }
     Some(io)
+}
+
+/// The motor-swap path: if exactly one expected servo is silent and a factory-fresh one
+/// answers instead, flash the new one as the missing joint.
+///
+/// A ping census of the fifteen expected IDs is all a complete bus pays for this. The
+/// factory-defaults probe — which reopens the port at 57 600 baud — only runs once a single
+/// servo is known to be missing, so an ordinary boot never scans for anything.
+///
+/// Returns whether the bus is worth checking further. `false` is "keep waiting": every servo
+/// unpowered, a servo missing with nothing fresh to replace it, or two missing at once, which
+/// cannot be told apart and is left to a human.
+#[cfg(target_os = "linux")]
+fn adopt_missing_servo(io: &mut BusIo, loud: bool) -> bool {
+    use duck_control::bus::replacement_target;
+
+    let missing = match io.missing_servos() {
+        Ok(missing) => missing,
+        Err(e) => {
+            if loud {
+                tracing::error!(error = %e, "cannot ping the servos; waiting, is servo power on?");
+            }
+            return false;
+        }
+    };
+    if missing.is_empty() {
+        return true;
+    }
+    if missing.len() == duck_control::NUM_JOINTS {
+        // Not a swap, just no power yet; `check_registers` below says so in the words people
+        // already know.
+        return true;
+    }
+    let Some(id) = replacement_target(&missing) else {
+        if loud {
+            tracing::error!(
+                ?missing,
+                "several servos are missing; a replacement can only be adopted one at a time, waiting"
+            );
+        }
+        return false;
+    };
+    match io.adopt_replacement(id) {
+        Ok(true) => true,
+        Ok(false) => {
+            if loud {
+                tracing::error!(
+                    id,
+                    "servo missing and nothing answers at factory defaults (id 1, 57600 baud); \
+                     is it plugged in? waiting"
+                );
+            }
+            false
+        }
+        Err(e) => {
+            if loud {
+                tracing::error!(error = %e, id, "adopting the replacement servo failed; waiting");
+            }
+            false
+        }
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
