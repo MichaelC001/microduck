@@ -85,8 +85,9 @@ pub fn pair_timeout(requested: Option<u32>) -> Duration {
 ///  - **`class`** is the BR/EDR class-of-device: bits 8-12 are the major device class, and `0x05`
 ///    is Peripheral. Bits 6-7 of the minor field distinguish keyboard from pointing device from
 ///    gamepad — `0x01` in bits 2-5 with the keyboard/pointer bits clear is a joystick or gamepad.
-///    Present for a classic pad, absent for a BLE-only one — and every pad tried so far has been
-///    LE-only, so this arm is from the specification and has never fired on hardware.
+///    Present for a classic pad, absent for a BLE-only one. A no-name "Pro Controller" (a Switch
+///    Pro clone) presents `0x2508` — peripheral, gamepad — and this is the arm that names it when
+///    BlueZ has not yet derived the icon from it.
 ///  - **`appearance`** is the BLE equivalent: category 15 (`0x03C0..=0x03C4`) is HID, and `0x03C4`
 ///    is specifically Gamepad. Many pads never set it, which is why it cannot stand alone. Only the
 ///    gamepad value counts, so an LE pad advertising generic HID falls through to its name.
@@ -287,14 +288,16 @@ mod tests {
     }
 
     /// A classic pad, identified by class-of-device with no icon and no name — which is what
-    /// discovery reports before a device is queried. Synthetic in a way the others are not: no pad
-    /// bonded to this robot has ever presented a class, so this arm is only ever exercised here.
+    /// discovery reports before a device is queried.
     #[test]
     fn a_peripheral_joystick_class_is_a_gamepad() {
         // Major 0x05 (peripheral), minor 0x01 (joystick): 0x000504.
         assert!(looks_like_a_gamepad("", None, Some(0x000504), None));
         // Minor 0x02, gamepad: 0x000508.
         assert!(looks_like_a_gamepad("", None, Some(0x000508), None));
+        // The class a "Pro Controller" Switch clone actually presents on the board (2026-09-09):
+        // the same gamepad minor with the limited-discoverable service bit set.
+        assert!(looks_like_a_gamepad("", None, Some(0x002508), None));
     }
 
     /// The direction that matters more. A keyboard and a mouse are peripherals too, and pairing

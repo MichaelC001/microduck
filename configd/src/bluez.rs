@@ -6,12 +6,21 @@
 //!
 //! ## The order, and why the state decides rather than the return values
 //!
-//! `connect` **before** `pair`, and `trust` after both. Leading with `Pair()` on an Xbox controller
-//! returns `AuthenticationCanceled`; that ordering comes from `microduck_runtime`'s notes and is the
-//! one that works on this board. It used to live in a provisioning script's comments and in whoever
-//! had done it before; now it is here, once, with the reason attached.
+//! **Which order depends on the transport**, and the two are opposite:
 //!
-//! But the order is **tried, not enforced**, because BlueZ's replies do not describe what happened:
+//!  - an **LE** pad (Xbox): `connect` **before** `pair`, and `trust` after both. Leading with
+//!    `Pair()` on an Xbox controller returns `AuthenticationCanceled`; that ordering comes from
+//!    `microduck_runtime`'s notes and is the one that works on this board.
+//!  - a **BR/EDR** pad (a "Pro Controller" Switch clone, and by the specification a DualShock or a
+//!    DualSense): `pair` **before** `connect`, then `trust`. See [the transport section](#which-transport-and-what-that-leaves-untested)
+//!    for what the other order does to it.
+//!
+//! `Snapshot::is_classic` decides, on whether BlueZ reports a `Class`. The rule used to live in a
+//! provisioning script's comments and in whoever had done it before; now it is here, once, with the
+//! reason attached.
+//!
+//! On the LE path the order is **tried, not enforced**, because BlueZ's replies do not describe what
+//! happened:
 //!
 //!  - `Connect()` on a device BlueZ has never bonded with can answer
 //!    `br-connection-profile-unavailable` — there is no profile to connect to *yet*. Refusing there
@@ -103,8 +112,8 @@
 //! BR/EDR and LE together, and every property `Snapshot` reads is optional partly because the two
 //! transports present different ones.
 //!
-//! But the pad all of this has been run against is **LE-only**. Its bond stores long-term keys and no
-//! `[LinkKey]`, and BlueZ reports no `Class` for it at all:
+//! The Xbox pad is **LE-only**. Its bond stores long-term keys and no `[LinkKey]`, and BlueZ reports
+//! no `Class` for it at all:
 //!
 //! ```text
 //! # /var/lib/bluetooth/<adapter>/<pad>/info
@@ -113,14 +122,27 @@
 //! [PeripheralLongTermKey]
 //! ```
 //!
-//! So the BR/EDR half of this file comes from the specification rather than from a radio. That
-//! includes the class-of-device branch in [`looks_like_a_gamepad`], which cannot have fired — an LE
-//! pad has no class to match — and the `br-connection-profile-unavailable` soft-fail above.
+//! The first **BR/EDR** pad arrived on 2026-09-09: a no-name "Pro Controller", a clone of Nintendo's
+//! Switch Pro Controller down to the modalias (`usb:v057Ep2009`), which is what makes the kernel's
+//! `hid-nintendo` bind it and expose it as "Nintendo Switch Pro Controller" on evdev. BlueZ reports
+//! it with `Class: 0x2508` — peripheral, gamepad — and derives `Icon: input-gaming` from that, so
+//! [`looks_like_a_gamepad`] recognises it on two signals, and the class-of-device branch has now
+//! fired on hardware. Only the HID and PnP UUIDs, no LE at all.
 //!
-//! Discovery stays on `auto` regardless, because the pads the heuristic names that are *not* LE — a
-//! DualShock, a DualSense — are BR/EDR HID, and filtering to LE would make hardware this claims to
-//! recognise unreachable. The thing to know is which way the risk runs: dropping BR/EDR would cost
-//! nothing yet observed, and the first classic pad to arrive exercises that path for the first time.
+//! What the LE order does to it, from `configd`'s own journal (2026-09-07, an earlier unit of the
+//! same pad): `Connect()` on the unbonded pad spends ten seconds and answers
+//! `br-connection-create-socket`; the `Pair()` fallback then answers
+//! `ConnectionAttemptFailed: Page Timeout`. The pad has left pairing mode — a rejected classic
+//! connection is enough to make it stop page-scanning — and every retry repeats the pair. Reproduced
+//! by hand, the same order (`bluetoothctl connect`, which bonds as a side effect, then `trust`) goes
+//! one step further and ends in the state that is hardest to read: `Paired: yes`, `Connected: yes`,
+//! a solid light on the pad, `pad status` saying connected — and **no input device**, so `padd` waits
+//! for a pad that BlueZ insists is there. `pair` → `connect` → `trust` works every time, so that is
+//! what `bond` does when `Class` is present. A pad already in the broken state is recovered with
+//! `pad forget` and a fresh `pad pair`.
+//!
+//! Discovery stays on `auto`, so BlueZ sweeps both transports and a Pro Controller and an Xbox pad
+//! are both found by the same search.
 //!
 //! ## Where this has and has not run
 //!
@@ -134,8 +156,13 @@
 //! that re-initiates: the adapter scans as a central for a bonded peripheral while `btd` advertises
 //! as a peripheral itself. Both roles at once hold on this board's radio.
 //!
-//! What has **not** been exercised on hardware: a pad that bonds over BR/EDR at all, a DualSense, two
-//! pads in pairing mode at once, and pairing by explicit address.
+//! The BR/EDR path was written from the Pro Controller clone's journal and from the `bluetoothctl`
+//! sequence that works on it by hand; `bond` follows that sequence call for call. The classic pad
+//! that the clone is bonded through today was bonded by hand, so the pair-first path in this file
+//! still owes its first `robotctl pad pair` on hardware.
+//!
+//! What has **not** been exercised on hardware: a DualSense, two pads in pairing mode at once, and
+//! pairing by explicit address.
 //!
 //! And one case that cannot be fixed from here: `pad forget` removes only the robot's half of the
 //! bond. A pad that still holds its half will not pair again until it is put back into pairing mode
@@ -382,6 +409,16 @@ impl Snapshot {
         })
     }
 
+    /// Does this pad bond over BR/EDR rather than LE?
+    ///
+    /// `Class` is the tell: it is the classic class-of-device, which an LE-only device has no way
+    /// to present, and BlueZ reports it from the inquiry response before anything else is known
+    /// about the device. `AddressType` does not separate the two — an Xbox pad's is `public` too.
+    /// The order `bond` tries depends on this, and the module docs say why.
+    fn is_classic(&self) -> bool {
+        self.class.is_some()
+    }
+
     fn is_gamepad(&self) -> bool {
         looks_like_a_gamepad(
             &self.name,
@@ -576,9 +613,52 @@ impl BlueZ {
             .await
             .map_err(|e| (proto::PadPairFailure::Other, e.to_string()))?;
 
-        if !device.paired {
-            // `Connect()` first, which is the order that works on this board — leading with `Pair()`
-            // on an Xbox controller returns `AuthenticationCanceled`.
+        if !device.paired && device.is_classic() {
+            // A BR/EDR pad: `Pair()` first, then `Connect()`. The other order — the one below, which
+            // an LE pad needs — does not work on classic HID and leaves things worse than it found
+            // them. Seen against a "Pro Controller" (a Switch Pro clone, class 0x2508):
+            // `Connect()` on the unbonded pad spends ten seconds and answers
+            // `br-connection-create-socket`, and the `Pair()` after it answers
+            // `ConnectionAttemptFailed: Page Timeout` — the pad has stopped page-scanning by then,
+            // and the person has to put it back into pairing mode. Done by hand in the same order,
+            // `bluetoothctl connect` then `trust`, the pad ends up *Paired and Connected* with no
+            // input device behind it: the light on the pad goes solid, `pad status` says connected,
+            // and `padd` has nothing to open. `pair` → `connect` → `trust` is the sequence that
+            // works, so it is the one this takes.
+            //
+            // `Pair()` on BR/EDR is synchronous and answers when the bond is done — but it is still
+            // raced against `Paired`, as below, because that property is the ground truth and the
+            // reply is only one way to learn it.
+            let paired = tokio::select! {
+                outcome = tokio::time::timeout(BOND_TIMEOUT, proxy.pair()) => match outcome {
+                    Ok(Ok(())) => { tracing::info!("bonded (classic)"); true }
+                    Ok(Err(e)) if is_already_paired(&e) => { tracing::info!("already bonded"); true }
+                    Ok(Err(e)) => return Err((proto::PadPairFailure::Rejected, e.to_string())),
+                    Err(_) => false,
+                },
+                bonded = self.wait_until_paired(&device.mac, BOND_TIMEOUT) => bonded,
+            };
+            if !paired {
+                return Err((
+                    proto::PadPairFailure::Timeout,
+                    "the pad did not finish pairing".to_owned(),
+                ));
+            }
+
+            // Now connect, which is what brings up the HID channel and hands the pad to the kernel
+            // driver — `hid-nintendo`, for the clone above — so an input device appears. Soft: a
+            // bonded and trusted pad reconnects by itself, so a refusal here is not worth failing a
+            // pairing that succeeded. Logged at warn rather than info, though, because a classic
+            // pad that bonded and will not connect is the "connected light, no input" state from
+            // the other order, and worth a line in the journal.
+            match tokio::time::timeout(BOND_TIMEOUT, proxy.connect()).await {
+                Ok(Ok(())) => tracing::info!("connected"),
+                Ok(Err(e)) => tracing::warn!(error = %e, "bonded but not connected yet"),
+                Err(_) => tracing::warn!("bonded; connect did not answer in time"),
+            }
+        } else if !device.paired {
+            // An LE pad. `Connect()` first, which is the order that works on this board — leading
+            // with `Pair()` on an Xbox controller returns `AuthenticationCanceled`.
             //
             // But **soft-failed**, deliberately. A device BlueZ has never bonded with has no known
             // profile to connect to, so `Connect()` can answer
