@@ -373,8 +373,12 @@ impl Shared {
         state.send(&Arc::new(proto::PadReport::ImuDetached { why }));
     }
 
-    fn sample(&self, sample: proto::PadImuSample) {
-        self.lock().send(&Arc::new(proto::PadReport::Imu(sample)));
+    fn samples(&self, samples: Vec<proto::PadImuSample>) {
+        self.lock()
+            .send(&Arc::new(proto::PadReport::Imu(proto::PadImuBatch {
+                samples,
+                socket_dropped: 0,
+            })));
     }
 
     fn attach(&self, device: proto::PadInputDevice) {
@@ -558,12 +562,12 @@ fn subscriber(stream: UnixStream, shared: &Arc<Shared>) {
                     })
                 })
             }
-            proto::PadReport::Imu(sample) => {
+            proto::PadReport::Imu(batch) => {
                 let missed = dropped.samples.swap(0, Ordering::Relaxed);
                 (missed > 0).then(|| {
-                    proto::PadReport::Imu(proto::PadImuSample {
+                    proto::PadReport::Imu(proto::PadImuBatch {
                         socket_dropped: missed,
-                        ..sample.clone()
+                        ..batch.clone()
                     })
                 })
             }
@@ -695,7 +699,8 @@ fn read_imu(shared: &Arc<Shared>) {
 ///
 /// A sample is the six `ABS_*` values as they stand at each `SYN_REPORT`. Axes a report did not
 /// mention keep their last value, which is the kernel's own contract for absolute axes — a driver
-/// that leaves an unchanged axis out of a report has not zeroed it.
+/// that leaves an unchanged axis out of a report has not zeroed it. The samples one read produced
+/// go out together, as one report: that is what keeps this affordable at six hundred a second.
 fn stream_imu(shared: &Arc<Shared>, node: &Path) -> String {
     let mut device = match RawDevice::open(node) {
         Ok(device) => device,
@@ -707,6 +712,7 @@ fn stream_imu(shared: &Arc<Shared>, node: &Path) -> String {
 
     let mut seq = 0u64;
     let mut resyncing = false;
+    let mut samples: Vec<proto::PadImuSample> = Vec::new();
     loop {
         let batch = match device.fetch_events() {
             Ok(batch) => batch,
@@ -727,12 +733,11 @@ fn stream_imu(shared: &Arc<Shared>, node: &Path) -> String {
                             continue;
                         }
                         seq += 1;
-                        shared.sample(proto::PadImuSample {
+                        samples.push(proto::PadImuSample {
                             seq,
                             at_us: micros(event.timestamp()),
                             accel: [current[0], current[1], current[2]],
                             gyro: [current[3], current[4], current[5]],
-                            socket_dropped: 0,
                         });
                     }
                     _ => {}
@@ -744,6 +749,9 @@ fn stream_imu(shared: &Arc<Shared>, node: &Path) -> String {
             {
                 current[slot] = event.value();
             }
+        }
+        if !samples.is_empty() {
+            shared.samples(std::mem::take(&mut samples));
         }
         if let Some(why) = shared.done_with_imu(node) {
             return why.to_owned();
@@ -1043,11 +1051,13 @@ mod tests {
     }
 
     fn a_sample(seq: u64) -> Arc<proto::PadReport> {
-        Arc::new(proto::PadReport::Imu(proto::PadImuSample {
-            seq,
-            at_us: 1_000_000 + seq * 1_667,
-            accel: [-391, -35, 4270],
-            gyro: [25_000, -9_000, 171_000],
+        Arc::new(proto::PadReport::Imu(proto::PadImuBatch {
+            samples: vec![proto::PadImuSample {
+                seq,
+                at_us: 1_000_000 + seq * 1_667,
+                accel: [-391, -35, 4270],
+                gyro: [25_000, -9_000, 171_000],
+            }],
             socket_dropped: 0,
         }))
     }

@@ -209,10 +209,16 @@ impl Imu {
         self.bias.value
     }
 
-    /// Take one sample.
-    pub fn absorb(&mut self, sample: &proto::PadImuSample) {
+    /// Take one batch, sample by sample and in order.
+    pub fn absorb(&mut self, batch: &proto::PadImuBatch) {
+        self.socket_dropped += batch.socket_dropped;
+        for sample in &batch.samples {
+            self.sample(sample);
+        }
+    }
+
+    fn sample(&mut self, sample: &proto::PadImuSample) {
         self.samples += 1;
-        self.socket_dropped += sample.socket_dropped;
 
         let accel_scale = scale(self.device.accel_per_g);
         let gyro_scale = scale(self.device.gyro_per_dps);
@@ -654,6 +660,12 @@ mod tests {
                 (gyro_dps[1] * 14247.0) as i32,
                 (gyro_dps[2] * 14247.0) as i32,
             ],
+        }
+    }
+
+    fn one(sample: proto::PadImuSample) -> proto::PadImuBatch {
+        proto::PadImuBatch {
+            samples: vec![sample],
             socket_dropped: 0,
         }
     }
@@ -663,7 +675,7 @@ mod tests {
         let n = (seconds * 200.0) as u64;
         let start = imu.last_us.unwrap_or(0);
         for i in 1..=n {
-            imu.absorb(&sample(i, start + i * 5_000, accel_g, gyro_dps));
+            imu.absorb(&one(sample(i, start + i * 5_000, accel_g, gyro_dps)));
         }
     }
 
@@ -734,7 +746,12 @@ mod tests {
         steady(&mut imu, 2.0, [0.0, 0.0, 1.0], [0.0; 3]);
         let before = imu.euler_deg();
         let last = imu.last_us.unwrap();
-        imu.absorb(&sample(9_999, last + 3_000_000, [0.0, 0.0, 1.0], [90.0, 0.0, 0.0]));
+        imu.absorb(&one(sample(
+            9_999,
+            last + 3_000_000,
+            [0.0, 0.0, 1.0],
+            [90.0, 0.0, 0.0],
+        )));
         let after = imu.euler_deg();
         assert!((after[1] - before[1]).abs() < 0.5, "{before:?} → {after:?}");
     }
@@ -788,15 +805,17 @@ mod probe {
                 gyro_max: 32_767_000,
             };
             let mut imu = Imu::new(device);
-            imu.absorb(&proto::PadImuSample {
-                seq: 1,
-                at_us: 1_000_000,
-                accel: [
-                    (accel[0] * 4096.0) as i32,
-                    (accel[1] * 4096.0) as i32,
-                    (accel[2] * 4096.0) as i32,
-                ],
-                gyro: [0; 3],
+            imu.absorb(&proto::PadImuBatch {
+                samples: vec![proto::PadImuSample {
+                    seq: 1,
+                    at_us: 1_000_000,
+                    accel: [
+                        (accel[0] * 4096.0) as i32,
+                        (accel[1] * 4096.0) as i32,
+                        (accel[2] * 4096.0) as i32,
+                    ],
+                    gyro: [0; 3],
+                }],
                 socket_dropped: 0,
             });
             let area = Rect::new(0, 0, 44, 10);

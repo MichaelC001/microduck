@@ -1037,9 +1037,9 @@ impl PadView {
             proto::PadReport::ImuAttached { device } => {
                 self.imu = Some(pad_imu::Imu::new(*device));
             }
-            proto::PadReport::Imu(sample) => {
+            proto::PadReport::Imu(batch) => {
                 if let Some(imu) = self.imu.as_mut() {
-                    imu.absorb(&sample);
+                    imu.absorb(&batch);
                 }
             }
             proto::PadReport::ImuDetached { .. } => self.imu = None,
@@ -3847,11 +3847,13 @@ mod tests {
         for i in 1..=200u64 {
             feed(
                 &mut view,
-                Update::Pad(Box::new(proto::PadReport::Imu(proto::PadImuSample {
-                    seq: i,
-                    at_us: 1_000_000 + i * 5_000,
-                    accel: [-391, -35, 4270],
-                    gyro: [25_000, -9_000, 171_000],
+                Update::Pad(Box::new(proto::PadReport::Imu(proto::PadImuBatch {
+                    samples: vec![proto::PadImuSample {
+                        seq: i,
+                        at_us: 1_000_000 + i * 5_000,
+                        accel: [-391, -35, 4270],
+                        gyro: [25_000, -9_000, 171_000],
+                    }],
                     socket_dropped: 0,
                 }))),
             );
@@ -3892,11 +3894,13 @@ mod tests {
         let repaints = (1..=100u64)
             .filter(|i| {
                 view.absorb(Update::Pad(Box::new(proto::PadReport::Imu(
-                    proto::PadImuSample {
-                        seq: *i,
-                        at_us: 1_000_000 + i * 1_667,
-                        accel: [0, 0, 4096],
-                        gyro: [0, 0, 0],
+                    proto::PadImuBatch {
+                        samples: vec![proto::PadImuSample {
+                            seq: *i,
+                            at_us: 1_000_000 + i * 1_667,
+                            accel: [0, 0, 4096],
+                            gyro: [0, 0, 0],
+                        }],
                         socket_dropped: 0,
                     },
                 ))))

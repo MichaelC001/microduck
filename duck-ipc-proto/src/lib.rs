@@ -4152,8 +4152,8 @@ pub enum PadReport {
     /// pad without one simply never sends this. Everything in a [`PadImuSample`] is read against
     /// the device here.
     ImuAttached { device: Box<PadImuDevice> },
-    /// One inertial sample, as the kernel framed it.
-    Imu(PadImuSample),
+    /// Inertial samples, as many as the kernel handed over in one read — see [`PadImuBatch`].
+    Imu(PadImuBatch),
     /// The IMU node closed.
     ImuDetached { why: String },
 }
@@ -4182,6 +4182,24 @@ pub struct PadImuDevice {
     pub gyro_max: i32,
 }
 
+/// The inertial samples one read of the IMU node produced.
+///
+/// A batch rather than one sample per report, because of what a sample costs to send: at six
+/// hundred a second, one JSON line and one socket write each was measured at 6.6% of a core on the
+/// board (2026-09-09, `padd` with a subscriber). The kernel already groups them — the clone packs
+/// three samples into every HID packet — so the tap sends what one `read` returned, and the
+/// viewer takes them in order. Nothing is summarised: every sample is here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PadImuBatch {
+    /// In the order the kernel delivered them, oldest first. Never empty on the wire.
+    pub samples: Vec<PadImuSample>,
+    /// Batches this subscriber missed because its own socket was behind, since the last one it did
+    /// receive. Counted apart from [`PadFrame::socket_dropped`]: a dropped IMU batch says nothing
+    /// about the stick reports.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub socket_dropped: u64,
+}
+
 /// One inertial sample: everything the IMU node delivered between two `SYN_REPORT`s.
 ///
 /// Raw kernel units, deliberately — the tap hands out what the device said and the resolution to
@@ -4190,7 +4208,8 @@ pub struct PadImuDevice {
 /// paid for on the board's CPU.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PadImuSample {
-    /// Samples since this IMU attached, counted by `padd`. A hole is [`Self::socket_dropped`].
+    /// Samples since this IMU attached, counted by `padd`. A hole is a batch this subscriber
+    /// missed — [`PadImuBatch::socket_dropped`].
     pub seq: u64,
     /// The kernel's timestamp, microseconds since the epoch — the same clock and the same
     /// caveats as [`PadFrame::at_us`].
@@ -4200,11 +4219,6 @@ pub struct PadImuSample {
     pub accel: [i32; 3],
     /// `ABS_RX`, `ABS_RY`, `ABS_RZ`: angular rate about the same three axes.
     pub gyro: [i32; 3],
-    /// Samples this subscriber missed because its own socket was behind, since the last one it
-    /// did receive. Counted apart from [`PadFrame::socket_dropped`]: a dropped IMU sample says
-    /// nothing about the stick reports.
-    #[serde(default, skip_serializing_if = "is_zero")]
-    pub socket_dropped: u64,
 }
 
 /// One report from the pad: everything the kernel delivered between two `SYN_REPORT`s.
