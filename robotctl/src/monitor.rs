@@ -31,7 +31,7 @@ use ratatui::widgets::{
     Block, Cell, Paragraph, RenderDirection, Row, Sparkline, Table, TableState,
 };
 
-use crate::{Client, Failure, duck, exit, pad_imu, path_map};
+use crate::{Client, Failure, duck, exit, imu_view, path_map};
 
 /// Tracking error at the edge of a deviation bar, radians.
 ///
@@ -1171,7 +1171,7 @@ fn render_imu(imu: &pad_imu::Imu, frame: &mut ratatui::Frame, area: ratatui::lay
         Constraint::Min(0),
     ])
     .areas::<2>(inner);
-    imu.draw(picture, frame.buffer_mut());
+    imu_view::draw(imu, picture, frame.buffer_mut());
 
     let [pitch, roll, yaw] = imu.euler_deg();
     let a = imu.accel_g();

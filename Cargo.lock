@@ -3235,6 +3235,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06503bb33f294c5f1ba484011e053bfa6ae227074bdb841e9863492dc5960d4b"
 
 [[package]]
+name = "pad-imu"
+version = "0.11.0"
+dependencies = [
+ "duck-ipc-proto",
+]
+
+[[package]]
 name = "padd"
 version = "0.11.0"
 dependencies = [
@@ -3243,6 +3250,7 @@ dependencies = [
  "evdev",
  "gilrs",
  "libc",
+ "pad-imu",
  "robotd-params",
  "serde",
  "serde_json",
@@ -3805,6 +3813,7 @@ dependencies = [
  "duck-ipc-proto",
  "kinematics",
  "libc",
+ "pad-imu",
  "ratatui",
  "robotd-params",
  "semver",
