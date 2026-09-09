@@ -412,6 +412,10 @@ with gr.Blocks(title="duck vision demo") as demo:
     picture = gr.Image(label="from the robot", height=520)
     frame_note = gr.Markdown("")
 
+    # Defined here rather than beside its `tick`, because the buttons below switch it on and off
+    # and Gradio needs the component to exist before an event can name it.
+    ticker = gr.Timer(0.5, active=False)
+
     with gr.Accordion("the log — every call, every frame stream, every refusal", open=False):
         gr.Markdown(
             "The same lines the container's stderr gets. `DUCK_LOG=DEBUG` adds more. Paste this "
@@ -423,14 +427,27 @@ with gr.Blocks(title="duck vision demo") as demo:
     finding.click(find, inputs=typed_token, outputs=[chosen, status])
     connecting.click(connect, inputs=[chosen, typed_token], outputs=status)
     disconnecting.click(lambda: LINK.disconnect(), outputs=status)
-    starting.click(start, inputs=[receiver_url, fps, longest], outputs=status)
-    stopping.click(stop, outputs=status)
+    # The frame poll follows the stream: on when one is asked for, off when it is stopped or the
+    # session ends.
+    starting.click(start, inputs=[receiver_url, fps, longest], outputs=status).then(
+        lambda: gr.Timer(active=True), outputs=ticker
+    )
+    stopping.click(stop, outputs=status).then(
+        lambda: gr.Timer(active=False), outputs=ticker
+    )
+    disconnecting.click(lambda: gr.Timer(active=False), outputs=ticker)
 
-    # **Four a second, for a stream that sends five.** Polling faster than the source produces
-    # ticks with nothing new in them, and each of those was a re-encoded PNG for the browser to
-    # parse — which is what Safari was complaining about. `render` skips an unchanged frame too, so
-    # this is the ceiling rather than the rate.
-    gr.Timer(0.25).tick(
+    # **Twice a second, and only while something is streaming.**
+    #
+    # Every tick is a request to the Space whether or not there is a new frame, and an idle page
+    # polling forever is what earns a `429` from the platform's edge — which looks exactly like a
+    # broken Space and is nobody's bug. So the timer starts inactive and the buttons turn it on
+    # and off: a page that nobody has connected costs nothing at all.
+    #
+    # Two a second for a five-frame-a-second stream shows every other frame, which for a
+    # perception demo is the difference between "smooth" and "polite". `render` still skips an
+    # unchanged frame on top of that.
+    ticker.tick(
         render, inputs=chosen_filter, outputs=[picture, frame_note], show_progress="hidden"
     )
 
@@ -440,7 +457,8 @@ with gr.Blocks(title="duck vision demo") as demo:
         lines = list(RING.lines)[-40:]
         return ("```\n" + "\n".join(lines) + "\n```") if lines else ""
 
-    gr.Timer(3.0).tick(tail, outputs=wire_log, show_progress="hidden")
+    # Ten seconds: it is a diagnostic, read after something went wrong rather than watched.
+    gr.Timer(10.0).tick(tail, outputs=wire_log, show_progress="hidden")
 
 
 # **FastAPI owns the server and Gradio is mounted into it**, not the other way round: the robot's
