@@ -144,11 +144,14 @@
 //! **The clone is also two devices at once.** In pairing mode it advertises an LE face,
 //! `BLE Controller_280609` at `98:B6:ED:28:06:09` — no class, no appearance, matched by the name
 //! heuristic alone — and the BR/EDR face, `Pro Controller` at `98:B6:E9:28:06:09`. The LE face is
-//! reported first. The first `robotctl pad pair` on this branch (2026-09-09) stopped on it, took the
+//! reported first — and, after the adapter power cycle `pad pair` performs on this board, several
+//! seconds first. The first `robotctl pad pair` on this branch (2026-09-09) stopped on it, took the
 //! LE order, hung [`BOND_TIMEOUT`] in `Connect()`, and by the time `Pair()` was tried the temporary
-//! object was gone: `UnknownObject: Method "Pair" ... doesn't exist`. So `find` now sweeps
-//! [`SIBLING_GRACE`] past the first unbonded match, and `one_face_per_pad` folds candidates that
-//! share their unit octets into the classic one before the ambiguity rule sees them.
+//! object was gone: `UnknownObject: Method "Pair" ... doesn't exist`. A two-second grace after the
+//! first match did not help; the BR/EDR face was still not in the tree. So `find` now ends the
+//! search early only on a match the radio classified — the LE face's name-only match is kept as a
+//! fallback but never stops the sweep — and `one_face_per_pad` folds candidates that share their
+//! unit octets into the classic one before the ambiguity rule sees them.
 //!
 //! Discovery stays on `auto`, so BlueZ sweeps both transports and a Pro Controller and an Xbox pad
 //! are both found by the same search.
@@ -185,7 +188,7 @@ use duck_ipc_proto as proto;
 use zbus::names::OwnedInterfaceName;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue};
 
-use crate::pad::{PadResult, Pads, looks_like_a_gamepad, same_pad};
+use crate::pad::{Evidence, PadResult, Pads, gamepad_evidence, same_pad};
 
 /// Where our pairing agent lives on the bus. Any path we own will do; this one says whose it is.
 const AGENT_PATH: &str = "/com/pollenrobotics/configd/pad_agent";
@@ -213,13 +216,16 @@ const BOND_SETTLE: Duration = Duration::from_secs(5);
 /// How often to re-read `Paired` while waiting for a bond.
 const BOND_POLL: Duration = Duration::from_millis(200);
 
-/// How long to keep sweeping after the first unbonded pad turns up, for the rest of it.
+/// How long to keep sweeping after the first classified, unbonded pad turns up, for the rest of it.
 ///
-/// A pad can be two devices — the Pro Controller clones advertise an LE face and a BR/EDR face, and
-/// the LE one is reported first. Stopping on the first match picked that one, whose `Connect()`
-/// hangs for [`BOND_TIMEOUT`] and whose object is gone by the time `Pair()` is tried. Two seconds is
-/// several inquiry results on this adapter, and the cost is two seconds on every pairing.
-const SIBLING_GRACE: Duration = Duration::from_secs(2);
+/// A pad can be two devices — the Pro Controller clones advertise an LE face and a BR/EDR face.
+/// The classified one is the one worth having, and this is a short courtesy for the case where the
+/// two arrive close together and the other happens to be classified too. It is **not** what
+/// protects against the LE face: that face has nothing but a name, and a name-only match never
+/// ends the search early at all — see `find`. Measured: after the adapter power cycle `pad pair`
+/// performs on this board, the LE face was in BlueZ's tree within two seconds and the BR/EDR face
+/// was not, so no grace short enough to be free would have caught it.
+const SIBLING_GRACE: Duration = Duration::from_secs(1);
 
 /// How often to re-read the object tree while looking for a pad.
 ///
@@ -436,13 +442,23 @@ impl Snapshot {
         self.class.is_some()
     }
 
-    fn is_gamepad(&self) -> bool {
-        looks_like_a_gamepad(
+    fn evidence(&self) -> Option<Evidence> {
+        gamepad_evidence(
             &self.name,
             self.icon.as_deref(),
             self.class,
             self.appearance,
         )
+    }
+
+    fn is_gamepad(&self) -> bool {
+        self.evidence().is_some()
+    }
+
+    /// Unbonded, and a pad on the radio's word rather than its name's — the only kind of match the
+    /// search ends early on.
+    fn is_fresh_and_classified(&self) -> bool {
+        !self.paired && self.evidence() == Some(Evidence::Classified)
     }
 
     fn as_pad(&self) -> proto::Pad {
@@ -551,9 +567,13 @@ impl BlueZ {
     /// first, which is the wrong shape: a robot may have several pads bonded, and `padd` drives
     /// whichever connects.
     ///
-    /// So with no address given, the sweep only ends early on a candidate that is **not yet paired**;
-    /// otherwise it runs to the deadline and reports what it has, which may be the pad already
-    /// bonded. The cost is that re-running `pad pair` with nothing new in pairing mode takes the whole
+    /// So with no address given, the sweep only ends early on a candidate that is **not yet paired
+    /// and classified by the radio** — icon, class or appearance, not its name alone. A name-only
+    /// match is kept and used if nothing better arrives by the deadline, but it does not stop the
+    /// search: the Pro Controller clone's LE face is exactly such a match, it is reported seconds
+    /// before the BR/EDR face that actually pairs, and stopping on it cost every attempt a
+    /// thirty-second hang and a dead object. Otherwise the sweep runs to the deadline and reports
+    /// what it has, which may be the pad already bonded. The cost is that re-running `pad pair` with nothing new in pairing mode takes the whole
     /// window before saying "already paired" — `--timeout` shortens it.
     ///
     /// An explicit address ends the sweep as soon as it appears, paired or not: the caller has named
@@ -566,8 +586,8 @@ impl BlueZ {
     /// no way to learn the address that `--mac` needs. So the refusal carries the list.
     async fn find(&self, mac: Option<&str>, timeout: Duration) -> PadResult<Found> {
         let deadline = tokio::time::Instant::now() + timeout;
-        // When the first unbonded candidate was seen, so the sweep can run [`SIBLING_GRACE`] past
-        // it and catch a pad's other face before deciding.
+        // When the first classified, unbonded candidate was seen, so the sweep can run
+        // [`SIBLING_GRACE`] past it before deciding.
         let mut first_fresh: Option<tokio::time::Instant> = None;
         loop {
             let seen = self.devices().await?;
@@ -586,7 +606,7 @@ impl BlueZ {
             let worth_stopping_for = match mac {
                 Some(_) => !matches.is_empty(),
                 None => {
-                    if matches.iter().any(|device| !device.paired) {
+                    if matches.iter().any(Snapshot::is_fresh_and_classified) {
                         let since = *first_fresh.get_or_insert(now);
                         now - since >= SIBLING_GRACE
                     } else {

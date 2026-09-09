@@ -103,8 +103,29 @@ pub fn looks_like_a_gamepad(
     class: Option<u32>,
     appearance: Option<u16>,
 ) -> bool {
+    gamepad_evidence(name, icon, class, appearance).is_some()
+}
+
+/// How a device came to look like a gamepad — and how much that is worth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Evidence {
+    /// The radio said so: BlueZ's icon, the class-of-device or the gamepad appearance. Settled.
+    Classified,
+    /// Only the name said so. Enough to pair when nothing better turns up, and not enough to stop
+    /// looking: the Pro Controller clone's LE face is `BLE Controller_280609` with nothing else
+    /// set, and stopping on it is what cost every pairing thirty seconds and a dead object.
+    NameOnly,
+}
+
+/// [`looks_like_a_gamepad`], with the strength of the answer. Same four signals, same order.
+pub fn gamepad_evidence(
+    name: &str,
+    icon: Option<&str>,
+    class: Option<u32>,
+    appearance: Option<u16>,
+) -> Option<Evidence> {
     if icon == Some("input-gaming") {
-        return true;
+        return Some(Evidence::Classified);
     }
 
     if let Some(class) = class {
@@ -114,7 +135,7 @@ pub fn looks_like_a_gamepad(
         // 0x03 remote control — the keyboard (0x10) and pointing-device (0x20) bits are the ones
         // this must not match, and they live above these values rather than overlapping them.
         if major == 0x05 && matches!(minor & 0x0f, 0x01 | 0x02) {
-            return true;
+            return Some(Evidence::Classified);
         }
     }
 
@@ -122,7 +143,7 @@ pub fn looks_like_a_gamepad(
         // 0x03C4 is Gamepad; the rest of category 15 is other HID. Only the gamepad value counts,
         // because a Bluetooth keyboard is category 15 too and must not be paired as a pad.
         if appearance == 0x03C4 {
-            return true;
+            return Some(Evidence::Classified);
         }
     }
 
@@ -138,6 +159,7 @@ pub fn looks_like_a_gamepad(
     ]
     .iter()
     .any(|needle| lower.contains(needle))
+    .then_some(Evidence::NameOnly)
 }
 
 /// Are these two Bluetooth addresses two faces of one pad?
@@ -369,6 +391,21 @@ mod tests {
             assert!(looks_like_a_gamepad(name, None, None, None), "{name}");
         }
         assert!(!looks_like_a_gamepad("Pierre's iPhone", None, None, None));
+    }
+
+    /// A name is enough to pair on and not enough to stop looking on; anything the radio classified
+    /// is both. The clone's two faces, as BlueZ reports them, land on opposite sides.
+    #[test]
+    fn a_name_alone_is_weak_evidence() {
+        assert_eq!(
+            gamepad_evidence("BLE Controller_280609", None, None, None),
+            Some(Evidence::NameOnly)
+        );
+        assert_eq!(
+            gamepad_evidence("Pro Controller", Some("input-gaming"), Some(0x2508), None),
+            Some(Evidence::Classified)
+        );
+        assert_eq!(gamepad_evidence("Pierre's iPhone", None, None, None), None);
     }
 
     /// The whole arc, over the fake: pair the pad that is in pairing mode, see it bonded and
