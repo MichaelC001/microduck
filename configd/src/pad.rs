@@ -140,6 +140,37 @@ pub fn looks_like_a_gamepad(
     .any(|needle| lower.contains(needle))
 }
 
+/// Are these two Bluetooth addresses two faces of one pad?
+///
+/// Some pads are two devices at once. The no-name "Pro Controller" Switch clones advertise an LE
+/// personality (`BLE Controller_280609`, for phones) *and* the BR/EDR one that drives a robot, from
+/// two addresses that differ only in the vendor half: `98:B6:ED:28:06:09` and `98:B6:E9:28:06:09`.
+/// The lower three octets — the part a vendor assigns per unit — are identical, and the LE name
+/// even spells them out.
+///
+/// So two candidates that agree on those octets are one pad presenting twice, not two pads in
+/// pairing mode, and the choice between them is not ambiguous: the classic one is the one that
+/// carries HID to the kernel. Refusing would leave that pad unpairable without an address, and
+/// picking whichever appeared first is how the LE face got connected to for thirty seconds while
+/// the pad waited for a bond that never came.
+///
+/// Three octets, not two or four: two is too few to separate unrelated devices from one vendor,
+/// and four already reaches into the OUI, which is exactly the half that differs.
+pub fn same_pad(a: &str, b: &str) -> bool {
+    let tail = |mac: &str| -> Option<[u8; 3]> {
+        let mut parts = mac.rsplit(':');
+        let mut tail = [0u8; 3];
+        for slot in tail.iter_mut().rev() {
+            *slot = u8::from_str_radix(parts.next()?, 16).ok()?;
+        }
+        Some(tail)
+    };
+    match (tail(a), tail(b)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
 /// A set of pads that exists only in memory.
 ///
 /// Used by the tests and by `--fake-pads`, which is what makes the whole `pad.*` surface — and the
@@ -442,6 +473,16 @@ mod tests {
             panic!("{result:?}");
         };
         assert_eq!(pad.mac, "A4:AE:11:00:22:33");
+    }
+
+    /// The Pro Controller clone's two faces share their unit octets and nothing else about the
+    /// address; an unrelated device from the same vendor shares the OUI and nothing else.
+    #[test]
+    fn two_faces_of_one_pad_share_their_unit_octets() {
+        assert!(same_pad("98:B6:ED:28:06:09", "98:B6:E9:28:06:09"));
+        assert!(same_pad("98:b6:ed:28:06:09", "98:B6:E9:28:06:09"));
+        assert!(!same_pad("98:B6:E9:28:06:09", "98:B6:E9:46:9F:EA"));
+        assert!(!same_pad("98:B6:E9:28:06:09", "not an address"));
     }
 
     /// A caller cannot hold the adapter in discovery for as long as it likes, and zero means "look

@@ -141,6 +141,15 @@
 //! what `bond` does when `Class` is present. A pad already in the broken state is recovered with
 //! `pad forget` and a fresh `pad pair`.
 //!
+//! **The clone is also two devices at once.** In pairing mode it advertises an LE face,
+//! `BLE Controller_280609` at `98:B6:ED:28:06:09` — no class, no appearance, matched by the name
+//! heuristic alone — and the BR/EDR face, `Pro Controller` at `98:B6:E9:28:06:09`. The LE face is
+//! reported first. The first `robotctl pad pair` on this branch (2026-09-09) stopped on it, took the
+//! LE order, hung [`BOND_TIMEOUT`] in `Connect()`, and by the time `Pair()` was tried the temporary
+//! object was gone: `UnknownObject: Method "Pair" ... doesn't exist`. So `find` now sweeps
+//! [`SIBLING_GRACE`] past the first unbonded match, and `one_face_per_pad` folds candidates that
+//! share their unit octets into the classic one before the ambiguity rule sees them.
+//!
 //! Discovery stays on `auto`, so BlueZ sweeps both transports and a Pro Controller and an Xbox pad
 //! are both found by the same search.
 //!
@@ -176,7 +185,7 @@ use duck_ipc_proto as proto;
 use zbus::names::OwnedInterfaceName;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue};
 
-use crate::pad::{PadResult, Pads, looks_like_a_gamepad};
+use crate::pad::{PadResult, Pads, looks_like_a_gamepad, same_pad};
 
 /// Where our pairing agent lives on the bus. Any path we own will do; this one says whose it is.
 const AGENT_PATH: &str = "/com/pollenrobotics/configd/pad_agent";
@@ -203,6 +212,14 @@ const BOND_SETTLE: Duration = Duration::from_secs(5);
 
 /// How often to re-read `Paired` while waiting for a bond.
 const BOND_POLL: Duration = Duration::from_millis(200);
+
+/// How long to keep sweeping after the first unbonded pad turns up, for the rest of it.
+///
+/// A pad can be two devices — the Pro Controller clones advertise an LE face and a BR/EDR face, and
+/// the LE one is reported first. Stopping on the first match picked that one, whose `Connect()`
+/// hangs for [`BOND_TIMEOUT`] and whose object is gone by the time `Pair()` is tried. Two seconds is
+/// several inquiry results on this adapter, and the cost is two seconds on every pairing.
+const SIBLING_GRACE: Duration = Duration::from_secs(2);
 
 /// How often to re-read the object tree while looking for a pad.
 ///
@@ -549,6 +566,9 @@ impl BlueZ {
     /// no way to learn the address that `--mac` needs. So the refusal carries the list.
     async fn find(&self, mac: Option<&str>, timeout: Duration) -> PadResult<Found> {
         let deadline = tokio::time::Instant::now() + timeout;
+        // When the first unbonded candidate was seen, so the sweep can run [`SIBLING_GRACE`] past
+        // it and catch a pad's other face before deciding.
+        let mut first_fresh: Option<tokio::time::Instant> = None;
         loop {
             let seen = self.devices().await?;
             let matches: Vec<Snapshot> = seen
@@ -562,11 +582,19 @@ impl BlueZ {
                 .cloned()
                 .collect();
 
+            let now = tokio::time::Instant::now();
             let worth_stopping_for = match mac {
                 Some(_) => !matches.is_empty(),
-                None => matches.iter().any(|device| !device.paired),
+                None => {
+                    if matches.iter().any(|device| !device.paired) {
+                        let since = *first_fresh.get_or_insert(now);
+                        now - since >= SIBLING_GRACE
+                    } else {
+                        false
+                    }
+                }
             };
-            if worth_stopping_for || tokio::time::Instant::now() >= deadline {
+            if worth_stopping_for || now >= deadline {
                 return Ok(Found { matches, seen });
             }
             tokio::time::sleep(DISCOVERY_POLL.min(deadline - tokio::time::Instant::now())).await;
@@ -741,6 +769,38 @@ impl BlueZ {
     }
 }
 
+/// Collapse a pad that presents as two devices into the one worth bonding.
+///
+/// Candidates that share their unit octets — [`same_pad`] — are one pad seen over two transports,
+/// and the classic face is the one to keep: it is the one that carries HID to the kernel and the one
+/// `bond` knows the order for. Among faces of the same kind the lowest address wins, for the same
+/// determinism the caller applies to bonded pads. Candidates that share nothing pass through, so a
+/// genuine second pad in pairing mode is still refused as ambiguous.
+fn one_face_per_pad(fresh: Vec<&Snapshot>) -> Vec<&Snapshot> {
+    let mut kept: Vec<&Snapshot> = Vec::new();
+    for candidate in fresh {
+        match kept.iter_mut().find(|k| same_pad(&k.mac, &candidate.mac)) {
+            Some(face) => {
+                let better = match (candidate.is_classic(), face.is_classic()) {
+                    (true, false) => true,
+                    (false, true) => false,
+                    _ => candidate.mac < face.mac,
+                };
+                if better {
+                    tracing::info!(
+                        kept = %candidate.mac,
+                        dropped = %face.mac,
+                        "one pad, two faces: keeping the classic one"
+                    );
+                    *face = candidate;
+                }
+            }
+            None => kept.push(candidate),
+        }
+    }
+    kept
+}
+
 /// Did BlueZ refuse this because the bond already exists?
 fn is_already_paired(error: &zbus::Error) -> bool {
     matches!(error, zbus::Error::MethodError(name, _, _)
@@ -850,6 +910,7 @@ impl Pads for BlueZ {
                 // Without this, adding a second pad in a room where the first is in range would be
                 // refused as ambiguous forever.
                 let fresh: Vec<&Snapshot> = several.iter().filter(|d| !d.paired).collect();
+                let fresh = one_face_per_pad(fresh);
                 match fresh.as_slice() {
                     [only] => (*only).clone(),
                     // Nothing new: report the bonded one, and let `bond` re-assert `Trusted`. This is
@@ -986,5 +1047,50 @@ impl Pads for BlueZ {
             .map_err(|e| format!("bluetoothd would not remove {mac}: {e}"))?;
         tracing::info!(mac, "pad forgotten");
         Ok(proto::PadForgetResult { removed: true })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn face(mac: &str, name: &str, class: Option<u32>) -> Snapshot {
+        Snapshot {
+            path: OwnedObjectPath::try_from(format!(
+                "/org/bluez/hci0/dev_{}",
+                mac.replace(':', "_")
+            ))
+            .unwrap(),
+            mac: mac.to_owned(),
+            name: name.to_owned(),
+            icon: None,
+            class,
+            appearance: None,
+            paired: false,
+            trusted: false,
+            connected: false,
+        }
+    }
+
+    /// The Pro Controller clone as the radio reports it: an LE face first, the classic one after.
+    /// One pad comes out, and it is the classic one whichever order they arrived in.
+    #[test]
+    fn a_pad_with_two_faces_is_one_candidate_and_the_classic_face_wins() {
+        let le = face("98:B6:ED:28:06:09", "BLE Controller_280609", None);
+        let classic = face("98:B6:E9:28:06:09", "Pro Controller", Some(0x2508));
+
+        for order in [vec![&le, &classic], vec![&classic, &le]] {
+            let kept = one_face_per_pad(order);
+            assert_eq!(kept.len(), 1);
+            assert_eq!(kept[0].mac, classic.mac);
+        }
+    }
+
+    /// Two different pads stay two candidates — the ambiguity refusal downstream depends on it.
+    #[test]
+    fn two_pads_stay_two_candidates() {
+        let a = face("98:B6:E9:28:06:09", "Pro Controller", Some(0x2508));
+        let b = face("78:86:2E:BB:13:28", "Xbox Wireless Controller", None);
+        assert_eq!(one_face_per_pad(vec![&a, &b]).len(), 2);
     }
 }
