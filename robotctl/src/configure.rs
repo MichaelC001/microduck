@@ -79,9 +79,9 @@ impl Apply {
 
 /// What a change to `section.key` needs, and from which daemon.
 ///
-/// `robotd` parses this file for itself; `[media]` and `[detect]` are `mediad` reading the same
+/// `robotd` parses this file for itself; `[media]` and `[duck_detector]` are `mediad` reading the same
 /// file, because a per-board setting belongs in the per-board config rather than on a unit file the
-/// release installer rewrites — and because the camera frames `[detect]` is about are on `mediad`'s
+/// release installer rewrites — and because the camera frames `[duck_detector]` is about are on `mediad`'s
 /// tee. Being wrong here is an edit that appears to do nothing until the next reboot — which is
 /// exactly what the offer exists to prevent, so it is derived from the keys that changed rather
 /// than assumed.
@@ -97,7 +97,7 @@ impl Apply {
 fn apply_for(key: &str) -> Option<Apply> {
     let (section, name) = key.split_once('.')?;
     Some(match section {
-        "media" | "detect" => Apply::Restart("mediad"),
+        "media" | "duck_detector" => Apply::Restart("mediad"),
         // `padd` stats the file once a second and re-reads both of its sections when the mtime
         // moves — `padd/src/main.rs`, where the reload is a line above `tap.imu_control()` and
         // says why it is on every tick. So there is nothing to offer, and offering a restart
@@ -1341,10 +1341,10 @@ mod tests {
         );
     }
 
-    /// A `[detect]` change restarts `mediad`, not `robotd`.
+    /// A `[duck_detector]` change restarts `mediad`, not `robotd`.
     ///
     /// `robotd` owned every key in this file for long enough that the restart was hardcoded, and
-    /// `[detect]` is read by `mediad` because the camera frames are on its tee. Restarting the
+    /// `[duck_detector]` is read by `mediad` because the camera frames are on its tee. Restarting the
     /// A save records what it wrote, because that is what decides the restart.
     ///
     /// The bug this pins: `save` clears `pending`, and the restart decision is made after the
@@ -1359,12 +1359,13 @@ mod tests {
         let mut m = Model::load(&path).expect("loads");
 
         assert!(m.written().is_empty(), "nothing written yet");
-        m.edit(entry("detect.enabled"), "true").expect("edits");
+        m.edit(entry("duck_detector.enabled"), "true")
+            .expect("edits");
         assert!(!m.pending.is_empty());
         m.save().expect("saves");
 
         assert!(m.pending.is_empty(), "a save clears what is pending");
-        assert_eq!(m.written(), ["detect.enabled".to_owned()]);
+        assert_eq!(m.written(), ["duck_detector.enabled".to_owned()]);
         assert_eq!(plan_for_written(m.written()).restart, vec!["mediad"]);
 
         // A second save adds to the record rather than replacing it: somebody who changes the
@@ -1380,7 +1381,7 @@ mod tests {
     /// wrong daemon is how somebody edits a value three times and swears it does nothing.
     #[test]
     fn the_section_decides_which_daemon_restarts() {
-        let detect = vec!["detect.enabled".to_owned()];
+        let detect = vec!["duck_detector.enabled".to_owned()];
         assert_eq!(plan_for_written(&detect).restart, vec!["mediad"]);
 
         let policy = vec!["policy.mode".to_owned()];
@@ -1388,7 +1389,7 @@ mod tests {
 
         // Both, in the order they are least disruptive to restart: the control loop first, then the
         // camera — a robot that is standing up should not be waiting on a WebRTC teardown.
-        let both = vec!["detect.hz".to_owned(), "audio.enabled".to_owned()];
+        let both = vec!["duck_detector.hz".to_owned(), "audio.enabled".to_owned()];
         assert_eq!(plan_for_written(&both).restart, vec!["robotd", "mediad"]);
 
         // A button change restarts nothing: `padd` reads it back off the file by itself, and

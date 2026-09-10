@@ -1,7 +1,7 @@
 //! What this daemon streams and what it looks for, out of the config file `robotd` already reads.
 //!
 //! `[media]` in `/etc/robot/robotd.toml` — camera or test pattern, frame size, rate, bitrate — and
-//! `[detect]` beside it, which is this daemon's too because the frames are on this daemon's tee.
+//! `[duck_detector]` beside it, which is this daemon's too because the frames are on this daemon's tee.
 //! The schema, the defaults and the validation are `robotd_params`'s, which is the point: the crate
 //! read here is the one `robotctl configure` writes through, so the editor cannot offer a value
 //! this daemon would not understand.

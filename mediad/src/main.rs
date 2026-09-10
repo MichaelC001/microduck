@@ -227,8 +227,8 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    // What the stream is and what it looks for, from `[media]` and `[detect]` — see
-    // `--config` and `mediad::config`. One file, one read: `[detect]` is `mediad`'s section
+    // What the stream is and what it looks for, from `[media]` and `[duck_detector]` — see
+    // `--config` and `mediad::config`. One file, one read: `[duck_detector]` is `mediad`'s section
     // too, and a second config file for the second daemon that wants one is how a fleet ends
     // up with settings nobody can find.
     let explicit = args.config.is_some();
@@ -237,7 +237,7 @@ fn main() -> ExitCode {
         .clone()
         .unwrap_or_else(mediad::config::default_path);
     let params = mediad::config::load(&config, explicit);
-    let (media, detect) = (params.media, params.detect);
+    let (media, detect) = (params.media, params.duck_detector);
 
     // **What will actually run, not what is configured.** `[media] quality` is the rung a camera
     // streams at; a test pattern ignores it and runs at `TEST_PATTERN_GEOMETRY`, so a log line
@@ -450,7 +450,7 @@ fn main() -> ExitCode {
             (mediad::pipeline::Source::Sim(_), _) => None,
         };
 
-        // **The duck detector, from the same config file as everything else.** `[detect]` lives in
+        // **The duck detector, from the same config file as everything else.** `[duck_detector]` lives in
         // robotd.toml because that is the file `robotctl configure` edits and a robot has one place
         // for its switches — even though it is this daemon that reads that section.
         //
@@ -459,7 +459,7 @@ fn main() -> ExitCode {
         // boot because a model file moved" is a bad trade.
         let models = detect.models();
         let detector = if models.is_empty() {
-            tracing::info!("duck detector off ([detect] enabled = false, or no model)");
+            tracing::info!("duck detector off ([duck_detector] enabled = false, or no model)");
             None
         } else {
             // The frames on the tee are as the camera took them — unless the pipeline was asked

@@ -94,6 +94,16 @@ if [ -f "$script" ]; then
         || echo "postinstall: policies were not seeded; robotctl health will say so" >&2
 fi
 
+# The duck detector, the same way and for the same reason: `mediad` reads it from
+# /opt/robot/detector/current, a retrain is a tag on the Hub rather than a daemon release, and the
+# seeder never touches a set it did not install. Warned about, never fatal — the detector is
+# off by default, and a robot asked to look for ducks with no model says so in mediad's journal.
+script=scripts/seed-detector.sh
+if [ -f "$script" ]; then
+    sh "$script" \
+        || echo "postinstall: the duck detector was not seeded; mediad will say so if asked for it" >&2
+fi
+
 [ -d systemd ] || exit 0
 
 # Users and groups before units: a unit naming a `User=` that does not exist fails to start, and
