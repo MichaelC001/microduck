@@ -69,6 +69,12 @@
 //! without the capture path existing. The camera arrives as a different source element behind the
 //! same encoder, and `media-bringup.md` records why capture cannot simply be `v4l2src`.
 //!
+//! **It runs at `robotd_params::TEST_PATTERN_GEOMETRY` rather than `[media] quality`**, and that is
+//! a CPU decision. A camera's frames come off the ISP in hardware; a test pattern's are drawn by
+//! this process, so at the configured rung an idle board with no camera burned 29.4% of a core
+//! against a real camera's 6.1% — synthesising 1.84 MB of UYVY thirty times a second for a tee
+//! whose readers had all said no. The session it exists to provide needs none of those pixels.
+//!
 //! ## What is not verified
 //!
 //! **Nothing in a signal handler here may panic.** These closures are invoked from C, so a panic
