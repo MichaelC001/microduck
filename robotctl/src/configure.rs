@@ -52,15 +52,27 @@ pub use robotd_params::edit::{Edit, Model, Row, bind_pad, pad_bindings, render, 
 /// tee. Being wrong here is an edit that appears to do nothing until the next reboot — which is
 /// exactly what the restart offer exists to prevent, so it is derived from the keys that changed
 /// rather than assumed.
-fn unit_for(section: &str) -> &'static str {
-    match section {
+///
+/// **Every section is listed, and there is no fallback.** `[head_imu]` shipped reading as `robotd`
+/// because a `_ => "robotd"` arm answered for it: enabling the head IMU restarted the daemon that
+/// does not read the key and left `tofd` on the old value, so the switch did nothing and said
+/// nothing. A section with no arm here now fails `every_registry_section_names_its_daemon` rather
+/// than picking up whichever daemon the catch-all happened to name.
+fn unit_for(section: &str) -> Option<&'static str> {
+    Some(match section {
         "media" | "detect" => "mediad",
         // `padd` reads the bindings, and `robotd` never sees them. Offering a robotd restart for
         // a button change would drop motor control — putting a standing robot on the floor — to
         // apply a setting it does not read.
         "pad" | "imu_head" => "padd",
-        _ => "robotd",
-    }
+        // `tofd` reads `[head_imu]` out of robotd's file — see `tof/src/config.rs` for why it
+        // reads that file rather than one of its own. Not to be confused with `imu_head` above,
+        // which is the *controller's* IMU steering the head.
+        "head_imu" => "tofd",
+        "bus" | "control" | "update_gate" | "policy" | "safety" | "chorale" | "theremin"
+        | "audio" => "robotd",
+        _ => return None,
+    })
 }
 
 /// The units a set of `section.key` names requires restarting, in start order, without duplicates.
@@ -70,7 +82,12 @@ fn units_for_keys<'a>(keys: impl Iterator<Item = &'a str>) -> Vec<&'static str> 
     let mut units: Vec<&'static str> = Vec::new();
     for key in keys {
         let (section, _) = key.split_once('.').expect("registry keys are section.key");
-        let unit = unit_for(section);
+        // Unreachable for a registry key: the test above keeps `unit_for` exhaustive. Offering
+        // nothing beats offering the wrong daemon — the exit path then prints the file it wrote
+        // instead of restarting something that never reads it.
+        let Some(unit) = unit_for(section) else {
+            continue;
+        };
         if !units.contains(&unit) {
             units.push(unit);
         }
@@ -657,6 +674,50 @@ mod tests {
 
         // Nothing pending is nothing to restart, and the caller must not offer one.
         assert!(units_for(&model("")).is_empty());
+    }
+
+    /// `[head_imu]` is `tofd`'s, and it read as `robotd`'s on the board.
+    ///
+    /// Turning the head IMU on through this editor restarted `robotd` — which never looks at the
+    /// key — and left `tofd` running on the value it loaded at boot. The switch was on in the
+    /// file, off in the daemon, and the only sign was a startup line nobody re-reads. Regression
+    /// test rather than an assertion folded into the case above, because the two IMU sections are
+    /// a name apart: `imu_head` is the controller's, and it really is `padd`'s.
+    #[test]
+    fn the_head_imu_switch_restarts_tofd_and_not_robotd() {
+        let mut m = model("");
+        m.edit(entry("head_imu.enabled"), "true").expect("valid");
+        assert_eq!(units_for(&m), vec!["tofd"]);
+
+        let mut m = model("");
+        m.edit(entry("imu_head.enabled"), "true").expect("valid");
+        assert_eq!(
+            units_for(&m),
+            vec!["padd"],
+            "the controller's IMU is padd's"
+        );
+    }
+
+    /// Every section in the registry names the daemon that reads it.
+    ///
+    /// What went wrong with `[head_imu]` was not a wrong answer, it was a default one: a
+    /// catch-all arm answered `robotd` for a section nobody had mapped, so adding a section was
+    /// enough to ship a restart offer that restarts the wrong daemon. There is no catch-all now,
+    /// and this fails for the next section added without an arm — at `cargo test`, not on a
+    /// board, and not as a switch that silently does nothing.
+    #[test]
+    fn every_registry_section_names_its_daemon() {
+        let mut unmapped: Vec<&str> = robotd_params::registry::REGISTRY
+            .iter()
+            .filter_map(|e| e.key.split_once('.').map(|(section, _)| section))
+            .filter(|section| unit_for(section).is_none())
+            .collect();
+        unmapped.sort_unstable();
+        unmapped.dedup();
+        assert!(
+            unmapped.is_empty(),
+            "no daemon named for {unmapped:?} — add an arm to `unit_for`"
+        );
     }
 
     /// The whole first screen renders without panicking, features first — the same
