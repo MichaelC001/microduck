@@ -58,7 +58,7 @@ version = "v1"
 
 # The duck detector, the same way: trained in pollen-robotics/duck_detector, published on the Hub,
 # and seeded onto a board by `scripts/seed-detector.sh` from this pin — a floor, moved past with
-# `robotctl detect update`. The model repo shares its name with the *dataset* repo; the robot only
+# `robotctl duck-detector update`. The model repo shares its name with the *dataset* repo; the robot only
 # ever addresses the model (`huggingface.co/<repo>/resolve/…`, `api/models/<repo>`), and the
 # dataset lives under `datasets/`, so the shared name cannot be confused on the wire.
 [workspace.metadata.detector]

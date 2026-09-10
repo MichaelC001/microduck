@@ -140,7 +140,7 @@ pub fn spawn_first(
     }
     anyhow::bail!(
         "no model would load ({}). A missing file means the set was never installed — \
-         `sudo robotctl detect update` fetches it from the Hub; for the NPU: \
+         `sudo robotctl duck-detector update` fetches it from the Hub; for the NPU: \
          sudo /usr/local/sbin/robot-setup-npu",
         refused.join("; ")
     )

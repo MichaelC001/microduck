@@ -140,7 +140,7 @@ Three properties worth trusting:
   daemon's own loader first, atomically (temp file + rename), and rejected with the reason.
 
 Saving offers what the change actually needs, from the daemon that actually reads it: a restart
-for most keys (`[media]` and `[detect]` are `mediad`'s, `[head_imu]` is `tofd`'s), a `robotd`
+for most keys (`[media]` and `[duck_detector]` are `mediad`'s, `[head_imu]` is `tofd`'s), a `robotd`
 *reload* for `[policy]` — the motors stay powered — and nothing at all for `[pad]` and
 `[pad_imu_head_control]`, which `padd` picks up within a second. `sudo`, because the file
 is root-owned — without it the editor opens read-only and says so on the first write.
@@ -225,16 +225,16 @@ The model `mediad` finds other ducks with lives on the Hub the same way
 (`pollen-robotics/microduck-duck-detector`) and versions on its own line:
 
 ```
-robotctl detect check
+robotctl duck-detector check
 ```
 
 ```
-sudo robotctl detect update
+sudo robotctl duck-detector update
 ```
 
 Same shape as the policy pair — `--version <tag>` names one, and `check` changes nothing. `update`
 restarts `mediad`, which drops the console's video for a moment; whether the detector then runs at
-all is `[detect] enabled` in `robotctl configure`.
+all is `[duck_detector] enabled` in `robotctl configure`.
 
 #### Trying your own file
 

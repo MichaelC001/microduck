@@ -1234,7 +1234,7 @@ mod tests {
     }
 
     /// **The detector's file list lives in three places and they must agree**: what the seeder
-    /// downloads, what `robotctl detect update` downloads, and what `mediad` looks for. A name
+    /// downloads, what `robotctl duck-detector update` downloads, and what `mediad` looks for. A name
     /// missing from either downloader is a detector that is installed and cannot be found; a
     /// name only the downloaders know is dead weight on the eMMC.
     #[test]
@@ -1316,7 +1316,7 @@ mod tests {
     }
 
     /// Nothing installed, the Hub reachable: both files arrive, `current` points at the pin,
-    /// and the provenance record names the repo `robotctl detect check` will ask.
+    /// and the provenance record names the repo `robotctl duck-detector check` will ask.
     #[test]
     fn the_pinned_detector_is_downloaded_from_the_hub() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1359,7 +1359,7 @@ mod tests {
     }
 
     /// The rule the handover rests on: a set already installed — the pin, a newer one from
-    /// `robotctl detect update`, or somebody else's — is never replaced by a daemon update.
+    /// `robotctl duck-detector update`, or somebody else's — is never replaced by a daemon update.
     #[test]
     fn an_installed_detector_is_left_alone() {
         let tmp = tempfile::tempdir().unwrap();

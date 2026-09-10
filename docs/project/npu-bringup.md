@@ -19,8 +19,8 @@ from `/opt/robot/detector/current`, and what fills that is
 | | |
 |---|---|
 | `scripts/seed-detector.sh` | run by the release's postinstall hook; installs the pin in `[workspace.metadata.detector]` on a board that has nothing, and never touches a set it did not install |
-| `robotctl detect check` | what is installed against what the repo offers |
-| `sudo robotctl detect update [--version <tag>]` | installs a revision and restarts `mediad` onto it |
+| `robotctl duck-detector check` | what is installed against what the repo offers |
+| `sudo robotctl duck-detector update [--version <tag>]` | installs a revision and restarts `mediad` onto it |
 
 It is `seed-policies.sh` and `robotctl policy check/update` with a different root and a fixed file
 list, served by the same `updaterd` calls (`detector.check`, `detector.install`), and

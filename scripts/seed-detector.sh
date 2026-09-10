@@ -33,7 +33,7 @@ DETECTOR_ROOT="${1:-/opt/robot/detector}"
 # Cargo.toml — this script runs from inside a release and cannot read the manifest.
 #
 # A floor, not a ceiling: what a board installs when it has *nothing*. A board moves past it with
-# `robotctl detect update`, which needs no daemon release; bump this when fresh boards should get
+# `robotctl duck-detector update`, which needs no daemon release; bump this when fresh boards should get
 # a newer model, not to push one to boards that already have one.
 DETECTOR_REPO="${DETECTOR_REPO:-pollen-robotics/microduck-duck-detector}"
 DETECTOR_VERSION="${DETECTOR_VERSION:-duck-v1}"
@@ -41,8 +41,8 @@ DETECTOR_BASE_URL="${DETECTOR_BASE_URL:-https://huggingface.co/${DETECTOR_REPO}/
 
 # Both, always. The `.rknn` is what the detector is for; the `.onnx` is the CPU fallback for a
 # board whose NPU is switched off in its device tree, which is how Armbian ships the Radxa Zero 3
-# (`robotd_params::DetectParams::models`). A revision missing either is one not ready for robots,
-# and `updater::policy::DETECTOR_FILES` is the same list for `robotctl detect update`.
+# (`robotd_params::DuckDetectorParams::models`). A revision missing either is one not ready for robots,
+# and `updater::policy::DETECTOR_FILES` is the same list for `robotctl duck-detector update`.
 DETECTOR_FILES="duck_detect.rknn duck_detect.onnx"
 
 # Per-file, and generous: the ONNX is ten megabytes, and `hooks/postinstall` runs inside an
@@ -52,7 +52,7 @@ DETECTOR_FILES="duck_detect.rknn duck_detect.onnx"
 # again.
 CURL_OPTS="--fail --location --silent --show-error --connect-timeout 5 --max-time 20"
 
-# Where a set came from, written beside it — the record `robotctl detect check` reads to know which
+# Where a set came from, written beside it — the record `robotctl duck-detector check` reads to know which
 # repo to ask, in the format `seed-policies.sh` writes and `updater::policy::Source` parses.
 write_source() {
     [ ! -f "$1/.source" ] || return 0

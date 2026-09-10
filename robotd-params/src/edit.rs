@@ -84,7 +84,7 @@ pub struct Model {
     ///
     /// Kept because `pending` is *cleared* by a save, and what wants restarting is decided after
     /// the editor has closed — reading `pending` there found nothing every time, so nothing was
-    /// ever restarted and a `[detect]` change looked like a no-op.
+    /// ever restarted and a `[duck_detector]` change looked like a no-op.
     written: Vec<String>,
 }
 
@@ -1069,7 +1069,7 @@ mod tests {
                 "update_gate",
                 "policy",
                 "safety",
-                "detect",
+                "duck_detector",
                 "chorale",
                 "theremin",
                 "head_imu",

@@ -2,7 +2,7 @@
 #
 # Installed to /etc/robot/robotd.toml. Mostly read once at startup and not watched, so
 # mostly a change needs a restart — of the daemon that reads the section, which is not
-# always robotd: [media] and [detect] are mediad's and [head_imu] is tofd's. The two
+# always robotd: [media] and [duck_detector] are mediad's and [head_imu] is tofd's. The two
 # exceptions: padd re-reads [pad_imu_head_control] a second after the file changes, and robotd
 # re-reads [policy] when asked. `robotctl configure` knows which is which and offers it
 # (docs/design/robotd-design.md §4.2).
@@ -335,7 +335,7 @@ mode = "walk"
 # withdrew keeps sounding.
 # hold_ms = 250
 
-[detect]
+[duck_detector]
 # Finding other Microducks in the head camera. Read by `mediad`, not `robotd` — the frames are on
 # `mediad`'s pipeline and perception belongs next to the sensor — but the switch lives here because
 # this is the file `robotctl configure` edits and a robot has one place for its settings.
@@ -352,8 +352,8 @@ mode = "walk"
 #
 # That set comes from the Hub (pollen-robotics/microduck-duck-detector, trained in
 # pollen-robotics/duck_detector), the way the official policy set does: the release's postinstall
-# hook seeds it once, `robotctl detect check` asks whether a newer one exists, and
-# `sudo robotctl detect update` installs it and restarts mediad onto it. A retrain is a tag
+# hook seeds it once, `robotctl duck-detector check` asks whether a newer one exists, and
+# `sudo robotctl duck-detector update` installs it and restarts mediad onto it. A retrain is a tag
 # there, not a daemon release. This key is for a model of your own.
 # model = "/home/microduck/my_detector.rknn"
 

@@ -271,12 +271,12 @@ enum Namespace {
     /// The model is trained in `pollen-robotics/duck_detector` and published on the Hub as
     /// `pollen-robotics/microduck-duck-detector`; a robot installs it from there the way it
     /// installs the official policy set, into `/opt/robot/detector/current`, so a retrain is a
-    /// tag rather than a daemon release. `[detect]` in the config says whether the detector runs
+    /// tag rather than a daemon release. `[duck_detector]` in the config says whether the detector runs
     /// at all (`robotctl configure`); this is about which model it runs.
     #[command(subcommand_required = true, arg_required_else_help = true)]
-    Detect {
+    DuckDetector {
         #[command(subcommand)]
-        command: DetectCommand,
+        command: DuckDetectorCommand,
     },
 
     /// Watch what the robot is doing, live.
@@ -909,9 +909,9 @@ enum AccountCommand {
     },
 }
 
-/// `robotctl detect …`
+/// `robotctl duck-detector …`
 #[derive(Subcommand, Debug)]
-enum DetectCommand {
+enum DuckDetectorCommand {
     /// Is there a newer duck detector than the one installed?
     ///
     /// Asks the Hub what revisions the detector's own repo offers, against the one on the
@@ -926,7 +926,7 @@ enum DetectCommand {
     ///
     /// The newest revision unless `--version` names one, which is also how to go back. `mediad`
     /// is restarted onto it — the model is loaded once, at its start — which drops the console's
-    /// video for a moment; `[detect] enabled` decides whether the detector then runs at all.
+    /// video for a moment; `[duck_detector] enabled` decides whether the detector then runs at all.
     Update {
         /// A revision in the detector repo — a tag like `v2`. Omit for the newest.
         #[arg(long)]
@@ -3650,7 +3650,7 @@ impl Set {
     fn namespace(self) -> &'static str {
         match self {
             Set::Policies => "policy",
-            Set::Detector => "detect",
+            Set::Detector => "duck-detector",
         }
     }
 
@@ -3670,7 +3670,7 @@ impl Set {
     }
 }
 
-/// `robotctl policy check` and `robotctl detect check` — what is installed, against the Hub.
+/// `robotctl policy check` and `robotctl duck-detector check` — what is installed, against the Hub.
 fn run_set_check(updater_socket: &Path, set: Set, json: bool) -> Result<(), Failure> {
     let mut client = Client::connect_to("updaterd", updater_socket)?;
     client.hello()?;
@@ -3715,7 +3715,7 @@ fn run_set_check(updater_socket: &Path, set: Set, json: bool) -> Result<(), Fail
     Ok(())
 }
 
-/// `robotctl policy update` and `robotctl detect update` — fetch a set and run it.
+/// `robotctl policy update` and `robotctl duck-detector update` — fetch a set and run it.
 fn run_set_update(
     updater_socket: &Path,
     set: Set,
@@ -3744,7 +3744,7 @@ fn run_set_update(
                      `sudo systemctl restart robotd`, or check `robotctl health`."
                 ),
                 (Set::Detector, true) => println!(
-                    "mediad restarted onto it — if [detect] enabled is on, it is looking with it now"
+                    "mediad restarted onto it — if [duck_detector] enabled is on, it is looking with it now"
                 ),
                 (Set::Detector, false) => println!(
                     "mediad did not restart — it is still running the old model. \n\
@@ -4561,10 +4561,12 @@ fn run(cli: Cli) -> Result<(), Failure> {
         Namespace::Policy { command, file } => {
             return run_policy(&cli.robot_socket, &cli.socket, &file, command);
         }
-        Namespace::Detect { command } => {
+        Namespace::DuckDetector { command } => {
             return match command {
-                DetectCommand::Check { json } => run_set_check(&cli.socket, Set::Detector, json),
-                DetectCommand::Update { version, json } => {
+                DuckDetectorCommand::Check { json } => {
+                    run_set_check(&cli.socket, Set::Detector, json)
+                }
+                DuckDetectorCommand::Update { version, json } => {
                     run_set_update(&cli.socket, Set::Detector, version.as_deref(), json)
                 }
             };
