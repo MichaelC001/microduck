@@ -673,18 +673,7 @@ fn search(items: &[Item], rows: &[Row], query: &str) -> Vec<usize> {
         .iter()
         .enumerate()
         .filter_map(|(at, item)| match item {
-            Item::Key(index) => {
-                let row = &rows[*index];
-                // The name is what people remember; a hit there outranks the same letters
-                // scattered through a sentence of doc.
-                let name = row.entry.key.split_once('.').expect("section.key").1;
-                let score = fuzzy_score(query, name)
-                    .map(|s| s + 100)
-                    .into_iter()
-                    .chain(fuzzy_score(query, &searchable(row)))
-                    .max()?;
-                Some((score, at))
-            }
+            Item::Key(index) => Some((row_score(&rows[*index], query)?, at)),
             Item::Header(_) => None,
         })
         .collect();
@@ -692,20 +681,40 @@ fn search(items: &[Item], rows: &[Row], query: &str) -> Vec<usize> {
     hits.into_iter().map(|(_, at)| at).collect()
 }
 
+/// How well one row answers `query`, or `None`. Every whitespace-separated word must hit; a
+/// word hits when it is *typed into* the key name (subsequence, `actsc` → `action_scale`), or
+/// appears verbatim anywhere else the row shows — section, value, default, doc. Only the name
+/// gets the fuzzy treatment: letters in order across a sentence of doc match nearly every row,
+/// which is what made `tof` land on `theremin.enabled` with forty hits behind it.
+fn row_score(row: &Row, query: &str) -> Option<i32> {
+    let name = row.entry.key.split_once('.').expect("section.key").1;
+    let text = searchable(row).to_lowercase();
+    let mut total = 0;
+    for word in query.split_whitespace() {
+        let lower = word.to_lowercase();
+        total += if let Some(at) = name.to_lowercase().find(&lower) {
+            let word_start = at == 0 || !name.as_bytes()[at - 1].is_ascii_alphanumeric();
+            300 + if word_start { 20 } else { 0 } - at as i32
+        } else if let Some(score) = fuzzy_score(word, name) {
+            100 + score
+        } else {
+            let at = text.find(&lower)?;
+            50 - (at / 10) as i32
+        };
+    }
+    Some(total)
+}
+
 /// Case-insensitive subsequence match, scored: `None` if the letters of `needle` do not occur
 /// in order in `hay`; otherwise higher is better — runs of adjacent matches and matches at word
-/// starts (`_`, space, `.`) score well, gaps and a late first hit cost a little. Small and
-/// deliberately unclever: a few hundred short rows, re-ranked per keystroke.
+/// starts (`_`, space, `.`) score well, gaps cost a little. Only ever run over a key name, which
+/// is short enough for a subsequence to mean something.
 fn fuzzy_score(needle: &str, hay: &str) -> Option<i32> {
     let needle: Vec<char> = needle.chars().flat_map(char::to_lowercase).collect();
     let hay: Vec<char> = hay.chars().flat_map(char::to_lowercase).collect();
     if needle.is_empty() {
         return Some(0);
     }
-    // A contiguous hit is what people mostly mean; make it win outright.
-    let contiguous = hay
-        .windows(needle.len())
-        .position(|window| window == needle.as_slice());
     let mut score = 0i32;
     let mut at = 0usize;
     let mut previous: Option<usize> = None;
@@ -720,16 +729,6 @@ fn fuzzy_score(needle: &str, hay: &str) -> Option<i32> {
         };
         previous = Some(found);
         at = found + 1;
-    }
-    let first = contiguous.unwrap_or_else(|| hay.iter().position(|&h| h == needle[0]).unwrap_or(0));
-    score -= (first / 4) as i32;
-    if let Some(start) = contiguous {
-        score += 50
-            + if start == 0 || !hay[start - 1].is_alphanumeric() {
-                20
-            } else {
-                0
-            };
     }
     Some(score)
 }
@@ -988,10 +987,11 @@ mod tests {
 
     use super::*;
 
-    /// ctrl+f: the letters in order find the key, a contiguous run outranks a scattered one,
-    /// and a hit on the name beats the same letters buried in a doc sentence.
+    /// ctrl+f: letters typed into a name find it, verbatim text finds it anywhere on the row,
+    /// and letters merely scattered through a doc sentence find nothing — `tof` used to land
+    /// on `theremin.enabled` with forty hits behind it.
     #[test]
-    fn the_search_ranks_the_key_you_meant_first() {
+    fn the_search_ranks_the_key_you_meant_first_and_ignores_scattered_letters() {
         assert!(fuzzy_score("gain", "gain").unwrap() > fuzzy_score("gain", "gait_in_a").unwrap());
         assert!(fuzzy_score("gan", "gain").is_some());
         assert_eq!(fuzzy_score("gainz", "gain"), None);
@@ -1011,10 +1011,42 @@ mod tests {
         assert_eq!(name_of(hits[0]), "policy.nominal_voltage");
         let hits = search(&items, &rows, "deadman");
         assert_eq!(name_of(hits[0]), "safety.deadman_ms");
+        // Typed into the name, not spelled out.
+        let hits = search(&items, &rows, "actsc");
+        assert_eq!(name_of(hits[0]), "policy.action_scale");
         // Section names are part of the text shown, so they match too.
         let hits = search(&items, &rows, "safety");
         assert!(name_of(hits[0]).starts_with("safety."));
         assert!(search(&items, &rows, "zzzzqqq").is_empty());
+
+        // Every `tof` hit has the three letters together somewhere on the row, or typed into
+        // its name — never spread across the doc.
+        let hits = search(&items, &rows, "tof");
+        assert!(!hits.is_empty());
+        for at in hits {
+            let Item::Key(index) = items[at] else {
+                unreachable!()
+            };
+            let row = &rows[index];
+            let name = row.entry.key.split_once('.').unwrap().1;
+            assert!(
+                searchable(row).to_lowercase().contains("tof")
+                    || fuzzy_score("tof", name).is_some(),
+                "{} matched tof without containing it",
+                row.entry.key
+            );
+        }
+        // The doc of `theremin.enabled` says "ToF theremin" — a fair hit, but a doc hit, so
+        // the rows *about* the sensor come first.
+        let hits = search(&items, &rows, "tof");
+        assert_ne!(name_of(hits[0]), "theremin.enabled");
+        assert!(hits.len() < 15, "{} rows hit tof", hits.len());
+        // Several words all have to hit.
+        assert!(
+            search(&items, &rows, "safety limp")
+                .iter()
+                .all(|&at| name_of(at).contains("limp"))
+        );
     }
 
     /// An `(auto)` row opens the editor on the value it resolves to, not on the word `unset`.
