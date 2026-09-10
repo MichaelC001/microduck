@@ -401,9 +401,9 @@ pub const REGISTRY: &[Entry] = &[
     ),
     // ── [media] ──────────────────────────────────────────────────────────────
     feature(
-        "media.camera",
-        Kind::Bool,
-        "Stream the head camera — off is a cheap test pattern, for a board with no camera",
+        "media.source",
+        Kind::Choice(crate::MEDIA_SOURCE_LABELS),
+        "Where video comes from: the head camera, or a cheap test pattern for a board without one",
     ),
     feature(
         "media.quality",
@@ -641,7 +641,7 @@ mod tests {
                 "audio.enabled",
                 "audio.greet",
                 "audio.pet_detect",
-                "media.camera",
+                "media.source",
                 "media.quality",
                 // The five one-shot buttons. Front-page keys because "what does this button do"
                 // is a question somebody asks holding the pad, not while reading tuning docs.

@@ -329,6 +329,47 @@ impl CongestionControl {
     }
 }
 
+/// Where `mediad`'s video comes from.
+///
+/// **This was `camera: bool`, and the boolean was the problem.** `camera = false` does not mean
+/// "no video" — the WebRTC control channel rides the video track, so a pipeline that never starts
+/// costs a robot its control surface along with its picture (`remote-webrtc.md`). What it means is
+/// "a test pattern instead", and nothing in the key said so: a board set up with no camera streamed
+/// 720p30 of synthetic video, which is how the pattern came to cost five times what the camera it
+/// stands in for does. A name that says what you get is the fix for the next person reading it.
+///
+/// `--sim-camera` is not a value here. It carries an address, so it is a flag, and it overrides
+/// this the way it always has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MediaSource {
+    /// The head camera, at [`Quality`]. What every robot with a camera wants, and the default.
+    #[default]
+    Camera,
+    /// A test pattern at [`TEST_PATTERN_GEOMETRY`], for a board with no camera: the session
+    /// exists, so signalling, negotiation, the datachannel and the control API are all reachable.
+    Test,
+}
+
+/// Every source, in the order an editor cycles them — and the strings the file uses.
+///
+/// One list, for [`QUALITY_LABELS`]'s reason; [`tests::every_media_source_label_round_trips`]
+/// pins it to the enum in both directions.
+pub const MEDIA_SOURCE_LABELS: &[&str] = &["camera", "test"];
+
+impl MediaSource {
+    /// The sources, in [`MEDIA_SOURCE_LABELS`] order.
+    pub const ALL: [MediaSource; 2] = [MediaSource::Camera, MediaSource::Test];
+
+    /// The name this source has in the file.
+    pub fn label(self) -> &'static str {
+        match self {
+            MediaSource::Camera => "camera",
+            MediaSource::Test => "test",
+        }
+    }
+}
+
 /// What a test pattern runs at, whatever `[media] quality` says — width, height, frames a second.
 ///
 /// **A test pattern is not video anybody watches.** It exists so a board with no camera still has
@@ -362,12 +403,9 @@ pub const TEST_PATTERN_GEOMETRY: (u32, u32, u32) = (256, 144, 5);
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct MediaParams {
-    /// Stream the head camera. `false` streams a test pattern instead, which is what a board
-    /// with no camera wants: the pipeline starts, so the WebRTC control channel exists.
-    ///
-    /// The pattern ignores `quality` and runs at [`TEST_PATTERN_GEOMETRY`], because it is there to
-    /// make the session exist rather than to be watched.
-    pub camera: bool,
+    /// Where the video comes from: the head camera, or a test pattern for a board without one.
+    /// [`MediaSource`] says why this is a name rather than a boolean.
+    pub source: MediaSource,
     /// Frame size and rate, as one name. [`Quality`] says why it is one key and not four.
     pub quality: Quality,
     /// Starting video bitrate, bits per second. Unset follows the quality —
@@ -449,12 +487,16 @@ impl CameraIntrinsics {
     }
 }
 
+// Derivable since `camera: bool` became `source: MediaSource`, and still written out: every line
+// of it is a decision with a reason beside it, and `#[derive(Default)]` would delete the reasons
+// while keeping the values. The next field added here should have to say what its default is for.
+#[allow(clippy::derivable_impls)]
 impl Default for MediaParams {
     fn default() -> Self {
         Self {
-            // On, because a robot with a camera is the case, and a board without one shows a
-            // test pattern rather than nothing only if somebody turns this off.
-            camera: true,
+            // The camera, because a robot with a camera is the case. A board without one shows a
+            // test pattern instead, and only if somebody names it.
+            source: MediaSource::Camera,
             quality: Quality::default(),
             bitrate: None,
             // Only a per-robot solve goes here; the family calibration is `mediad`'s fallback.
@@ -521,14 +563,13 @@ impl MediaParams {
     /// A simulated camera is a camera: `--sim-camera` renders the configured rung, and `mediad`
     /// applies that precedence where it picks the source.
     pub fn geometry(&self) -> (u32, u32, u32) {
-        if self.camera {
-            (
+        match self.source {
+            MediaSource::Camera => (
                 self.quality.width(),
                 self.quality.height(),
                 self.quality.fps(),
-            )
-        } else {
-            TEST_PATTERN_GEOMETRY
+            ),
+            MediaSource::Test => TEST_PATTERN_GEOMETRY,
         }
     }
 }
@@ -2805,6 +2846,42 @@ mod tests {
         }
     }
 
+    /// [`MEDIA_SOURCE_LABELS`] is what the registry offers and what the file may contain, and
+    /// [`MediaSource::ALL`] is what `mediad` can build. A name in one and not the other is either
+    /// a choice the editor writes and `mediad` cannot read, or a source nobody can select.
+    #[test]
+    fn every_media_source_label_round_trips() {
+        assert_eq!(MEDIA_SOURCE_LABELS.len(), MediaSource::ALL.len());
+        for (label, source) in MEDIA_SOURCE_LABELS.iter().zip(MediaSource::ALL) {
+            assert_eq!(*label, source.label());
+            let parsed: Params =
+                toml::from_str(&format!("[media]\nsource = \"{label}\"\n")).expect("parses");
+            assert_eq!(parsed.media.source, source);
+        }
+    }
+
+    /// **The key that was replaced must not come back as a silent default.** A robot carrying the
+    /// old `camera = false` gets the unknown-key warning and this build's default — the camera —
+    /// which is a board that starts using a camera it may not have. Better than refusing to boot
+    /// over an inert key (the `[chorale]` rule), and only defensible if the warning names it, so
+    /// this pins that the key is *ignored* rather than parsed into something.
+    #[test]
+    fn the_retired_camera_boolean_is_ignored_and_named() {
+        let (_, ignored) = without_unknown_keys("[media]\ncamera = false\n").unwrap();
+        assert_eq!(ignored, ["media.camera"]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(dir.path(), "[media]\ncamera = false\n");
+        let media = Params::load(&path, true)
+            .expect("an inert key must not stop the robot")
+            .media;
+        assert_eq!(
+            media.source,
+            MediaSource::Camera,
+            "the retired key must not still be steering the source"
+        );
+    }
+
     /// The labels are `webrtcsink`'s own property nicknames — the strings that get set on the
     /// element. `gcc`, not `googcc`: a nickname this file spelled its own way would be a config
     /// key that parses, validates, saves, and then silently leaves the element on its default.
@@ -2848,7 +2925,7 @@ mod tests {
         for quality in Quality::ALL {
             media.quality = quality;
 
-            media.camera = true;
+            media.source = MediaSource::Camera;
             assert_eq!(
                 media.geometry(),
                 (quality.width(), quality.height(), quality.fps()),
@@ -2856,7 +2933,7 @@ mod tests {
                 quality.label()
             );
 
-            media.camera = false;
+            media.source = MediaSource::Test;
             assert_eq!(
                 media.geometry(),
                 TEST_PATTERN_GEOMETRY,
@@ -2880,7 +2957,7 @@ mod tests {
         // And it is worth having: a pattern as expensive as the rung it replaces would be this
         // constant written the long way.
         let (w, h, f) = MediaParams {
-            camera: true,
+            source: MediaSource::Camera,
             ..MediaParams::default()
         }
         .geometry();
@@ -2910,7 +2987,11 @@ mod tests {
     #[test]
     fn the_defaults_are_what_mediad_streamed_before_the_section_existed() {
         let media = Params::default().media;
-        assert!(media.camera, "mediad.service carried --camera");
+        assert_eq!(
+            media.source,
+            MediaSource::Camera,
+            "mediad.service carried --camera"
+        );
         assert_eq!(media.quality.size(), (1280, 720));
         assert_eq!(media.quality.fps(), 30);
         assert_eq!(media.bitrate_resolved(), 2_000_000);
@@ -2947,7 +3028,7 @@ mod tests {
             from_file.update_gate.max_consecutive_errors,
             built_in.update_gate.max_consecutive_errors
         );
-        assert_eq!(from_file.media.camera, built_in.media.camera);
+        assert_eq!(from_file.media.source, built_in.media.source);
         assert_eq!(from_file.media.quality, built_in.media.quality);
         assert_eq!(
             from_file.media.bitrate_resolved(),

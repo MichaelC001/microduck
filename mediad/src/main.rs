@@ -132,7 +132,7 @@ struct Args {
     /// renders at — because the frames arrive raw and length-prefixed with no handshake, and a
     /// mismatch is a picture nobody can read rather than an error the pipeline can recover from.
     /// `mediad` says so and refuses the frame if the sizes disagree.
-    /// Takes precedence over `[media] camera`, which is a fact about a robot and not about this.
+    /// Takes precedence over `[media] source`, which is a fact about a robot and not about this.
     #[arg(long)]
     sim_camera: Option<String>,
 
@@ -243,7 +243,7 @@ fn main() -> ExitCode {
     // streams at; a test pattern ignores it and runs at `TEST_PATTERN_GEOMETRY`, so a log line
     // reporting the rung on a board with no camera named a resolution nothing was producing.
     //
-    // `--sim-camera` wins over `[media] camera`, exactly as the source selection further down
+    // `--sim-camera` wins over `[media] source`, exactly as the source selection further down
     // does: a simulated camera is a camera, and it renders the configured rung.
     let (width, height, fps) = if args.sim_camera.is_some() {
         (
@@ -255,7 +255,7 @@ fn main() -> ExitCode {
         media.geometry()
     };
     tracing::info!(
-        camera = media.camera,
+        source = media.source.label(),
         quality = media.quality.label(),
         width,
         height,
@@ -372,16 +372,20 @@ fn main() -> ExitCode {
             }
         }
 
-        let source = if let Some(addr) = args.sim_camera.clone() {
-            mediad::pipeline::Source::Sim(addr)
-        } else if media.camera {
-            mediad::pipeline::Source::Camera(mediad::pipeline::Camera {
-                device: args.camera_device.clone(),
-                exposure: args.exposure,
-                analogue_gain: args.analogue_gain,
-            })
-        } else {
-            mediad::pipeline::Source::Test
+        // Matched rather than tested, so a source added to `MediaSource` fails the build here
+        // instead of quietly arriving as a test pattern.
+        let source = match args.sim_camera.clone() {
+            Some(addr) => mediad::pipeline::Source::Sim(addr),
+            None => match media.source {
+                robotd_params::MediaSource::Camera => {
+                    mediad::pipeline::Source::Camera(mediad::pipeline::Camera {
+                        device: args.camera_device.clone(),
+                        exposure: args.exposure,
+                        analogue_gain: args.analogue_gain,
+                    })
+                }
+                robotd_params::MediaSource::Test => mediad::pipeline::Source::Test,
+            },
         };
 
         // Frame size and rate are still pinned rather than negotiated — both branches of the tee

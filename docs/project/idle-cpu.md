@@ -20,7 +20,8 @@ pattern has been measured on a board**; the last section says what the rest woul
 ### `mediad` copied every frame
 
 The appsink callback copied every buffer off the tee into a slot readers took the latest of.
-At 720p30 — the shipped quality, and `media.camera` defaults on — a UYVY frame is 1 280 × 720 × 2
+At 720p30 — the shipped quality, and `media.source` defaults to the camera — a UYVY frame is
+1 280 × 720 × 2
 = 1.84 MB. The readers are auto-exposure at 2 Hz and the duck detector at 2 Hz when enabled, so
 twenty-eight of every thirty copies were made for nobody: 55 MB/s of memcpy and a 1.8 MB
 allocation thirty times a second, from boot.
@@ -31,7 +32,7 @@ exposure loop steering on half-second-old luma hunts rather than settles.
 
 ### The test pattern was drawn at the camera's resolution
 
-A board with `[media] camera = false` streams `videotestsrc` instead, so that a robot with no
+A board with `[media] source = "test"` streams `videotestsrc` instead, so that a robot with no
 camera still has a session — signalling, negotiation, the datachannel, the control API, all of
 which ride the video track. It ran at `[media] quality`, the same rung a camera streams at.
 

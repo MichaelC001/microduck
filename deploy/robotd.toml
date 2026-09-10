@@ -401,10 +401,16 @@ mode = "walk"
 # only supported way to change one was a systemd drop-in, and nobody reaches for a drop-in to
 # answer "why is the video soft?".
 
-# Stream the head camera. Off streams a test pattern instead, which is what a board with no
-# camera wants — the pipeline still starts, so the WebRTC *control* channel still exists. It is
-# bundled with the video track, so a pipeline that will not start costs both.
-# camera = true
+# Where the video comes from: "camera" or "test".
+#
+# "test" streams a test pattern, which is what a board with no camera wants — the pipeline still
+# starts, so the WebRTC *control* channel still exists. It is bundled with the video track, so a
+# pipeline that will not start costs both. A name rather than a boolean because "camera = false"
+# does not mean "no video", it means "synthetic video", and nothing in the old key said so.
+#
+# The pattern ignores `quality` and runs at 256x144@5: it exists to make the session reachable,
+# and drawing a 720p30 one in software cost five times what the camera it stands in for does.
+# source = "camera"
 
 # Frame size and rate, as one name: 1080p30, 720p30, 720p15 or 360p30.
 #
