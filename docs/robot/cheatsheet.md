@@ -138,8 +138,10 @@ Three properties worth trusting:
 - **It cannot write a file robotd refuses to start on.** Every save is validated through the
   daemon's own loader first, atomically (temp file + rename), and rejected with the reason.
 
-The daemons read the file once at startup, so saving offers a restart — of the ones that read
-what you changed: `[media]` is `mediad`, everything else is `robotd`. `sudo`, because the file
+Saving offers what the change actually needs, from the daemon that actually reads it: a restart
+for most keys (`[media]` and `[detect]` are `mediad`'s, `[head_imu]` is `tofd`'s), a `robotd`
+*reload* for `[policy]` — the motors stay powered — and nothing at all for `[pad]` and
+`[imu_head]`, which `padd` picks up within a second. `sudo`, because the file
 is root-owned — without it the editor opens read-only and says so on the first write.
 `--file` points it elsewhere for a bench copy. The shipped `deploy/robotd.toml` stays the
 reference for *why* each knob exists; this is for flipping them.
