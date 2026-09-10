@@ -1091,7 +1091,7 @@ mod tests {
         // Both, and robotd first: mediad.service is After=robotd.service, so the other order
         // reconnects mediad to a robotd that is about to go away.
         let mut m = model("");
-        m.edit(entry("media.camera"), "false").expect("valid");
+        m.edit(entry("media.source"), "test").expect("valid");
         m.edit(entry("audio.enabled"), "false").expect("valid");
         assert_eq!(plan_for(&m).restart, vec!["robotd", "mediad"]);
 

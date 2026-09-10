@@ -154,9 +154,12 @@ sudo robotctl configure
 ```
 
 Set `media.quality` — `1080p30`, `720p30`, `720p15` or `360p30` — and take the restart it
-offers. `media.camera` off streams a test pattern instead, which is what a board with no camera
+offers. `media.source` set to `test` streams a test pattern instead, which is what a board with
+no camera
 wants: the WebRTC *control* channel rides on the video track, so a pipeline that cannot start
-costs both. `media.bitrate` follows the quality unless you set it; the unit is bits per second.
+costs both. The pattern ignores `media.quality` and runs at 256x144@5 — it is there to make the
+session exist, and drawing a 720p one costs five times the CPU a real camera does.
+`media.bitrate` follows the quality unless you set it; the unit is bits per second.
 
 `media.congestion_control` is the other knob in that section, and it is the one that moves CPU:
 `disabled` drops the bandwidth estimator, which is the largest single consumer in `mediad` (7.6% of
