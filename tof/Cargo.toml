@@ -37,12 +37,9 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 # The BMI088 driver and its Madgwick fusion, ours because the crates.io ones stop at the raw
 # registers. Pinned to a tag: it is a second repository and a moving `main` is not a dependency.
-#
-# TEMPORARY: a rev, not a tag, for `Bmi088Ahrs::update_all` — bmi088-rs#1, which is what takes
-# a head-IMU sample from three I²C transactions to two. A rev is at least as reproducible as a
-# tag; what it is not is released. **Flip this back to `tag = "v0.1.2"` once that is tagged**,
-# and do not merge this line as it stands.
-bmi088 = { git = "https://github.com/pollen-robotics/bmi088-rs", rev = "6db3c2cd7428b0da43385cb68e8f90a17cb1cb1c" }
+# v0.1.2 is the one that has `Bmi088Ahrs::update_all`, which is what takes a head-IMU sample
+# from three I²C transactions to two.
+bmi088 = { git = "https://github.com/pollen-robotics/bmi088-rs", tag = "v0.1.2" }
 # `I2cdev`, the `embedded-hal` bus the driver is generic over. Linux-only by construction —
 # `i2cdev`'s `linux` module is the whole crate.
 linux-embedded-hal = "0.4"
