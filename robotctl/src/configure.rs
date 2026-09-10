@@ -311,11 +311,11 @@ pub fn list(path: &Path, json: bool) -> Result<(), String> {
 // `monitor`'s conventions (ratatui, `ratatui::init`/`restore`) and deliberately dumber — a
 // config editor should feel like a settings menu, not a dashboard.
 
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use ratatui::layout::{Constraint, Layout};
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 /// What the list shows at one line: a section header, or a key.
 #[derive(Debug)]
@@ -332,6 +332,15 @@ enum Focus {
     Editing {
         buffer: String,
         error: Option<String>,
+    },
+    /// Fuzzy-searching the list from a popup (ctrl+f). The cursor follows the best match as
+    /// the query grows; leaving the popup — ENTER or ESC alike — keeps it wherever it landed.
+    Search {
+        query: String,
+        /// Where the cursor was when the popup opened: an emptied query goes back there.
+        origin: usize,
+        /// Which of the ranked hits the cursor sits on (↑↓ walk them).
+        hit: usize,
     },
     /// Deciding what to do with the pending edits on the way out.
     Confirm,
@@ -409,7 +418,7 @@ pub fn run(path: &Path, robot_socket: &Path) -> Result<(), String> {
                             }
                             None => {
                                 focus = Focus::Editing {
-                                    buffer: row.effective().to_owned(),
+                                    buffer: shown_value(row).to_owned(),
                                     error: None,
                                 };
                             }
@@ -419,10 +428,17 @@ pub fn run(path: &Path, robot_socket: &Path) -> Result<(), String> {
                 KeyCode::Enter => {
                     if let Item::Key(index) = items[cursor] {
                         focus = Focus::Editing {
-                            buffer: rows[index].effective().to_owned(),
+                            buffer: shown_value(&rows[index]).to_owned(),
                             error: None,
                         };
                     }
+                }
+                KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    focus = Focus::Search {
+                        query: String::new(),
+                        origin: cursor,
+                        hit: 0,
+                    };
                 }
                 KeyCode::Char('u') | KeyCode::Char('d') => {
                     if let Item::Key(index) = items[cursor] {
@@ -451,6 +467,40 @@ pub fn run(path: &Path, robot_socket: &Path) -> Result<(), String> {
                 }
                 _ => {}
             },
+            Focus::Search { query, origin, hit } => {
+                match key.code {
+                    // Both leave the selection where the search put it: the point of the
+                    // search was to get there.
+                    KeyCode::Esc | KeyCode::Enter => {
+                        focus = Focus::List;
+                        continue;
+                    }
+                    KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        focus = Focus::List;
+                        continue;
+                    }
+                    KeyCode::Down | KeyCode::Tab => *hit += 1,
+                    KeyCode::Up | KeyCode::BackTab => *hit = hit.saturating_sub(1),
+                    KeyCode::Backspace => {
+                        query.pop();
+                        *hit = 0;
+                    }
+                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        query.push(c);
+                        *hit = 0;
+                    }
+                    _ => {}
+                }
+                if query.is_empty() {
+                    cursor = *origin;
+                } else {
+                    let hits = search(&items, &rows, query);
+                    if !hits.is_empty() {
+                        *hit = (*hit).min(hits.len() - 1);
+                        cursor = hits[*hit];
+                    }
+                }
+            }
             Focus::Confirm => match key.code {
                 KeyCode::Char('y') | KeyCode::Enter => {
                     // Read before the save, which clears `pending` — after it there is nothing
@@ -592,6 +642,95 @@ fn layout_items(model: &Model) -> Vec<Item> {
         items.extend(keys.into_iter().map(Item::Key));
     }
     items
+}
+
+/// The value the list draws for a row — and so the one an edit should start from. An optional
+/// key left unset shows what it *resolves* to, `0.9 (auto)`; opening the editor on the literal
+/// word `unset` instead meant erasing it before every edit.
+fn shown_value(row: &Row) -> &str {
+    match &row.resolved {
+        Some(resolved) if !row.differs() => resolved,
+        _ => row.effective(),
+    }
+}
+
+/// Everything the list shows for one key, joined so a query can hit any of it: section, name,
+/// the value as drawn, the default, and the one-line doc.
+fn searchable(row: &Row) -> String {
+    let (section, name) = row.entry.key.split_once('.').expect("section.key");
+    format!(
+        "{section} {name} {} {} {}",
+        shown_value(row),
+        row.default,
+        row.entry.doc
+    )
+}
+
+/// Item indices of every key matching `query`, best first. Ties keep list order, so a query
+/// that fits several keys equally walks them top to bottom.
+fn search(items: &[Item], rows: &[Row], query: &str) -> Vec<usize> {
+    let mut hits: Vec<(i32, usize)> = items
+        .iter()
+        .enumerate()
+        .filter_map(|(at, item)| match item {
+            Item::Key(index) => Some((row_score(&rows[*index], query)?, at)),
+            Item::Header(_) => None,
+        })
+        .collect();
+    hits.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    hits.into_iter().map(|(_, at)| at).collect()
+}
+
+/// How well one row answers `query`, or `None`. Every whitespace-separated word must hit; a
+/// word hits when it is *typed into* the key name (subsequence, `actsc` → `action_scale`), or
+/// appears verbatim anywhere else the row shows — section, value, default, doc. Only the name
+/// gets the fuzzy treatment: letters in order across a sentence of doc match nearly every row,
+/// which is what made `tof` land on `theremin.enabled` with forty hits behind it.
+fn row_score(row: &Row, query: &str) -> Option<i32> {
+    let name = row.entry.key.split_once('.').expect("section.key").1;
+    let text = searchable(row).to_lowercase();
+    let mut total = 0;
+    for word in query.split_whitespace() {
+        let lower = word.to_lowercase();
+        total += if let Some(at) = name.to_lowercase().find(&lower) {
+            let word_start = at == 0 || !name.as_bytes()[at - 1].is_ascii_alphanumeric();
+            300 + if word_start { 20 } else { 0 } - at as i32
+        } else if let Some(score) = fuzzy_score(word, name) {
+            100 + score
+        } else {
+            let at = text.find(&lower)?;
+            50 - (at / 10) as i32
+        };
+    }
+    Some(total)
+}
+
+/// Case-insensitive subsequence match, scored: `None` if the letters of `needle` do not occur
+/// in order in `hay`; otherwise higher is better — runs of adjacent matches and matches at word
+/// starts (`_`, space, `.`) score well, gaps cost a little. Only ever run over a key name, which
+/// is short enough for a subsequence to mean something.
+fn fuzzy_score(needle: &str, hay: &str) -> Option<i32> {
+    let needle: Vec<char> = needle.chars().flat_map(char::to_lowercase).collect();
+    let hay: Vec<char> = hay.chars().flat_map(char::to_lowercase).collect();
+    if needle.is_empty() {
+        return Some(0);
+    }
+    let mut score = 0i32;
+    let mut at = 0usize;
+    let mut previous: Option<usize> = None;
+    for &c in &needle {
+        let found = hay[at..].iter().position(|&h| h == c)? + at;
+        let word_start = found == 0 || !hay[found - 1].is_alphanumeric();
+        score += match previous {
+            Some(p) if found == p + 1 => 10,
+            _ if word_start => 8,
+            Some(p) => 2 - ((found - p - 1).min(10) as i32),
+            None => 2,
+        };
+        previous = Some(found);
+        at = found + 1;
+    }
+    Some(score)
 }
 
 /// Move the cursor to the next key in `direction`, skipping headers, stopping at the ends.
@@ -742,6 +881,16 @@ fn draw(
                 Line::from(format!("{} now? y do it · n later", what.join(", then "))),
             ]
         }
+        Focus::Search { .. } => {
+            let doc = match items.get(cursor) {
+                Some(Item::Key(index)) => rows[*index].entry.doc,
+                _ => "",
+            };
+            vec![
+                Line::from(doc),
+                Line::from("type to search · ↑↓ next/prev hit · ENTER/ESC done"),
+            ]
+        }
         Focus::List => {
             let doc = match items.get(cursor) {
                 Some(Item::Key(index)) => rows[*index].entry.doc,
@@ -752,7 +901,7 @@ fn draw(
                     Some(s) => Span::styled(s.to_owned(), Style::new().red()),
                     None => Span::raw(doc),
                 }),
-                Line::from("↑↓ move · SPACE toggle · ENTER edit · u default · q quit"),
+                Line::from("↑↓ move · SPACE toggle · ENTER edit · u default · ^f search · q quit"),
             ]
         }
     };
@@ -760,6 +909,44 @@ fn draw(
         Paragraph::new(footer).block(Block::default().borders(Borders::ALL)),
         footer_area,
     );
+
+    // The search popup: a small box floated over the list, the list still visible around it so
+    // the selection can be watched moving as the query grows.
+    if let Focus::Search { query, hit, .. } = focus {
+        let hits = if query.is_empty() {
+            0
+        } else {
+            search(items, rows, query).len()
+        };
+        let title = if query.is_empty() {
+            " search ".to_owned()
+        } else if hits == 0 {
+            " search · no match ".to_owned()
+        } else {
+            format!(" search · {}/{hits} ", (*hit).min(hits - 1) + 1)
+        };
+        let width = 60.min(list_area.width.saturating_sub(4)).max(20);
+        let popup = Rect {
+            x: list_area.x + (list_area.width.saturating_sub(width)) / 2,
+            y: list_area.y + 2,
+            width,
+            height: 3,
+        };
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            Paragraph::new(Line::from(format!("{query}▏"))).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(title)
+                    .border_style(if hits == 0 && !query.is_empty() {
+                        Style::new().red()
+                    } else {
+                        Style::new().cyan()
+                    }),
+            ),
+            popup,
+        );
+    }
 }
 
 #[cfg(test)]
@@ -799,6 +986,86 @@ mod tests {
     }
 
     use super::*;
+
+    /// ctrl+f: letters typed into a name find it, verbatim text finds it anywhere on the row,
+    /// and letters merely scattered through a doc sentence find nothing — `tof` used to land
+    /// on `theremin.enabled` with forty hits behind it.
+    #[test]
+    fn the_search_ranks_the_key_you_meant_first_and_ignores_scattered_letters() {
+        assert!(fuzzy_score("gain", "gain").unwrap() > fuzzy_score("gain", "gait_in_a").unwrap());
+        assert!(fuzzy_score("gan", "gain").is_some());
+        assert_eq!(fuzzy_score("gainz", "gain"), None);
+        assert!(
+            fuzzy_score("LOW", "head_lowpass").is_some(),
+            "case-insensitive"
+        );
+
+        let m = model("");
+        let rows = m.rows();
+        let items = layout_items(&m);
+        let name_of = |at: usize| match items[at] {
+            Item::Key(index) => rows[index].entry.key,
+            Item::Header(_) => unreachable!("headers are never hits"),
+        };
+        let hits = search(&items, &rows, "nominal_volt");
+        assert_eq!(name_of(hits[0]), "policy.nominal_voltage");
+        let hits = search(&items, &rows, "deadman");
+        assert_eq!(name_of(hits[0]), "safety.deadman_ms");
+        // Typed into the name, not spelled out.
+        let hits = search(&items, &rows, "actsc");
+        assert_eq!(name_of(hits[0]), "policy.action_scale");
+        // Section names are part of the text shown, so they match too.
+        let hits = search(&items, &rows, "safety");
+        assert!(name_of(hits[0]).starts_with("safety."));
+        assert!(search(&items, &rows, "zzzzqqq").is_empty());
+
+        // Every `tof` hit has the three letters together somewhere on the row, or typed into
+        // its name — never spread across the doc.
+        let hits = search(&items, &rows, "tof");
+        assert!(!hits.is_empty());
+        for at in hits {
+            let Item::Key(index) = items[at] else {
+                unreachable!()
+            };
+            let row = &rows[index];
+            let name = row.entry.key.split_once('.').unwrap().1;
+            assert!(
+                searchable(row).to_lowercase().contains("tof")
+                    || fuzzy_score("tof", name).is_some(),
+                "{} matched tof without containing it",
+                row.entry.key
+            );
+        }
+        // The doc of `theremin.enabled` says "ToF theremin" — a fair hit, but a doc hit, so
+        // the rows *about* the sensor come first.
+        let hits = search(&items, &rows, "tof");
+        assert_ne!(name_of(hits[0]), "theremin.enabled");
+        assert!(hits.len() < 15, "{} rows hit tof", hits.len());
+        // Several words all have to hit.
+        assert!(
+            search(&items, &rows, "safety limp")
+                .iter()
+                .all(|&at| name_of(at).contains("limp"))
+        );
+    }
+
+    /// An `(auto)` row opens the editor on the value it resolves to, not on the word `unset`.
+    #[test]
+    fn editing_an_auto_key_starts_from_its_resolved_value() {
+        let m = model("");
+        let rows = m.rows();
+        let bitrate = rows
+            .iter()
+            .find(|r| r.entry.key == "media.bitrate")
+            .unwrap();
+        assert_eq!(bitrate.effective(), "unset");
+        assert_eq!(shown_value(bitrate), bitrate.resolved.as_deref().unwrap());
+        let set = rows
+            .iter()
+            .find(|r| r.entry.key == "safety.deadman_ms")
+            .unwrap();
+        assert_eq!(shown_value(set), set.effective());
+    }
 
     fn model(text: &str) -> Model {
         Model::from_text(Path::new("/test/robotd.toml"), text).expect("parses")
