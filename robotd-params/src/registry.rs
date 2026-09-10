@@ -403,7 +403,7 @@ pub const REGISTRY: &[Entry] = &[
     feature(
         "media.camera",
         Kind::Bool,
-        "Stream the head camera — off is a test pattern, for a board with no camera",
+        "Stream the head camera — off is a cheap test pattern, for a board with no camera",
     ),
     feature(
         "media.quality",

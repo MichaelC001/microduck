@@ -238,12 +238,28 @@ fn main() -> ExitCode {
         .unwrap_or_else(mediad::config::default_path);
     let params = mediad::config::load(&config, explicit);
     let (media, detect) = (params.media, params.detect);
+
+    // **What will actually run, not what is configured.** `[media] quality` is the rung a camera
+    // streams at; a test pattern ignores it and runs at `TEST_PATTERN_GEOMETRY`, so a log line
+    // reporting the rung on a board with no camera named a resolution nothing was producing.
+    //
+    // `--sim-camera` wins over `[media] camera`, exactly as the source selection further down
+    // does: a simulated camera is a camera, and it renders the configured rung.
+    let (width, height, fps) = if args.sim_camera.is_some() {
+        (
+            media.quality.width(),
+            media.quality.height(),
+            media.quality.fps(),
+        )
+    } else {
+        media.geometry()
+    };
     tracing::info!(
         camera = media.camera,
         quality = media.quality.label(),
-        width = media.quality.width(),
-        height = media.quality.height(),
-        fps = media.quality.fps(),
+        width,
+        height,
+        fps,
         bitrate = media.bitrate_resolved(),
         congestion_control = media.congestion_control.nick(),
         "streaming"
@@ -378,9 +394,9 @@ fn main() -> ExitCode {
             port: args.port,
             bitrate: media.bitrate_resolved(),
             congestion_control: media.congestion_control,
-            width: media.quality.width(),
-            height: media.quality.height(),
-            fps: media.quality.fps(),
+            width,
+            height,
+            fps,
             rotation,
         };
 
@@ -477,13 +493,13 @@ fn main() -> ExitCode {
         let intrinsics = if args.sim_camera.is_some() {
             // The MuJoCo twin renders a known field of view, so publish its exact geometry — twin
             // recordings then self-describe (no `--calib` needed on the duckslam side).
-            mediad::camera::Intrinsics::sim(media.quality.width(), media.quality.height())
+            mediad::camera::Intrinsics::sim(width, height)
         } else {
             mediad::camera::Intrinsics::published(
                 media.intrinsics.as_ref(),
                 mediad::pipeline::sensor_mode(),
-                media.quality.width(),
-                media.quality.height(),
+                width,
+                height,
             )
         };
         match &intrinsics {
@@ -502,8 +518,8 @@ fn main() -> ExitCode {
         }
 
         let video = mediad::session::Video {
-            width: media.quality.width(),
-            height: media.quality.height(),
+            width,
+            height,
             rotate,
             intrinsics,
         };

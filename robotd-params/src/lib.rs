@@ -329,6 +329,20 @@ impl CongestionControl {
     }
 }
 
+/// What a test pattern runs at, whatever `[media] quality` says — width, height, frames a second.
+///
+/// **A test pattern is not video anybody watches.** It exists so a board with no camera still has
+/// a whole session — signalling, negotiation, the datachannel, the control API — and none of that
+/// needs the rung a camera streams at. Running it at the configured rung instead is what an idle
+/// radxa-zero3 was measured doing: **29.4% of a core against the real camera's 6.1%** on the same
+/// board, with nothing connected. A camera's frames arrive off the ISP in hardware, while a test
+/// pattern is drawn by the CPU — at 720p30, 1.84 MB of packed UYVY thirty times a second, every
+/// frame discarded unread. This is 73 KB five times a second: 0.7% of that pixel rate.
+///
+/// 16:9 with both axes a multiple of 8, for [`Quality::size`]'s reason. Five frames a second is
+/// still a live stream — enough to prove the path end to end, which is all it is for.
+pub const TEST_PATTERN_GEOMETRY: (u32, u32, u32) = (256, 144, 5);
+
 /// `[media]` — what `mediad` streams.
 ///
 /// **These were command-line flags in `mediad.service`, and that is why this section exists.**
@@ -350,6 +364,9 @@ impl CongestionControl {
 pub struct MediaParams {
     /// Stream the head camera. `false` streams a test pattern instead, which is what a board
     /// with no camera wants: the pipeline starts, so the WebRTC control channel exists.
+    ///
+    /// The pattern ignores `quality` and runs at [`TEST_PATTERN_GEOMETRY`], because it is there to
+    /// make the session exist rather than to be watched.
     pub camera: bool,
     /// Frame size and rate, as one name. [`Quality`] says why it is one key and not four.
     pub quality: Quality,
@@ -496,6 +513,23 @@ impl MediaParams {
     pub fn bitrate_resolved(&self) -> u32 {
         self.bitrate
             .unwrap_or_else(|| self.quality.default_bitrate())
+    }
+
+    /// Frame size and rate the pipeline will actually run at — width, height, frames a second.
+    ///
+    /// [`Quality`], except for the test pattern, which gets [`TEST_PATTERN_GEOMETRY`] instead.
+    /// A simulated camera is a camera: `--sim-camera` renders the configured rung, and `mediad`
+    /// applies that precedence where it picks the source.
+    pub fn geometry(&self) -> (u32, u32, u32) {
+        if self.camera {
+            (
+                self.quality.width(),
+                self.quality.height(),
+                self.quality.fps(),
+            )
+        } else {
+            TEST_PATTERN_GEOMETRY
+        }
     }
 }
 
@@ -2803,6 +2837,57 @@ mod tests {
         }
         media.bitrate = Some(3_000_000);
         assert_eq!(media.bitrate_resolved(), 3_000_000);
+    }
+
+    /// **A camera runs at the configured rung and a test pattern does not**, which is the whole
+    /// of [`MediaParams::geometry`]. Every rung, so a `quality` edit cannot start reaching the
+    /// pattern by accident.
+    #[test]
+    fn only_a_camera_runs_at_the_configured_quality() {
+        let mut media = MediaParams::default();
+        for quality in Quality::ALL {
+            media.quality = quality;
+
+            media.camera = true;
+            assert_eq!(
+                media.geometry(),
+                (quality.width(), quality.height(), quality.fps()),
+                "a camera streams {}",
+                quality.label()
+            );
+
+            media.camera = false;
+            assert_eq!(
+                media.geometry(),
+                TEST_PATTERN_GEOMETRY,
+                "a test pattern ignores {}",
+                quality.label()
+            );
+        }
+    }
+
+    /// The pattern's geometry has to satisfy the same two constraints every [`Quality`] rung does
+    /// — 16:9, and both axes a multiple of 8 for the encoder's macroblocks — because it goes
+    /// through the same capsfilter and the same encoder. A rate of zero would be a still image.
+    #[test]
+    fn the_test_pattern_is_16_9_and_encodable() {
+        let (width, height, fps) = TEST_PATTERN_GEOMETRY;
+        assert_eq!(width % 8, 0, "width {width} is not a multiple of 8");
+        assert_eq!(height % 8, 0, "height {height} is not a multiple of 8");
+        assert_eq!(width * 9, height * 16, "{width}x{height} is not 16:9");
+        assert!(fps > 0, "a test pattern with no frame rate is a photograph");
+
+        // And it is worth having: a pattern as expensive as the rung it replaces would be this
+        // constant written the long way.
+        let (w, h, f) = MediaParams {
+            camera: true,
+            ..MediaParams::default()
+        }
+        .geometry();
+        assert!(
+            width * height * fps * 4 < w * h * f,
+            "{width}x{height}@{fps} is not materially cheaper than the default {w}x{h}@{f}"
+        );
     }
 
     /// A bitrate in the wrong unit is the mistake this band exists to catch: `2000` is somebody
