@@ -1047,6 +1047,7 @@ mod tests {
                 "detect",
                 "chorale",
                 "theremin",
+                "head_imu",
                 "audio",
                 "media",
                 // Last, and the editor shows sections in this order: the pad is what a robot's

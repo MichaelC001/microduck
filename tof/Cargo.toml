@@ -23,6 +23,9 @@ path = "src/main.rs"
 anyhow = "1"
 clap = { workspace = true, features = ["derive"] }
 duck-ipc-proto = { path = "../duck-ipc-proto" }
+# `[head_imu]` lives in `robotd.toml`, and this crate is the schema for that file — the same
+# dependency, for the same reason, that `mediad` takes on for `[media]`. See `src/config.rs`.
+robotd-params = { path = "../robotd-params" }
 libc = "0.2"
 serde = { workspace = true }
 serde_json.workspace = true
@@ -44,3 +47,6 @@ linux-embedded-hal = "0.4"
 
 [build-dependencies]
 cc = "1"
+
+[dev-dependencies]
+tempfile = "3.27.0"

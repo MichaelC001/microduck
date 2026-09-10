@@ -758,6 +758,19 @@ provisions the bus itself; the ToF step only adds the stable `/dev/i2c-pihat`
 name. Both sensor generations are supported — a VL53L5CX and a VL53L8CX are
 interchangeable on the board, and the daemon picks the driver from an ID read.
 
+#### The head IMU (`head_imu.stream`)
+
+`tofd` also serves the head module's BMI088 — gyro, acceleration and a Madgwick
+orientation — and it is **off by default**: `[head_imu] enabled` in `robotd.toml`,
+set with `robotctl configure`, which offers the `tofd` restart. Reading it costs
+~4% of a core at 100 Hz and nothing subscribes yet, so a duck that is not mapping
+was paying that from boot. A subscriber while it is off gets a reason naming the
+key, not the silence an unfitted sensor gives. `tofd --imu` reads it for one
+session without touching the file, and `--imu-hz` trades rate for cost linearly.
+
+None of this touches depth: the ToF ranges either way, so the grid above works on
+a duck whose IMU has never been switched on.
+
 ### Wifi (`configd`)
 
 ```
