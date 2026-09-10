@@ -1,7 +1,10 @@
 # robotd — per-robot parameters.
 #
-# Installed to /etc/robot/robotd.toml. Read once at startup, not watched: changing
-# anything here needs `systemctl restart robotd`. Live reload is deferred
+# Installed to /etc/robot/robotd.toml. Mostly read once at startup and not watched, so
+# mostly a change needs a restart — of the daemon that reads the section, which is not
+# always robotd: [media] and [detect] are mediad's and [head_imu] is tofd's. The two
+# exceptions: padd re-reads [imu_head] a second after the file changes, and robotd
+# re-reads [policy] when asked. `robotctl configure` knows which is which and offers it
 # (docs/design/robotd-design.md §4.2).
 #
 # It lives here, and not under /opt/robot/daemon/releases/<ver>/, on purpose: this is

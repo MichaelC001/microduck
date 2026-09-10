@@ -3475,6 +3475,24 @@ fn skill_encoding_refusal(name: &str, encoding: Option<&str>) -> Option<String> 
     }
 }
 
+/// Ask `robotd` to re-read `[policy]`, and say whether it took it.
+///
+/// `false` is a running daemon that declined — policies are off on this robot, which is the one
+/// thing in that section a reload cannot change — and an `Err` is one that could not be reached
+/// at all. Neither is a failure worth an exit code: the config is written either way, and the
+/// next start picks it up. Shared with `configure`, which offers this instead of a restart for
+/// the same keys.
+pub(crate) fn reload_policies(robot_socket: &Path) -> Result<bool, String> {
+    (|| -> Result<bool, Failure> {
+        let mut client = Client::connect_to("robotd", robot_socket)?;
+        client.hello()?;
+        let result: proto::IntentResult =
+            decode(&result_of(client.call(&proto::Call::RobotReloadPolicies)?)?)?;
+        Ok(result.accepted)
+    })()
+    .map_err(|e| e.message)
+}
+
 /// Tell `robotd` to re-read its skills, and say whether it did.
 ///
 /// A skill written into config is not one the robot has until the loop resolves it again, and
@@ -3482,14 +3500,7 @@ fn skill_encoding_refusal(name: &str, encoding: Option<&str>) -> Option<String> 
 /// the whole point of the command is that trying one is cheap. An unreachable robot is not a
 /// failure here: the config is written either way, and the next start picks it up.
 fn report_reload(robot_socket: &Path) {
-    let reloaded = (|| -> Result<bool, Failure> {
-        let mut client = Client::connect_to("robotd", robot_socket)?;
-        client.hello()?;
-        let result: proto::IntentResult =
-            decode(&result_of(client.call(&proto::Call::RobotReloadPolicies)?)?)?;
-        Ok(result.accepted)
-    })();
-    match reloaded {
+    match reload_policies(robot_socket) {
         Ok(true) => println!("  the robot is re-reading its skills"),
         Ok(false) | Err(_) => {
             println!("  robotd did not pick it up — it will at the next start");
@@ -4466,7 +4477,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
             let result = if list {
                 configure::list(&file, json)
             } else {
-                configure::run(&file)
+                configure::run(&file, &cli.robot_socket)
             };
             return result.map_err(|e| Failure::new(exit::FAILED, e));
         }
