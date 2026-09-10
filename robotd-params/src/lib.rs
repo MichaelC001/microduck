@@ -39,6 +39,16 @@ pub const RELEASE_DIR: &str = "/opt/robot/daemon/current";
 /// atomically. See `docs/design/policy-channel-design.md` §9.
 pub const POLICY_DIR: &str = "/opt/robot/policies/current";
 
+/// Where the duck detector lives — outside the release, the way [`POLICY_DIR`] is, and for the
+/// same reason: the model is trained and published elsewhere (`pollen-robotics/duck_detector`,
+/// on the Hub as `pollen-robotics/microduck-duck-detector`), a retrain is a tag rather than a
+/// daemon release, and a daemon fix should not re-ship fourteen megabytes of unchanged weights.
+///
+/// Seeded by the release's own `scripts/seed-detector.sh`, moved past with
+/// `robotctl detect update`; `current` is a symlink beside a `releases/` directory, the layout
+/// the policies use and the updater swaps atomically.
+pub const DETECTOR_DIR: &str = "/opt/robot/detector/current";
+
 /// Where policies fetched from the Hub one at a time live — `robotctl policy load <slot> <repo>`.
 ///
 /// Outside every release directory, per `updater-design.md` §5.7: a policy somebody chose has to
@@ -466,11 +476,12 @@ impl Default for MediaParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct DetectParams {
-    /// Off by default. The detector costs a model in the release, ~50 ms of CPU per frame and some
-    /// heat; a robot that nothing asks to look for ducks should not be paying for it.
+    /// Off by default. The detector costs ~50 ms of CPU per frame and some heat; a robot that
+    /// nothing asks to look for ducks should not be paying for it.
     pub enabled: bool,
     /// Where to look, and therefore *what runs it*: a `.rknn` goes to the NPU, an `.onnx` runs on
-    /// the CPU. Absent means the release's own model, NPU first — see [`DetectParams::model`].
+    /// the CPU. Absent means the installed set under [`DETECTOR_DIR`], NPU first — see
+    /// [`DetectParams::models`].
     pub model: Option<PathBuf>,
     /// Frames per second to run the detector at.
     ///
@@ -515,6 +526,11 @@ impl DetectParams {
     /// board still sees, on the CPU, instead of logging one warning and doing nothing for ever.
     ///
     /// An explicit `model` is the operator being specific, so it is tried alone.
+    ///
+    /// **Not filtered on existence.** A board whose set was never seeded — first install with no
+    /// network — has neither file, and an empty list here would read as "detector off" in
+    /// `mediad`'s journal when the truth is "detector on, model missing". Letting the loader fail
+    /// on the path names the directory and what fills it.
     pub fn models(&self) -> Vec<PathBuf> {
         if !self.enabled {
             return Vec::new();
@@ -525,16 +541,15 @@ impl DetectParams {
             }
             return vec![path.clone()];
         }
-        let release = PathBuf::from(RELEASE_DIR).join("models");
-        [
-            release.join("duck_detect.rknn"),
-            release.join("duck_detect.onnx"),
-        ]
-        .into_iter()
-        .filter(|path| path.exists())
-        .collect()
+        let set = PathBuf::from(DETECTOR_DIR);
+        DETECTOR_FILES.iter().map(|name| set.join(name)).collect()
     }
 }
+
+/// The two files a detector set holds, NPU first. `scripts/seed-detector.sh` and
+/// `updater::policy::DETECTOR_FILES` download exactly this list, and a test in each place holds
+/// them together.
+pub const DETECTOR_FILES: [&str; 2] = ["duck_detect.rknn", "duck_detect.onnx"];
 
 /// `[chorale]` — several ducks singing one piece.
 ///

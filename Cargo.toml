@@ -56,6 +56,15 @@ runtime = "v2.3.2"
 repo    = "pollen-robotics/microduck-policies"
 version = "v1"
 
+# The duck detector, the same way: trained in pollen-robotics/duck_detector, published on the Hub,
+# and seeded onto a board by `scripts/seed-detector.sh` from this pin — a floor, moved past with
+# `robotctl detect update`. The model repo shares its name with the *dataset* repo; the robot only
+# ever addresses the model (`huggingface.co/<repo>/resolve/…`, `api/models/<repo>`), and the
+# dataset lives under `datasets/`, so the shared name cannot be confused on the wire.
+[workspace.metadata.detector]
+repo    = "pollen-robotics/microduck-duck-detector"
+version = "duck-v1"
+
 # The prebuilt GStreamer plugins `mediad` needs, built in CI from pinned upstream sources at
 # https://github.com/pollen-robotics/microduck-gst-plugins — `mpph264enc` (hardware H.264 through
 # Rockchip MPP) and `webrtcsink`/`webrtcsrc`, neither of which exists in any Debian suite.

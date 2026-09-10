@@ -340,15 +340,21 @@ mode = "walk"
 # `mediad`'s pipeline and perception belongs next to the sensor — but the switch lives here because
 # this is the file `robotctl configure` edits and a robot has one place for its settings.
 #
-# **Off by default.** The model ships in the release (models/duck_detect.rknn for the NPU,
-# models/duck_detect.onnx for the CPU), and a robot nobody has asked to look for ducks should not
-# pay ~60 ms of work every half second for it.
+# **Off by default.** A robot nobody has asked to look for ducks should not pay ~60 ms of work
+# every half second for it.
 # enabled = true
 
 # Which model, and therefore which processor: a `.rknn` runs on the NPU, an `.onnx` on the CPU.
-# Unset tries the release's own, NPU first — and falls through to the CPU on a board whose NPU is
+# Unset means the installed set — /opt/robot/detector/current/duck_detect.rknn for the NPU,
+# duck_detect.onnx for the CPU — NPU first, falling through to the CPU on a board whose NPU is
 # switched off in its device tree, which is how Armbian ships the Radxa Zero 3. `sudo sh
 # /opt/robot/daemon/current/scripts/setup-npu.sh` turns it on, and needs a reboot.
+#
+# That set comes from the Hub (pollen-robotics/microduck-duck-detector, trained in
+# pollen-robotics/duck_detector), the way the official policy set does: the release's postinstall
+# hook seeds it once, `robotctl detect check` asks whether a newer one exists, and
+# `sudo robotctl detect update` installs it and restarts mediad onto it. A retrain is a tag
+# there, not a daemon release. This key is for a model of your own.
 # model = "/home/microduck/my_detector.rknn"
 
 # Looks per second. **2 is a thermal limit, not a preference**: flat out this reaches 95 °C on a

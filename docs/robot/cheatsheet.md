@@ -219,6 +219,23 @@ name one — `--version v1` is how to go back. The robot returns to its home pos
 slot and drives again, and **a slot you loaded yourself is left alone**, because it points
 somewhere else entirely.
 
+#### A newer duck detector
+
+The model `mediad` finds other ducks with lives on the Hub the same way
+(`pollen-robotics/microduck-duck-detector`) and versions on its own line:
+
+```
+robotctl detect check
+```
+
+```
+sudo robotctl detect update
+```
+
+Same shape as the policy pair — `--version <tag>` names one, and `check` changes nothing. `update`
+restarts `mediad`, which drops the console's video for a moment; whether the detector then runs at
+all is `[detect] enabled` in `robotctl configure`.
+
 #### Trying your own file
 
 No release, no file to edit, no restart:
