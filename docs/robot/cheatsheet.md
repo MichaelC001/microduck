@@ -122,7 +122,8 @@ about a robot behaving oddly, and until now answering it meant a full-screen edi
 An interactive editor over `/etc/robot/robotd.toml`: every key the daemons know, the feature
 switches first (policy on/off, walk/roller, limp-fall, audio, pet detection, battery
 shutdown, camera and video quality…), current value against default, one line of doc. SPACE toggles, ENTER types a
-value, `u` reverts a key to its default. Values in yellow (marked `•`) are the keys where
+value, `u` reverts a key to its default, `ctrl+f` opens a fuzzy search over everything on
+screen (the selection follows as you type; ENTER or ESC keeps it there). Values in yellow (marked `•`) are the keys where
 this robot diverges from the defaults; everything else is the built-in default, and `unset`
 optionals show what they resolve to `(auto)`.
 
